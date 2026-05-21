@@ -1,55 +1,39 @@
-// MascotGreeting — wraps the execlaw mascot SVG, drives both the
-// cursor-tracking iris animation AND a one-shot greeting that
-// physically morphs the mascot's existing shapes into bracket-
-// like silhouettes and reveals a "welcome <name>" line.
+// MascotGreeting — mascot face + time-of-day greeting revealed by a
+// particle constellation emitting from the mascot's eye.
 //
-// Why one component? The morph reuses the mascot's own paths —
-// it rotates and slides them — so the SVG, the refs into each
-// piece, and the timeline have to live in the same place.
+// 2026-05-21 — replaced the original full-shape morph (where the
+// hair and beard rotated −90° to become `<` and `>` brackets
+// around a "Welcome, name!" line) with a composed sequence:
 //
-// LAYOUT
-//   The mascot SVG is split into three independently-controllable
-//   sub-trees, each wrapped in two groups so we can compose
-//   transforms cleanly:
+//   1. The hair LIFTS off the head (mirrors the MiniMascotSpinner
+//      "pop" pattern) — a small upward translate + scale + tilt
+//      anchored at the bottom-centre of the hair bbox. The beard
+//      squashes inward to "catch" the absent hair, and the eye
+//      widens slightly. Reads as "the mascot's mind is opening."
+//   2. A swarm of accent-blue PARTICLES bursts from the EXPOSED
+//      eye (now the visible center of the face), scatters into a
+//      loose cloud, and funnels into a line beneath the mascot.
+//   3. As the particles arrive, the time-of-day GREETING fades in
+//      ("Good morning, Justin." / afternoon / evening).
+//   4. The hair DROPS back with a bounce, the beard rebounds, the
+//      eye settles. Residual particles dissolve, leaving the line.
 //
-//       <g outerSlide>
-//         <g innerRotate>
-//           <path d=… />     ← hair / beard / eye+iris
-//         </g>
-//       </g>
-//
-//   The inner group handles rotation around the canvas centre.
-//   The outer group handles screen-space translation. Stacking
-//   them this way means the slide always moves the shape in
-//   viewBox X/Y regardless of how far the inner group has
-//   rotated.
-//
-// SEQUENCE
-//   1. 5 s rest — mascot tracks the cursor.
-//   2. Morph (~0.8 s) — each sub-tree rotates −90° around the
-//      canvas centre. The (originally top) hair lands on the
-//      left and slides further left. The (originally bottom)
-//      beard lands on the right and slides further right. The
-//      eye fades out.
-//   3. Welcome line fades in between the two bracket-shapes.
-//   4. 5 s hold.
-//   5. Reverse — line fades, hair/beard slide back, rotation
-//      unwinds, eye fades back in.
+// The mascot continues idle motion (slow breath + occasional
+// blink + cursor-tracking iris) before, during, and after the
+// sequence — so the mascot reads as steadily alive rather than a
+// performer that goes still between cues.
 //
 // REDUCED MOTION
-//   The greeting is the brand mark's reason to exist, and the
-//   movement is a single ~0.8s rotation + slide rather than
-//   large-scale parallax — well below the threshold the
-//   preference is meant to suppress. We intentionally do NOT
-//   honour `prefers-reduced-motion` here.
-//
-// 2026-04-28.
+//   `prefers-reduced-motion: reduce` skips the lift, the burst,
+//   and the convergence. The greeting just fades in. Breath /
+//   blink keep running — they're well below the parallax threshold
+//   the preference targets.
 
-import { useEffect, useRef } from "react";
+import { useGSAP } from "@gsap/react";
 import gsap from "gsap";
+import { useMemo, useRef } from "react";
 import {
     BEARD_PATH,
-    CANVAS_CENTER,
     EYE_PATH,
     FALLBACK_EYE_CX,
     FALLBACK_EYE_CY,
@@ -66,49 +50,98 @@ import {
 interface Props {
     /** Pixel size of the rendered SVG. Defaults to 216. */
     size?: number;
-    /** Name to interpolate into the welcome line. Falls back to
+    /** Name to interpolate into the greeting. Falls back to
      *  "friend" so the line still reads if we don't have a name. */
     userName?: string;
     /** Optional className passthrough for layout/spacing. */
     className?: string;
 }
 
-// VIEWBOX, CANVAS_CENTER, IRIS_MAX_TRAVEL_VB, IRIS_SATURATION_PX,
-// the mascot path strings, and the iris/eye fallback centres are
-// shared with `MiniMascotSpinner` via `./mascotPaths`. Constants
-// imported above. Greeting-only knobs stay here.
+// ---- Tuning knobs ---------------------------------------------------
 
-// Greeting timing.
-const REST_DELAY_S = 3;
-const HOLD_DURATION_S = 5;
-const MORPH_ROTATION_S = 0.8;
-const MORPH_SLIDE_S = 0.6;
-const FADE_S = 0.4;
-// Bracket height multiplier — shapes morph to this many times
-// the welcome line's measured pixel height.
-const BRACKET_HEIGHT_MULT = 1.3;
-// Fraction of the welcome-line width to leave between each
-// bracket and the text.
-const BRACKET_MARGIN_FRACTION = 0.12;
+/** Total particles in the constellation. */
+const PARTICLE_COUNT = 14;
 
-// Natural bbox dimensions of hair and beard (measured from the
-// source SVG). Used as fallbacks when getBBox isn't available
-// (jsdom). Width / height are in viewBox units.
-const FALLBACK_HAIR_BBOX = { width: 689, height: 504 };
-const FALLBACK_BEARD_BBOX = { width: 398, height: 142 };
+/** Delay after mount before the sequence begins. Gives the layout
+ *  a beat so the welcome text bbox we measure is stable. */
+const REST_DELAY_S = 0.4;
 
-function readBboxSize(
-    el: SVGGraphicsElement | null,
-    fallback: { width: number; height: number },
-): { width: number; height: number } {
-    if (!el || typeof el.getBBox !== "function") return fallback;
+/** Pixel ranges used during the BURST phase (random per particle).
+ *  Values land in `.execlaw-mascot-stage__particle`'s CSS-pixel
+ *  frame (the particles are HTML divs, not SVG elements). */
+const BURST_DIST_MIN = 70;
+const BURST_DIST_MAX = 140;
+
+/** Vertical jitter applied to each particle's converge target so
+ *  the resting line looks like a constellation rather than a
+ *  perfectly straight ruler. */
+const CONVERGE_JITTER_Y = 10;
+
+// ---- Hair lift values (CSS pixels via `transform-box: fill-box`) ---
+//
+// Calibrated against `size = 216`. At smaller renderings the lift
+// will look proportionally identical because we're scaling against
+// the hair's own bbox via fill-box.
+const HAIR_LIFT_Y = -32;
+const HAIR_LIFT_SCALE = 1.04;
+const HAIR_LIFT_ROT = -4;
+const BEARD_SQUASH_Y = 0.9;
+const BEARD_SQUASH_X = 1.05;
+const EYE_WIDEN_SCALE = 1.06;
+
+// ---- Time-of-day greeting -----------------------------------------
+
+/** Map an hour-of-day into a friendly greeting. Boundaries match
+ *  conversational English: morning until noon, afternoon until 5,
+ *  evening covers everything from late afternoon to early morning
+ *  (no separate "good night" — that implies departure). */
+function timeOfDayGreeting(hour: number): string {
+    if (hour >= 5 && hour < 12) return "Good morning";
+    if (hour >= 12 && hour < 17) return "Good afternoon";
+    return "Good evening";
+}
+
+// ---- Greeting font rotation ----------------------------------------
+
+/** Display fonts the greeting cycles through on each page load.
+ *  Three sci-fi-leaning sans-serifs (rendered ALL CAPS) plus one
+ *  editorial italic serif — see `theme.scss` for the per-variant
+ *  size / letter-spacing / case-transform tuning that makes each
+ *  read as the "cinematic title card" version of itself.
+ *
+ *  All four are self-hosted via fontsource (imports in `main.tsx`)
+ *  so the SPA stays offline-capable. */
+const FONT_VARIANTS = [
+    "unica-one",
+    "orbitron",
+    "antonio",
+    "instrument-serif",
+] as const;
+type FontVariant = (typeof FONT_VARIANTS)[number];
+
+const FONT_STORAGE_KEY = "execlaw:welcome-font";
+
+/** Pick a font that's NOT the one we showed last reload. Pure random
+ *  would occasionally repeat back-to-back which kills the "fresh
+ *  greeting every time" feel; excluding the previous pick guarantees
+ *  variation without requiring strict round-robin bookkeeping. */
+function pickGreetingFont(): FontVariant {
+    let last: string | null = null;
     try {
-        const b = el.getBBox();
-        if (b.width <= 0 || b.height <= 0) return fallback;
-        return { width: b.width, height: b.height };
+        last = localStorage.getItem(FONT_STORAGE_KEY);
     } catch {
-        return fallback;
+        /* private mode / storage-disabled — fall through */
     }
+    const candidates = FONT_VARIANTS.filter((f) => f !== last);
+    const choice =
+        candidates[Math.floor(Math.random() * candidates.length)] ??
+        FONT_VARIANTS[0];
+    try {
+        localStorage.setItem(FONT_STORAGE_KEY, choice);
+    } catch {
+        /* ignore */
+    }
+    return choice;
 }
 
 export function MascotGreeting({
@@ -116,395 +149,490 @@ export function MascotGreeting({
     userName = "friend",
     className,
 }: Props) {
+    const stageRef = useRef<HTMLDivElement | null>(null);
     const svgRef = useRef<SVGSVGElement | null>(null);
 
-    // Iris tracking refs.
+    // Per-shape refs for the lift sequence + iris cursor tracking.
+    const hairRef = useRef<SVGPathElement | null>(null);
+    const beardRef = useRef<SVGPathElement | null>(null);
+    const eyeOuterRef = useRef<SVGGElement | null>(null);
     const eyePathRef = useRef<SVGPathElement | null>(null);
     const irisRef = useRef<SVGGElement | null>(null);
 
-    // Greeting morph refs — outer (slide) + inner (rotate/scale)
-    // for each piece. Path refs are also held so we can measure
-    // each shape's natural bbox before the timeline mutates it.
-    const hairOuterRef = useRef<SVGGElement | null>(null);
-    const hairInnerRef = useRef<SVGGElement | null>(null);
-    const hairPathRef = useRef<SVGPathElement | null>(null);
-    const beardOuterRef = useRef<SVGGElement | null>(null);
-    const beardInnerRef = useRef<SVGGElement | null>(null);
-    const beardPathRef = useRef<SVGPathElement | null>(null);
-    const eyeOuterRef = useRef<SVGGElement | null>(null);
-    const eyeInnerRef = useRef<SVGGElement | null>(null);
-    // Bracket overlays. The original hair/beard rotate + scale
-    // into vertical ribbons at the canvas centre; on Phase B these
-    // overlays fade in (replacing the rotated blobs) and slide
-    // outward to flank the welcome text, reading as `<` `>`. On
-    // the reverse leg they slide back + fade out, then the
-    // hair/beard inner groups unwind to their resting state.
-    const leftBracketOuterRef = useRef<SVGGElement | null>(null);
-    const leftBracketRef = useRef<SVGPathElement | null>(null);
-    const rightBracketOuterRef = useRef<SVGGElement | null>(null);
-    const rightBracketRef = useRef<SVGPathElement | null>(null);
-
-    // Welcome text (HTML overlay, sits above the SVG centre).
     const welcomeRef = useRef<HTMLSpanElement | null>(null);
+    const particleRefs = useRef<Array<HTMLDivElement | null>>([]);
 
-    // ---- Iris cursor tracking --------------------------------
-    useEffect(() => {
-        const svg = svgRef.current;
-        const eye = eyePathRef.current;
-        const iris = irisRef.current;
-        if (!svg || !eye || !iris) return;
+    // Greeting is computed once per mount so the line doesn't flick
+    // categories at the exact hour boundary while the welcome view
+    // is visible.
+    const greeting = useMemo(() => {
+        const hour = new Date().getHours();
+        return `${timeOfDayGreeting(hour)}, ${userName}.`;
+    }, [userName]);
 
-        const eyeCenter = readCenter(eye, FALLBACK_EYE_CX, FALLBACK_EYE_CY);
-        const irisCenter = readCenter(
-            iris,
-            FALLBACK_IRIS_CX,
-            FALLBACK_IRIS_CY,
-        );
+    // Random display font per mount. `useMemo` with no deps so we
+    // don't re-pick on parent re-renders inside the same mount —
+    // the visual identity should stay stable for the life of the
+    // welcome view.
+    const fontVariant = useMemo<FontVariant>(() => pickGreetingFont(), []);
 
-        const baseOffsetX = eyeCenter.cx - irisCenter.cx;
-        const baseOffsetY = eyeCenter.cy - irisCenter.cy;
-        gsap.set(iris, { x: baseOffsetX, y: baseOffsetY });
+    // ---- Iris cursor tracking ---------------------------------------
+    useGSAP(
+        () => {
+            const svg = svgRef.current;
+            const eye = eyePathRef.current;
+            const iris = irisRef.current;
+            if (!svg || !eye || !iris) return;
 
-        const xTo = gsap.quickTo(iris, "x", {
-            duration: 0.3,
-            ease: "power3.out",
-        });
-        const yTo = gsap.quickTo(iris, "y", {
-            duration: 0.3,
-            ease: "power3.out",
-        });
+            const eyeCenter = readCenter(
+                eye,
+                FALLBACK_EYE_CX,
+                FALLBACK_EYE_CY,
+            );
+            const irisCenter = readCenter(
+                iris,
+                FALLBACK_IRIS_CX,
+                FALLBACK_IRIS_CY,
+            );
 
-        const onMove = (e: MouseEvent) => {
-            const rect = svg.getBoundingClientRect();
-            if (rect.width === 0 || rect.height === 0) return;
-            const cx = rect.left + (eyeCenter.cx / VIEWBOX) * rect.width;
-            const cy = rect.top + (eyeCenter.cy / VIEWBOX) * rect.height;
-            const dx = e.clientX - cx;
-            const dy = e.clientY - cy;
-            const dist = Math.hypot(dx, dy);
-            if (dist === 0) {
-                xTo(baseOffsetX);
-                yTo(baseOffsetY);
+            const baseOffsetX = eyeCenter.cx - irisCenter.cx;
+            const baseOffsetY = eyeCenter.cy - irisCenter.cy;
+            gsap.set(iris, { x: baseOffsetX, y: baseOffsetY });
+
+            const xTo = gsap.quickTo(iris, "x", {
+                duration: 0.3,
+                ease: "power3.out",
+            });
+            const yTo = gsap.quickTo(iris, "y", {
+                duration: 0.3,
+                ease: "power3.out",
+            });
+
+            const onMove = (e: MouseEvent) => {
+                const rect = svg.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) return;
+                const cx =
+                    rect.left + (eyeCenter.cx / VIEWBOX) * rect.width;
+                const cy =
+                    rect.top + (eyeCenter.cy / VIEWBOX) * rect.height;
+                const dx = e.clientX - cx;
+                const dy = e.clientY - cy;
+                const dist = Math.hypot(dx, dy);
+                if (dist === 0) {
+                    xTo(baseOffsetX);
+                    yTo(baseOffsetY);
+                    return;
+                }
+                const ratio = Math.min(1, dist / IRIS_SATURATION_PX);
+                const travel = IRIS_MAX_TRAVEL_VB * ratio;
+                xTo(baseOffsetX + (dx / dist) * travel);
+                yTo(baseOffsetY + (dy / dist) * travel);
+            };
+
+            window.addEventListener("mousemove", onMove, { passive: true });
+            return () => window.removeEventListener("mousemove", onMove);
+        },
+        { dependencies: [] },
+    );
+
+    // ---- Idle breath + blink ----------------------------------------
+    //
+    // Tiny ambient motion so the mascot doesn't feel frozen.
+    //
+    //   * Breath — uniform scale pulse on the whole SVG (1 → 1.015,
+    //     3.5s yoyo).
+    //
+    //   * Blink — multi-step squash on the eye-outer group every
+    //     5–9s with a randomised delay. The blink passes through
+    //     an intermediate `scaleY: 0.4` ("football" / lens) stage
+    //     on the way down and on the way back up so the operator
+    //     actually SEES the eye close, rather than a sub-frame
+    //     vertical flash. Pivot is set via `svgOrigin` pinned to
+    //     the eye path's user-space centre — using `transformOrigin
+    //     + fill-box` previously sometimes drifted off the visual
+    //     centre of the eye because the eye-outer group's bbox
+    //     includes the iris, which shifts the union bbox up-right.
+    useGSAP(
+        () => {
+            const svg = svgRef.current;
+            const eyeOuter = eyeOuterRef.current;
+            const eyePath = eyePathRef.current;
+            if (!svg || !eyeOuter || !eyePath) return;
+
+            // Breath.
+            gsap.to(svg, {
+                scale: 1.015,
+                duration: 3.5,
+                yoyo: true,
+                repeat: -1,
+                ease: "sine.inOut",
+            });
+
+            // Blink pivot — eye path's actual centre, in viewBox
+            // user-space coords.
+            const eyeCenter = readCenter(
+                eyePath,
+                FALLBACK_EYE_CX,
+                FALLBACK_EYE_CY,
+            );
+            const blinkOrigin = `${eyeCenter.cx} ${eyeCenter.cy}`;
+            gsap.set(eyeOuter, { svgOrigin: blinkOrigin });
+
+            let cancelled = false;
+            const scheduleBlink = () => {
+                if (cancelled) return;
+                const delay = gsap.utils.random(5, 9);
+                const tl = gsap.timeline({
+                    delay,
+                    // Every step keeps the same pivot so the eye
+                    // squishes around its centre instead of
+                    // sliding vertically across the head.
+                    defaults: { svgOrigin: blinkOrigin },
+                    onComplete: scheduleBlink,
+                });
+                // Open → football (lens-shaped, half-closed). Slowest
+                // of the steps — this is where the operator reads
+                // "the eye is closing" rather than "the eye blinked."
+                tl.to(eyeOuter, {
+                    scaleY: 0.4,
+                    duration: 0.10,
+                    ease: "power2.inOut",
+                });
+                // Football → closed. Quick snap to a thin line.
+                tl.to(eyeOuter, {
+                    scaleY: 0.06,
+                    duration: 0.04,
+                    ease: "power2.in",
+                });
+                // Briefly held closed (the eyelid "rests").
+                tl.to(eyeOuter, {
+                    scaleY: 0.06,
+                    duration: 0.03,
+                });
+                // Closed → football. Mirrors the close-snap so the
+                // open looks like a deliberate eyelid lift.
+                tl.to(eyeOuter, {
+                    scaleY: 0.4,
+                    duration: 0.04,
+                    ease: "power2.out",
+                });
+                // Football → open. Slowest again — the eyelid
+                // settles to fully open.
+                tl.to(eyeOuter, {
+                    scaleY: 1,
+                    duration: 0.09,
+                    ease: "power2.out",
+                });
+            };
+            scheduleBlink();
+            return () => {
+                cancelled = true;
+            };
+        },
+        { dependencies: [] },
+    );
+
+    // ---- Greeting sequence: lift → emit → drop → reveal ------------
+    useGSAP(
+        () => {
+            const stage = stageRef.current;
+            const svg = svgRef.current;
+            const hair = hairRef.current;
+            const beard = beardRef.current;
+            const eyeOuter = eyeOuterRef.current;
+            const eyePath = eyePathRef.current;
+            const welcome = welcomeRef.current;
+            const particles = particleRefs.current.filter(
+                (p): p is HTMLDivElement => p !== null,
+            );
+            if (
+                !stage ||
+                !svg ||
+                !hair ||
+                !beard ||
+                !eyeOuter ||
+                !eyePath ||
+                !welcome ||
+                particles.length !== PARTICLE_COUNT
+            ) {
                 return;
             }
-            const ratio = Math.min(1, dist / IRIS_SATURATION_PX);
-            const travel = IRIS_MAX_TRAVEL_VB * ratio;
-            xTo(baseOffsetX + (dx / dist) * travel);
-            yTo(baseOffsetY + (dy / dist) * travel);
-        };
 
-        window.addEventListener("mousemove", onMove, { passive: true });
-        return () => window.removeEventListener("mousemove", onMove);
-    }, []);
+            const reducedMotion =
+                typeof window !== "undefined" &&
+                window.matchMedia?.("(prefers-reduced-motion: reduce)")
+                    .matches;
 
-    // ---- Greeting timeline -----------------------------------
-    useEffect(() => {
-        const svg = svgRef.current;
-        const hairOuter = hairOuterRef.current;
-        const hairInner = hairInnerRef.current;
-        const hairPath = hairPathRef.current;
-        const beardOuter = beardOuterRef.current;
-        const beardInner = beardInnerRef.current;
-        const beardPath = beardPathRef.current;
-        const eyeOuter = eyeOuterRef.current;
-        const eyeInner = eyeInnerRef.current;
-        const welcome = welcomeRef.current;
-        const leftBracketOuter = leftBracketOuterRef.current;
-        const leftBracket = leftBracketRef.current;
-        const rightBracketOuter = rightBracketOuterRef.current;
-        const rightBracket = rightBracketRef.current;
-        if (
-            !svg ||
-            !hairOuter ||
-            !hairInner ||
-            !hairPath ||
-            !beardOuter ||
-            !beardInner ||
-            !beardPath ||
-            !eyeOuter ||
-            !eyeInner ||
-            !welcome ||
-            !leftBracketOuter ||
-            !leftBracket ||
-            !rightBracketOuter ||
-            !rightBracket
-        ) {
-            return;
-        }
+            gsap.set(welcome, { opacity: 0, y: 6 });
 
-        // ---- Geometry ---------------------------------------
-        // Measure the welcome line and the SVG's screen size so
-        // we can convert between CSS-pixel and viewBox units.
-        // Reading the line's bbox before any GSAP transforms
-        // touch it gives us the natural rendered size — opacity
-        // is 0 via CSS but layout still happens.
-        const welcomeRect = welcome.getBoundingClientRect();
-        const svgRect = svg.getBoundingClientRect();
-        const pxToVb =
-            svgRect.width > 0 ? VIEWBOX / svgRect.width : 1;
-        const textHeightVb = welcomeRect.height * pxToVb;
-        const textWidthVb = welcomeRect.width * pxToVb;
+            if (reducedMotion) {
+                gsap.to(welcome, {
+                    opacity: 1,
+                    y: 0,
+                    duration: 0.6,
+                    delay: REST_DELAY_S,
+                    ease: "power2.out",
+                });
+                return;
+            }
 
-        // Each bracket morphs to BRACKET_HEIGHT_MULT × text
-        // height, in viewBox units.
-        const targetHeightVb = textHeightVb * BRACKET_HEIGHT_MULT;
+            // Pivots. Hair pivots at its OWN bottom-centre so the
+            // lift + tilt hinges off the top of the head, not the
+            // SVG canvas centre. Beard pivots at its top so a
+            // vertical squash compresses toward the eye like an
+            // inhale. Eye scales from its user-space centre — same
+            // `svgOrigin` the blink uses, so the two effects share
+            // a consistent pivot even if the blink fires shortly
+            // after the lift settles.
+            gsap.set(hair, { transformOrigin: "50% 100%" });
+            gsap.set(beard, { transformOrigin: "50% 0%" });
+            const liftEyeCenter = readCenter(
+                eyePath,
+                FALLBACK_EYE_CX,
+                FALLBACK_EYE_CY,
+            );
+            gsap.set(eyeOuter, {
+                svgOrigin: `${liftEyeCenter.cx} ${liftEyeCenter.cy}`,
+            });
 
-        // Natural bboxes (in viewBox units). After a -90° rotation
-        // the natural width becomes the screen-vertical extent and
-        // the natural height becomes the screen-horizontal extent.
-        // Uniform scale is therefore (target / naturalWidth) so
-        // the rotated shape ends up exactly `targetHeightVb` tall.
-        const hairBbox = readBboxSize(hairPath, FALLBACK_HAIR_BBOX);
-        const beardBbox = readBboxSize(beardPath, FALLBACK_BEARD_BBOX);
-        const hairScale = targetHeightVb / hairBbox.width;
-        const beardScale = targetHeightVb / beardBbox.width;
+            // ---- Geometry — compute particle origin (the eye centre,
+            // in stage-local CSS pixels) and converge targets along
+            // the greeting baseline. We use the eye's path bbox so the
+            // burst clearly originates from the visible eye shape
+            // rather than the SVG-canvas centre.
+            const stageRect = stage.getBoundingClientRect();
+            const svgRect = svg.getBoundingClientRect();
+            const welcomeRect = welcome.getBoundingClientRect();
 
-        // Post-transform half-widths (the screen-X half-extent
-        // each bracket occupies once rotated and scaled).
-        const hairHalfWidthVb =
-            (hairBbox.height * hairScale) / 2;
-        const beardHalfWidthVb =
-            (beardBbox.height * beardScale) / 2;
+            const eyeCenter = readCenter(
+                eyePath,
+                FALLBACK_EYE_CX,
+                FALLBACK_EYE_CY,
+            );
+            const eyeScreenX =
+                svgRect.left + (eyeCenter.cx / VIEWBOX) * svgRect.width;
+            const eyeScreenY =
+                svgRect.top + (eyeCenter.cy / VIEWBOX) * svgRect.height;
+            const originX = eyeScreenX - stageRect.left;
+            const originY = eyeScreenY - stageRect.top;
 
-        // Slide distances — each bracket sits just outside the
-        // text's bounding box, with a margin proportional to the
-        // text width.
-        const marginVb = textWidthVb * BRACKET_MARGIN_FRACTION;
-        const hairSlide = -(
-            textWidthVb / 2 +
-            marginVb +
-            hairHalfWidthVb
-        );
-        const beardSlide =
-            textWidthVb / 2 + marginVb + beardHalfWidthVb;
+            const targetCenterX =
+                welcomeRect.left + welcomeRect.width / 2 - stageRect.left;
+            const targetCenterY =
+                welcomeRect.top + welcomeRect.height / 2 - stageRect.top;
+            const targetSpread = welcomeRect.width * 0.85;
 
-        // ---- Bracket geometry --------------------------------
-        // Brackets are stroked chevrons drawn at the canvas
-        // centre, sized to the welcome text height. Their outer
-        // groups inherit the same `hairSlide` / `beardSlide`
-        // distances the rotated blobs target — so the bracket
-        // emerges right where the rotated original disappears.
-        const bracketHalfH = targetHeightVb / 2;
-        const bracketHalfW = targetHeightVb * 0.28; // chevron aspect
-        const bracketStrokeVb = Math.max(targetHeightVb * 0.10, 18);
-        const bcx = CANVAS_CENTER;
-        const bcy = CANVAS_CENTER;
-        // `<` — point on the left, opens to the right.
-        const leftBracketD =
-            `M ${bcx + bracketHalfW} ${bcy - bracketHalfH} ` +
-            `L ${bcx - bracketHalfW} ${bcy} ` +
-            `L ${bcx + bracketHalfW} ${bcy + bracketHalfH}`;
-        // `>` — point on the right, opens to the left.
-        const rightBracketD =
-            `M ${bcx - bracketHalfW} ${bcy - bracketHalfH} ` +
-            `L ${bcx + bracketHalfW} ${bcy} ` +
-            `L ${bcx - bracketHalfW} ${bcy + bracketHalfH}`;
-        leftBracket.setAttribute("d", leftBracketD);
-        leftBracket.setAttribute("stroke-width", `${bracketStrokeVb}`);
-        rightBracket.setAttribute("d", rightBracketD);
-        rightBracket.setAttribute("stroke-width", `${bracketStrokeVb}`);
-        // Brackets start invisible at the canvas centre.
-        gsap.set([leftBracketOuter, rightBracketOuter], { opacity: 0, x: 0 });
+            // Per-particle params. Burst angle is biased upward so
+            // the cloud hovers ABOVE the (newly exposed) eye rather
+            // than ringing it — the lifted hair has cleared that
+            // upper space and the cloud reads as "thought rising."
+            const setup = particles.map((_, i) => {
+                const burstAngle = gsap.utils.random(0, Math.PI * 2);
+                const burstDist = gsap.utils.random(
+                    BURST_DIST_MIN,
+                    BURST_DIST_MAX,
+                );
+                const burstX = Math.cos(burstAngle) * burstDist;
+                // Subtract 40 — additional upward lift on top of the
+                // raw radial scatter so the cloud crowns the mascot.
+                const burstY = Math.sin(burstAngle) * burstDist - 40;
 
-        // Welcome line starts hidden.
-        gsap.set(welcome, { opacity: 0, scale: 0.95 });
+                const t = (i + 0.5) / PARTICLE_COUNT;
+                const targetX =
+                    targetCenterX -
+                    targetSpread / 2 +
+                    t * targetSpread +
+                    gsap.utils.random(-4, 4);
+                const targetY =
+                    targetCenterY +
+                    gsap.utils.random(
+                        -CONVERGE_JITTER_Y,
+                        CONVERGE_JITTER_Y,
+                    );
 
-        const origin = `${CANVAS_CENTER} ${CANVAS_CENTER}`;
+                return { burstX, burstY, targetX, targetY };
+            });
 
-        const tl = gsap.timeline({ delay: REST_DELAY_S });
-
-        // Phase A — morph each bracket: rotate −90° + uniform
-        // scale to the target height, all anchored to the canvas
-        // centre. Hair (originally top) lands on the left, beard
-        // (originally bottom) lands on the right. The eye rotates
-        // along but doesn't scale (it's about to fade).
-        tl.to(hairInner, {
-            rotation: -90,
-            scale: hairScale,
-            duration: MORPH_ROTATION_S,
-            ease: "power2.inOut",
-            svgOrigin: origin,
-        });
-        tl.to(
-            beardInner,
-            {
-                rotation: -90,
-                scale: beardScale,
-                duration: MORPH_ROTATION_S,
-                ease: "power2.inOut",
-                svgOrigin: origin,
-            },
-            "<",
-        );
-        tl.to(
-            eyeInner,
-            {
-                rotation: -90,
-                duration: MORPH_ROTATION_S,
-                ease: "power2.inOut",
-                svgOrigin: origin,
-            },
-            "<",
-        );
-
-        // Phase B — bracket morph. The rotated hair/beard blobs
-        // fade out at the canvas centre while the bracket
-        // overlays fade in at the same spot and slide outward to
-        // their calibrated flanking positions. Eye fades too,
-        // clearing the centre for the welcome text.
-        tl.to(
-            [hairInner, beardInner],
-            {
+            // Each particle's CSS home is at the stage centre
+            // (top: 50%; left: 50%). We translate to the eye via a
+            // delta against the stage centre, then apply the per-
+            // particle burst / converge offsets relative to that.
+            const stageCenterX = stageRect.width / 2;
+            const stageCenterY = stageRect.height / 2;
+            const homeX = originX - stageCenterX;
+            const homeY = originY - stageCenterY;
+            gsap.set(particles, {
+                x: homeX,
+                y: homeY,
+                scale: 0,
                 opacity: 0,
-                duration: FADE_S,
-                ease: "power2.in",
-            },
-            "-=0.45",
-        );
-        tl.to(
-            leftBracketOuter,
-            {
-                opacity: 1,
-                x: hairSlide,
-                duration: MORPH_SLIDE_S,
-                ease: "power2.out",
-            },
-            "<",
-        );
-        tl.to(
-            rightBracketOuter,
-            {
-                opacity: 1,
-                x: beardSlide,
-                duration: MORPH_SLIDE_S,
-                ease: "power2.out",
-            },
-            "<",
-        );
-        tl.to(
-            eyeOuter,
-            {
-                opacity: 0,
-                duration: FADE_S,
-                ease: "power2.in",
-            },
-            "<",
-        );
+            });
 
-        // Phase C — welcome line fades in, vertically centred
-        // (the CSS overlay handles the centring; GSAP only
-        // animates opacity + a small scale-up).
-        tl.to(
-            welcome,
-            {
-                opacity: 1,
-                scale: 1,
-                duration: FADE_S,
-                ease: "power2.out",
-            },
-            "-=0.15",
-        );
+            const tl = gsap.timeline({ delay: REST_DELAY_S });
 
-        // Phase D — hold.
-        tl.to({}, { duration: HOLD_DURATION_S });
+            // 1. LIFT — hair pops up + tilts, beard inhales, eye
+            //    widens. Mirrors the MiniMascotSpinner pop pattern
+            //    but at MascotGreeting amplitude (size=216 vs 22px).
+            tl.to(
+                hair,
+                {
+                    y: HAIR_LIFT_Y,
+                    scale: HAIR_LIFT_SCALE,
+                    rotation: HAIR_LIFT_ROT,
+                    duration: 0.36,
+                    ease: "back.out(1.6)",
+                },
+                0,
+            )
+                .to(
+                    beard,
+                    {
+                        scaleY: BEARD_SQUASH_Y,
+                        scaleX: BEARD_SQUASH_X,
+                        duration: 0.36,
+                        ease: "power2.out",
+                    },
+                    0,
+                )
+                .to(
+                    eyeOuter,
+                    {
+                        scale: EYE_WIDEN_SCALE,
+                        duration: 0.36,
+                        ease: "power2.out",
+                    },
+                    0,
+                );
 
-        // Phase E — fade the welcome line out.
-        tl.to(welcome, {
-            opacity: 0,
-            scale: 0.95,
-            duration: FADE_S,
-            ease: "power2.in",
-        });
+            // 2. BURST — particles fly out from the eye. Starts
+            //    around the time the hair lift peaks; the eye is
+            //    fully exposed by then.
+            tl.to(
+                particles,
+                {
+                    x: (i) => homeX + setup[i].burstX,
+                    y: (i) => homeY + setup[i].burstY,
+                    scale: 1,
+                    opacity: 1,
+                    duration: 0.55,
+                    ease: "back.out(1.3)",
+                    stagger: { each: 0.025, from: "random" },
+                },
+                0.22,
+            );
 
-        // Phase F — brackets slide back to centre + fade out;
-        // hair/beard fade back in at the centre (still rotated
-        // from Phase A — Phase G unwinds that). Eye fades back.
-        tl.to(
-            leftBracketOuter,
-            {
-                opacity: 0,
-                x: 0,
-                duration: MORPH_SLIDE_S,
-                ease: "power2.inOut",
-            },
-            "-=0.2",
-        );
-        tl.to(
-            rightBracketOuter,
-            {
-                opacity: 0,
-                x: 0,
-                duration: MORPH_SLIDE_S,
-                ease: "power2.inOut",
-            },
-            "<",
-        );
-        tl.to(
-            [hairInner, beardInner],
-            {
-                opacity: 1,
-                duration: FADE_S,
-                ease: "power2.out",
-            },
-            "<",
-        );
-        tl.to(
-            eyeOuter,
-            {
-                opacity: 1,
-                duration: FADE_S,
-                ease: "power2.out",
-            },
-            "<",
-        );
+            // 3. HOVER — tiny loose drift while the mascot holds
+            //    the lifted pose. Total dwell here ≈ 0.25s.
+            tl.to(particles, {
+                x: (i) =>
+                    homeX + setup[i].burstX + gsap.utils.random(-6, 6),
+                y: (i) =>
+                    homeY + setup[i].burstY + gsap.utils.random(-6, 6),
+                duration: 0.25,
+                ease: "sine.inOut",
+            });
 
-        // Phase G — unwind rotation + scale on hair / beard, and
-        // unwind rotation on the eye.
-        tl.to(
-            hairInner,
-            {
-                rotation: 0,
-                scale: 1,
-                duration: MORPH_ROTATION_S,
-                ease: "power2.inOut",
-                svgOrigin: origin,
-            },
-            "-=0.3",
-        );
-        tl.to(
-            beardInner,
-            {
-                rotation: 0,
-                scale: 1,
-                duration: MORPH_ROTATION_S,
-                ease: "power2.inOut",
-                svgOrigin: origin,
-            },
-            "<",
-        );
-        tl.to(
-            eyeInner,
-            {
-                rotation: 0,
-                duration: MORPH_ROTATION_S,
-                ease: "power2.inOut",
-                svgOrigin: origin,
-            },
-            "<",
-        );
+            // 4. DROP — hair falls back with a bounce; beard
+            //    catches the impact and rebounds with elastic
+            //    settle; eye returns to rest scale.
+            tl.to(
+                hair,
+                {
+                    y: 0,
+                    scale: 1,
+                    rotation: 0,
+                    duration: 0.5,
+                    ease: "bounce.out",
+                },
+                ">",
+            )
+                .to(
+                    beard,
+                    {
+                        scaleY: 1.04,
+                        scaleX: 0.98,
+                        duration: 0.18,
+                        ease: "power3.out",
+                    },
+                    "<+=0.25",
+                )
+                .to(
+                    beard,
+                    {
+                        scaleY: 1,
+                        scaleX: 1,
+                        duration: 0.4,
+                        ease: "elastic.out(1, 0.45)",
+                    },
+                    ">",
+                )
+                .to(
+                    eyeOuter,
+                    {
+                        scale: 1,
+                        duration: 0.35,
+                        ease: "power2.out",
+                    },
+                    "<-=0.2",
+                );
 
-        return () => {
-            tl.kill();
-        };
-    }, []);
+            // 5. CONVERGE — particles funnel down to the greeting
+            //    baseline. Runs in parallel with the hair drop so
+            //    the eye gets clear of the descending hair just as
+            //    the particles arrive below.
+            tl.to(
+                particles,
+                {
+                    x: (i) => setup[i].targetX - stageCenterX,
+                    y: (i) => setup[i].targetY - stageCenterY,
+                    duration: 0.6,
+                    ease: "power2.inOut",
+                    stagger: { each: 0.018, from: "random" },
+                },
+                "<-=0.3",
+            );
+
+            // 6. REVEAL — greeting fades in just as the first
+            //    particles arrive.
+            tl.to(
+                welcome,
+                {
+                    opacity: 1,
+                    y: 0,
+                    duration: 0.45,
+                    ease: "power2.out",
+                },
+                "-=0.35",
+            );
+
+            // 7. DISSOLVE — particles fade + shrink from the edges
+            //    inward, leaving a clean line.
+            tl.to(
+                particles,
+                {
+                    opacity: 0,
+                    scale: 0.4,
+                    duration: 0.4,
+                    ease: "power2.in",
+                    stagger: { each: 0.02, from: "edges" },
+                },
+                "-=0.2",
+            );
+
+            return () => {
+                tl.kill();
+            };
+        },
+        { dependencies: [] },
+    );
 
     return (
         <div
+            ref={stageRef}
             className={
                 "execlaw-mascot-stage" +
                 (className ? " " + className : "")
             }
-            style={{ width: size, height: size }}
         >
             <svg
                 ref={svgRef}
@@ -514,80 +642,68 @@ export function MascotGreeting({
                 height={size}
                 role="img"
                 aria-label="execlaw"
+                // 2026-05-21 — push the mascot 0.5rem down inside the
+                // stage so the visible art sits closer to the
+                // greeting baseline. Pairs with the negative margin
+                // on `__text` below — the two together keep the
+                // stage's total height unchanged while reducing the
+                // perceived gap between mascot chin and greeting.
+                style={{ marginTop: "0.5rem" }}
             >
-                {/* Hair — outer slide group + inner rotate
-                    group. The path ref is read once for getBBox
-                    so we can size the bracket to the welcome
-                    line. */}
-                <g ref={hairOuterRef}>
-                    <g ref={hairInnerRef}>
-                        <path
-                            ref={hairPathRef}
-                            d={HAIR_PATH}
-                            fill="currentColor"
-                        />
-                    </g>
-                </g>
-                {/* Beard. */}
-                <g ref={beardOuterRef}>
-                    <g ref={beardInnerRef}>
-                        <path
-                            ref={beardPathRef}
-                            d={BEARD_PATH}
-                            fill="currentColor"
-                        />
-                    </g>
-                </g>
-                {/* Eye + iris. The outer group also handles the
-                    opacity fade during the greeting. */}
-                <g ref={eyeOuterRef}>
-                    <g ref={eyeInnerRef}>
-                        <path
-                            ref={eyePathRef}
-                            d={EYE_PATH}
-                            fill="currentColor"
-                        />
-                        <g
-                            ref={irisRef}
-                            className="execlaw-mascot__iris"
-                        >
-                            <path d={IRIS_PATH} />
-                        </g>
-                    </g>
-                </g>
-                {/* Bracket overlays — d / stroke-width set at
-                    runtime from the welcome line's measured
-                    height (see useEffect). Initially hidden;
-                    fade in as the rotated hair/beard fades out. */}
-                <g ref={leftBracketOuterRef} opacity="0">
+                <path
+                    ref={hairRef}
+                    className="execlaw-mascot__hair"
+                    d={HAIR_PATH}
+                    fill="currentColor"
+                />
+                <path
+                    ref={beardRef}
+                    className="execlaw-mascot__beard"
+                    d={BEARD_PATH}
+                    fill="currentColor"
+                />
+                <g
+                    ref={eyeOuterRef}
+                    className="execlaw-mascot__eye-outer"
+                >
                     <path
-                        ref={leftBracketRef}
-                        d=""
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth={20}
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
+                        ref={eyePathRef}
+                        d={EYE_PATH}
+                        fill="currentColor"
                     />
-                </g>
-                <g ref={rightBracketOuterRef} opacity="0">
-                    <path
-                        ref={rightBracketRef}
-                        d=""
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth={20}
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                    />
+                    <g ref={irisRef} className="execlaw-mascot__iris">
+                        <path d={IRIS_PATH} />
+                    </g>
                 </g>
             </svg>
+
+            {/* Particles overlay — HTML divs so we can co-ordinate
+                CSS-pixel positions with the HTML greeting line. */}
+            <div
+                className="execlaw-mascot-stage__particles"
+                aria-hidden
+            >
+                {Array.from({ length: PARTICLE_COUNT }).map((_, i) => (
+                    <div
+                        key={i}
+                        ref={(el) => {
+                            particleRefs.current[i] = el;
+                        }}
+                        className="execlaw-mascot-stage__particle"
+                    />
+                ))}
+            </div>
+
             <span
                 ref={welcomeRef}
-                className="execlaw-mascot-stage__text"
+                className={
+                    "execlaw-mascot-stage__text " +
+                    `execlaw-mascot-stage__text--${fontVariant}`
+                }
                 data-testid="welcome-greeting-text"
+                data-font={fontVariant}
             >
-                Welcome, {userName}!
+                {greeting}
             </span>
         </div>
     );

@@ -231,6 +231,19 @@ html, body, #root {
     height: 100%;
 }
 
+// 2026-05-21 — bulletproof page-level scroll suppression. The
+// `body { overflow: hidden }` below USUALLY propagates to the
+// viewport scroll, but a child with `position: absolute` extending
+// past the body or with `overflow: visible` can still trigger an
+// html-level scrollbar in some browsers (notably Safari and older
+// Chromium). Setting `overflow: hidden` on `html` too closes that
+// loophole — no element above the chat shell can scroll, and the
+// chat shell owns its own scroll surfaces (welcome view, message
+// stream, settings modal, etc.).
+html {
+    overflow: hidden;
+}
+
 // Bootstrap's `[data-bs-theme=dark]` rule (which `index.html` opts
 // into) re-defines `--bs-body-bg`, `--bs-body-color`, etc. to its
 // stock dark palette (`#212529` etc.). That override has higher
@@ -411,6 +424,14 @@ body {
     display: flex;
     height: 100vh;
     width: 100%;
+    // 2026-05-21 — hard clip at the shell boundary. Per-route
+    // surfaces (chat stream, welcome view, settings modal, etc.)
+    // own their own scroll containers via `overflow-y: auto`;
+    // anything that extends past the shell (a rare misbehaving
+    // child or a long line that escaped `min-width: 0`) gets
+    // clipped here rather than leaking up to body / html and
+    // triggering a subtle page-level scrollbar.
+    overflow: hidden;
 }
 
 // Phase 14.D — floating sidebar.
@@ -789,6 +810,15 @@ body {
     min-height: 0;
     background-color: $bg-deep;
     margin-left: $main-offset;
+    // 2026-05-21 — clip overflow at the main-pane boundary so a
+    // misbehaving child (e.g. a long unwrapped code line in a
+    // markdown message bubble) can't push the layout horizontally
+    // and trigger a page-level scrollbar. Per-route scroll surfaces
+    // inside main (chat stream, welcome view, page--scroll) have
+    // their own `overflow-y: auto` and create their own scroll
+    // containers, so this `hidden` doesn't kill any intentional
+    // scrolling.
+    overflow: hidden;
 }
 
 @media (max-width: 767.98px) {
@@ -2117,14 +2147,35 @@ body {
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 1.5rem;
-    padding: 2rem 1.5rem;
+    // 2026-05-21 — tightened from `gap: 1.5rem; padding: 2rem 1.5rem`.
+    // The mascot greeting block grew ~50px when it switched from a
+    // single 216px overlay (text on top of mascot) to mascot-on-top
+    // + text-below. That tipped the welcome content past the
+    // viewport on 13" laptop windows and forced an internal scroll
+    // — visually it read as if the whole page was scrolling. The
+    // ~40px we save here (16px gap, 24px padding) recovers the
+    // overflow without touching the mascot's visual size.
+    gap: 1rem;
+    padding: 1.25rem 1.5rem;
+    // Allow the welcome to shrink below its content's intrinsic
+    // width inside the flex column. Without this, a wide greeting
+    // (e.g. "GOOD AFTERNOON, JUSTIN." in Antonio with wide
+    // letter-spacing) can force the welcome wider than its parent
+    // and push the absolute-positioned incognito button off-screen.
     min-height: 0;
-    // Y scrolls when content is tall; X stays visible so the
-    // mascot greeting's morphed brackets can extend past the
-    // mascot's nominal slot without being clipped or
-    // triggering a horizontal scrollbar.
-    overflow-x: visible;
+    min-width: 0;
+    // 2026-05-21 — `overflow-x: clip` (was `visible`). The mascot
+    // greeting text uses `white-space: nowrap` and can render
+    // wider than the welcome on narrow viewports; the GSAP
+    // particle burst also briefly translates dots well past the
+    // mascot's bounding box. Both used to leak past the welcome
+    // edges into the main pane, which on some browsers triggered
+    // a tiny html-level horizontal scroll (subtle, but enough to
+    // shift the absolute-positioned incognito button out of
+    // view). `clip` clips at the welcome boundary WITHOUT
+    // reserving a scrollbar (unlike `hidden`, which creates a
+    // scroll container even when no overflow exists).
+    overflow-x: clip;
     overflow-y: auto;
 }
 
@@ -2216,22 +2267,74 @@ body {
     .execlaw-mascot__iris path {
         fill: $bg-deep;
     }
+
+    // 2026-05-21 — hair / beard use `transform-box: fill-box` so
+    // the greeting-sequence transforms (hair lift + beard squash)
+    // pivot from each shape's OWN bbox via `transform-origin:
+    // 50% 100%` / `50% 0%`. Without fill-box those percentages
+    // resolve to the SVG canvas, tilting the lift off-axis.
+    //
+    // The eye-outer is intentionally EXCLUDED. It uses GSAP's
+    // `svgOrigin` (a user-space coordinate pinned to the eye
+    // path's measured centre) for both the lift's eye-widen AND
+    // the idle blink — fill-box on `<g>` bboxes that include the
+    // iris path drifts the pivot off the visual eye centre,
+    // which made the blink slide vertically. svgOrigin sidesteps
+    // the bbox entirely.
+    //
+    // The iris is intentionally excluded for the same reason —
+    // it stays in viewBox-unit world so the cursor-tracking
+    // math (operating in user-space units) keeps working.
+    .execlaw-mascot__hair,
+    .execlaw-mascot__beard {
+        transform-box: fill-box;
+    }
 }
 
-// Mascot greeting stage — the host frame for the mascot SVG and
-// the welcome overlay. The SVG's own shapes morph into bracket-
-// like silhouettes via GSAP; the welcome line is a plain HTML
-// span centred over the SVG, fading in once the morph completes.
-// `overflow: visible` mirrors the SVG override above — when the
-// brackets slide outward they extend horizontally past the
-// stage's nominal `size × size` slot.
+// Mascot greeting stage — the host frame for the mascot SVG, the
+// particle constellation overlay, and the greeting line.
+//
+// 2026-05-21 — restructured for the constellation-reveal redesign.
+// Stage is now a flex column: mascot on top, greeting below
+// (was previously absolute-centred over the mascot for the
+// bracket morph). `position: relative` so the particle overlay
+// can absolute-position into stage-local coordinates.
 .execlaw-mascot-stage {
     position: relative;
     display: inline-flex;
+    flex-direction: column;
     align-items: center;
-    justify-content: center;
     flex-shrink: 0;
     overflow: visible;
+}
+
+// Particles overlay — fixed at the stage's natural box. Each
+// particle is absolutely positioned at 50% / 50% (mascot centre)
+// as its CSS home; GSAP translates it from there to the burst
+// scatter and on to a converge target near the greeting line.
+// `pointer-events: none` so the particles don't intercept clicks
+// on whatever sits underneath them.
+.execlaw-mascot-stage__particles {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 1;
+}
+
+.execlaw-mascot-stage__particle {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 6px;
+    height: 6px;
+    margin: -3px 0 0 -3px;
+    border-radius: 50%;
+    background-color: $accent;
+    // Soft outer glow so the particle reads as a "spark" rather
+    // than a hard dot, especially against the deep background.
+    box-shadow: 0 0 6px rgba($accent, 0.55);
+    opacity: 0;
+    will-change: transform, opacity;
 }
 
 // Centred over the SVG, allowed to overflow horizontally so
@@ -2339,22 +2442,88 @@ body {
 }
 
 .execlaw-mascot-stage__text {
-    position: absolute;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    // Match `.execlaw-brand` — same monospace stack, same weight,
-    // same tight letter-spacing. The welcome greeting reads as a
-    // continuation of the brand identity rather than a separate
-    // typographic register.
-    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-    font-size: 1.4rem;
-    font-weight: 600;
+    // 2026-05-21 — sits below the mascot via flex flow (no longer
+    // overlaid on top). The greeting fades in once the particle
+    // constellation has converged onto its baseline; GSAP drives
+    // opacity + a small upward translate.
+    //
+    // `margin-top` is intentionally NEGATIVE — the mascot SVG has
+    // ~22% of the viewBox of empty space below the beard (the
+    // bottom of the actual mascot art sits ~48px above the SVG
+    // box's bottom edge at size=216). Pulling the text up by
+    // -2rem reaches into that whitespace so the text feels
+    // coupled to the mascot's chin (leaves ~16px of breathing
+    // room above the greeting baseline) rather than floating in
+    // space below the SVG's empty padding.
+    //
+    // Pairs with the inline `marginTop: 0.5rem` on the SVG: the
+    // mascot drops 8px while the text rises 32px, putting them
+    // closer together without growing the stage's total height.
+    //
+    // The base rule only carries layout / colour / animation
+    // hooks. Typography (font-family / size / weight / casing /
+    // letter-spacing / italic) is set per-variant below so the
+    // randomised font lands with the right cinematic feel.
+    margin-top: -2rem;
     color: $text-primary;
-    letter-spacing: -0.02em;
     white-space: nowrap;
     pointer-events: none;
     opacity: 0;
+    z-index: 2;
+    // Tweak text rendering for the display faces — antialiased on
+    // dark backgrounds keeps the thin strokes (Antonio, Unica One)
+    // from breaking up.
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+// ---- Greeting font variants ---------------------------------------
+//
+// 2026-05-21 — MascotGreeting picks one of these at random per
+// page load. Each variant is tuned (size + letter-spacing + casing)
+// so the greeting reads as the cinematic / title-card version of
+// itself rather than a default render. The sci-fi-leaning sans
+// faces (Unica One, Orbitron, Antonio) are rendered ALL CAPS with
+// wide tracking — Blade Runner / Dune / Eurostile heritage. The
+// editorial serif (Instrument Serif) stays mixed-case italic for
+// the "literary opening line" feel.
+.execlaw-mascot-stage__text--unica-one {
+    font-family: "Unica One", $font-system;
+    font-size: 1.7rem;
+    font-weight: 400;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+}
+
+.execlaw-mascot-stage__text--orbitron {
+    font-family: "Orbitron", $font-system;
+    // Orbitron's glyphs are wider than the other sci-fi faces, so
+    // we dial the size down + push letter-spacing up to keep the
+    // line proportionally similar.
+    font-size: 1.25rem;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+}
+
+.execlaw-mascot-stage__text--antonio {
+    font-family: "Antonio", $font-system;
+    // Antonio is heavily condensed — it can carry a larger size
+    // without overrunning the column.
+    font-size: 1.8rem;
+    font-weight: 400;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+.execlaw-mascot-stage__text--instrument-serif {
+    font-family: "Instrument Serif", Georgia, "Times New Roman", serif;
+    font-size: 1.9rem;
+    font-weight: 400;
+    font-style: italic;
+    // Mixed case here — italic editorial serif, no transform.
+    text-transform: none;
+    letter-spacing: 0;
 }
 
 .execlaw-welcome__composer {
@@ -2367,47 +2536,395 @@ body {
     // around it. Just hold the width.
 }
 
-.execlaw-welcome__suggestions {
+// ---- Welcome tile picker -----------------------------------------
+//
+// 2026-05-21 — replaces the original `.execlaw-welcome__suggestions`
+// row with a single-active-tile picker. Iterations:
+//   1. 2-column grid showing all enabled tiles + customise popover
+//      for visibility — felt cluttered.
+//   2. Horizontal pill nav above the active tile — works, but the
+//      nav competed with the tile content for attention.
+//   3. (current) Customise button at the BOTTOM with a drop-up
+//      popover for picking which tile is active. Quietest of the
+//      three. Default tile (`todays-brief`) speaks for itself; the
+//      picker is there for operators who want something different.
+//
+// The outer container and individual tile bodies are intentionally
+// background-less. Only inner cells (metric cards, thread rows,
+// prompt buttons) carry surface fills.
+.execlaw-welcome-tiles {
     width: 100%;
-    max-width: 720px;
+    max-width: 56rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.85rem;
+}
+
+// Active-tile container — transparent so the tile renders against
+// the welcome view's body colour, not a nested card.
+.execlaw-welcome-tiles__active {
+    min-height: 6rem;
+}
+
+// Bottom-anchored customise affordance.
+.execlaw-welcome-tiles__foot {
+    position: relative;
+    display: flex;
+    justify-content: center;
+    margin-top: 0.25rem;
+}
+
+.execlaw-welcome-tiles__customize {
+    background: transparent;
+    border: 0;
+    color: $text-muted;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.3rem 0.7rem;
+    border-radius: $radius-pill;
+    cursor: pointer;
+    transition: background-color 0.12s ease, color 0.12s ease;
+
+    i {
+        font-size: 0.9rem;
+    }
+
+    &:hover,
+    &.is-open {
+        background-color: $bg-surface;
+        color: $text-primary;
+    }
+}
+
+// Drop-UP popover (the customise button sits at the bottom of the
+// welcome tiles section, so the popover anchors above the button
+// via `bottom: 100%`).
+.execlaw-welcome-tiles__customizer {
+    position: absolute;
+    bottom: calc(100% + 0.4rem);
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 10;
+    background-color: $bg-surface;
+    border-radius: $radius-md;
+    box-shadow: $shadow-float;
+    padding: 0.4rem;
+    min-width: 16rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+}
+
+.execlaw-welcome-tiles__customizer-head {
+    color: $text-muted;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 0.5rem 0.65rem 0.35rem;
+}
+
+.execlaw-welcome-tiles__customizer-row {
+    background: transparent;
+    border: 0;
+    text-align: left;
+    width: 100%;
+    color: $text-primary;
+    padding: 0.45rem 0.65rem;
+    border-radius: $radius-md;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    font-size: 0.88rem;
+    transition: background-color 0.12s ease, color 0.12s ease;
+
+    &:hover {
+        background-color: $bg-elev;
+    }
+
+    &.is-active {
+        background-color: rgba($accent, 0.18);
+        color: color.adjust($accent, $lightness: 18%);
+    }
+}
+
+.execlaw-welcome-tiles__customizer-icon {
+    font-size: 0.95rem;
+    width: 1rem;
+    flex: 0 0 1rem;
+    text-align: center;
+    opacity: 0.85;
+}
+
+.execlaw-welcome-tiles__customizer-label {
+    flex: 1 1 auto;
+}
+
+.execlaw-welcome-tiles__customizer-check {
+    flex: 0 0 auto;
+    color: color.adjust($accent, $lightness: 18%);
+    font-size: 1rem;
+}
+
+// Default tile chrome — surface fill + padding + rounded corners
+// so each tile reads as a self-contained card. The MissionControl
+// variant overrides this to transparent (its four metric cells
+// carry the visual weight, an outer card behind them would feel
+// like double-stacking).
+.execlaw-welcome-tile {
+    background-color: $bg-surface;
+    border-radius: $radius-md;
+    padding: 0.9rem 1.1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+}
+
+.execlaw-welcome-tile__body {
+    color: $text-primary;
+    font-size: 0.9rem;
+    line-height: 1.5;
     display: flex;
     flex-direction: column;
     gap: 0.4rem;
-    color: $text-muted;
 }
 
-.execlaw-welcome__suggestions-label {
-    font-size: 0.85rem;
-    color: $text-muted;
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    margin-bottom: 0.25rem;
+// Today's brief — captivating itemised layout.
+//
+// Each brief line renders as a row with a severity-coloured icon
+// badge on the left and a bold headline + muted detail on the
+// right. Severity colours pull from the existing token palette
+// ($danger / $warning / $accent / $success / $text-muted) at ~15%
+// opacity for the badge fill and full strength for the icon glyph.
+//
+// A small refresh icon sits in the top-right corner — replaces the
+// previous footer button row so the brief itself owns the visual
+// weight.
+.execlaw-welcome-tile--brief {
+    position: relative;
 }
 
-.execlaw-welcome__suggestion {
-    text-align: left;
+.execlaw-welcome-tile__brief-refresh {
+    position: absolute;
+    top: 0.6rem;
+    right: 0.6rem;
+    width: 1.8rem;
+    height: 1.8rem;
     background: transparent;
     border: 0;
-    color: $text-primary;
-    padding: 0.6rem 0.75rem;
-    border-radius: $radius-pill;
+    color: $text-muted;
+    border-radius: 50%;
     cursor: pointer;
-    line-height: 1.4;
-    transition: background-color 0.12s ease;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.95rem;
+    transition: background-color 0.12s ease, color 0.12s ease;
+
+    &:hover:not(:disabled),
+    &:focus-visible:not(:disabled) {
+        background-color: $bg-elev;
+        color: $text-primary;
+    }
+
+    &:disabled {
+        cursor: default;
+        opacity: 0.5;
+    }
+}
+
+.execlaw-welcome-tile__brief-refresh-spin {
+    animation: execlaw-brief-refresh-spin 1.1s linear infinite;
+}
+
+@keyframes execlaw-brief-refresh-spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.execlaw-welcome-tile__brief-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.85rem;
+    padding: 0.25rem 0;
+}
+
+.execlaw-welcome-tile__brief-badge {
+    flex: 0 0 auto;
+    width: 2.25rem;
+    height: 2.25rem;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.05rem;
+    line-height: 1;
+
+    &.severity-danger {
+        background-color: rgba($danger, 0.18);
+        color: $danger;
+        box-shadow: 0 0 0 1px rgba($danger, 0.18) inset;
+    }
+
+    &.severity-warning {
+        background-color: rgba($warning, 0.2);
+        color: $warning;
+        box-shadow: 0 0 0 1px rgba($warning, 0.2) inset;
+    }
+
+    &.severity-info {
+        background-color: rgba($accent, 0.2);
+        color: color.adjust($accent, $lightness: 14%);
+        box-shadow: 0 0 0 1px rgba($accent, 0.2) inset;
+    }
+
+    &.severity-success {
+        background-color: rgba($success, 0.18);
+        color: $success;
+        box-shadow: 0 0 0 1px rgba($success, 0.18) inset;
+    }
+
+    &.severity-muted {
+        background-color: rgba($text-muted, 0.12);
+        color: $text-muted;
+    }
+}
+
+.execlaw-welcome-tile__brief-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    line-height: 1.45;
+    font-size: 0.95rem;
+    padding-top: 0.2rem;
+}
+
+.execlaw-welcome-tile__brief-headline {
+    font-family: $font-body;
+    font-weight: 600;
+    color: $text-primary;
+}
+
+.execlaw-welcome-tile__brief-detail {
+    color: $text-muted;
+}
+
+// Mission control — 4 inline metric cells. Transparent outer
+// container so the four metric cards aren't nested inside another
+// card (which read as cluttered against the brief / threads
+// tiles' single-surface fills).
+.execlaw-welcome-tile--metrics {
+    background: transparent;
+    padding: 0;
+
+    .execlaw-welcome-tile__metrics {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 0.5rem;
+
+        @media (max-width: 575.98px) {
+            grid-template-columns: repeat(2, 1fr);
+        }
+    }
+}
+
+.execlaw-welcome-tile__metric {
+    background-color: $bg-elev;
+    border-radius: $radius-md;
+    padding: 0.6rem 0.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    color: $text-primary;
+    text-decoration: none;
+    transition: background-color 0.12s ease, transform 0.12s ease;
 
     &:hover {
-        background-color: $bg-surface;
+        background-color: color.adjust($bg-elev, $lightness: 4%);
+        color: $text-primary;
+        text-decoration: none;
+        transform: translateY(-1px);
     }
+}
 
-    .execlaw-welcome__suggestion-title {
-        font-weight: 500;
-    }
+.execlaw-welcome-tile__metric-head {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    color: $text-muted;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
 
-    .execlaw-welcome__suggestion-sub {
+.execlaw-welcome-tile__metric-label {
+    line-height: 1;
+}
+
+.execlaw-welcome-tile__metric-value {
+    color: $text-primary;
+    font-family: $font-body;
+    font-size: 1.4rem;
+    font-weight: 500;
+    line-height: 1.1;
+}
+
+.execlaw-welcome-tile__metric-sub {
+    color: $text-muted;
+    font-size: 0.72rem;
+}
+
+// Quick prompts tile — tool-shaped pills.
+//
+// Row of compact pills, each firing a concrete tool-shaped prompt
+// when clicked. The pill tile itself drops the outer card frame
+// (no `$bg-surface` fill, no padding) so the pills float against
+// the welcome view's body — visually echoes the "row of
+// affordances under the composer" pattern other chat surfaces use.
+.execlaw-welcome-tile--prompts {
+    background: transparent;
+    padding: 0;
+}
+
+.execlaw-welcome-pills {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 0.5rem;
+}
+
+.execlaw-welcome-pill {
+    background-color: $bg-surface;
+    border: 0;
+    color: $text-primary;
+    padding: 0.5rem 0.95rem;
+    border-radius: $radius-pill;
+    font-size: 0.85rem;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    transition: background-color 0.12s ease, color 0.12s ease,
+        transform 0.12s ease;
+
+    i {
+        font-size: 0.95rem;
         color: $text-muted;
-        font-size: 0.85rem;
-        margin-left: 0.4rem;
+        transition: color 0.12s ease;
+    }
+
+    &:hover,
+    &:focus-visible {
+        background-color: $bg-elev;
+        transform: translateY(-1px);
+
+        i {
+            color: color.adjust($accent, $lightness: 14%);
+        }
     }
 }
 
