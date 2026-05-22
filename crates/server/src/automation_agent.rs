@@ -99,6 +99,35 @@ pub enum AskAgentError {
 #[derive(Debug, Clone)]
 pub struct AskAgentRequest {
     pub config: AskAgentConfig,
+    /// Flow-run id (M6-D streaming). When `Some`, the invoker emits
+    /// `FlowChannelEvent::AgentTextDelta` and friends so the
+    /// `/api/automations/flow-runs/{run_id}/events` SSE consumer
+    /// receives live token deltas. `None` disables flow-trace
+    /// streaming (test invocations, ad-hoc CLI use).
+    pub run_id: Option<String>,
+    /// Source AskAgent node id — used as the `node_id` field on the
+    /// emitted FlowChannelEvents so SPA renderers can attribute the
+    /// stream to the right tile.
+    pub node_id: Option<String>,
+    /// Conversation id when the trigger envelope's origin is
+    /// `ChatAppend{conversation_id}` (M6-D / M6-E). The invoker
+    /// mirrors text deltas to `UiEvent::ChatTokenDelta` so the chat
+    /// UI receives live text alongside the flow-trace stream.
+    pub conversation_id: Option<String>,
+}
+
+impl AskAgentRequest {
+    /// Build a config-only request — used by tests and the few
+    /// non-flow callers that don't need streaming. Equivalent to the
+    /// pre-M6-D shape.
+    pub fn from_config(config: AskAgentConfig) -> Self {
+        Self {
+            config,
+            run_id: None,
+            node_id: None,
+            conversation_id: None,
+        }
+    }
 }
 
 /// Behind-the-trait contract. Implementations are responsible for:
@@ -217,6 +246,18 @@ pub struct InferenceAgentInvoker {
     db: Database,
     inference: Arc<InferenceResolver>,
     metrics: InferenceMetrics,
+    /// FlowChannelHub for live token-delta streaming (M6-D). When
+    /// `Some`, each text chunk emits a `FlowChannelEvent::AgentTextDelta`
+    /// under the request's `run_id` so the SPA's flow-trace SSE feed
+    /// sees streaming text. `None` disables — tests + reduced
+    /// configurations work without.
+    flow_channel: Option<crate::flow_channel::FlowChannelHub>,
+    /// UiEvent bus for mirroring text deltas to chat-context
+    /// conversations (M6-D). When set + the request carries a
+    /// `conversation_id`, each chunk is also published as
+    /// `UiEvent::ChatTokenDelta` so the chat UI sees live text the
+    /// same way the legacy chat path delivers it.
+    events: Option<crate::events::EventBus>,
 }
 
 impl InferenceAgentInvoker {
@@ -238,7 +279,23 @@ impl InferenceAgentInvoker {
             db,
             inference,
             metrics,
+            flow_channel: None,
+            events: None,
         }
+    }
+
+    /// Wire the FlowChannelHub so streaming text deltas reach the
+    /// SPA's `/api/automations/flow-runs/{run_id}/events` SSE feed.
+    pub fn with_flow_channel(mut self, hub: crate::flow_channel::FlowChannelHub) -> Self {
+        self.flow_channel = Some(hub);
+        self
+    }
+
+    /// Wire the UiEvent bus so streaming text deltas to ChatAppend
+    /// origins reach the chat UI's WebSocket subscribers.
+    pub fn with_events(mut self, bus: crate::events::EventBus) -> Self {
+        self.events = Some(bus);
+        self
     }
 }
 
@@ -289,12 +346,31 @@ impl AgentInvoker for InferenceAgentInvoker {
         // M5 — wrap the chat-completions call with the metrics
         // observer so `/admin/inference` can attribute load to the
         // Automations consumer.
+        let stream_ctx = StreamingContext {
+            flow_channel: self.flow_channel.as_ref(),
+            events: self.events.as_ref(),
+            run_id: req.run_id.as_deref(),
+            node_id: req.node_id.as_deref(),
+            conversation_id: req.conversation_id.as_deref(),
+        };
         self.metrics
             .observe(InferenceConsumer::Automations, async {
-                do_invoke(&resolved.client, &resolved.model_id, &req.config).await
+                do_invoke(&resolved.client, &resolved.model_id, &req.config, stream_ctx).await
             })
             .await
     }
+}
+
+/// Bundle of optional broadcast/publish targets passed into
+/// `do_invoke` so the streaming-text callback can fan deltas out to
+/// the right places. Borrowed view — the invoker owns the hub/bus.
+#[derive(Clone, Copy)]
+struct StreamingContext<'a> {
+    flow_channel: Option<&'a crate::flow_channel::FlowChannelHub>,
+    events: Option<&'a crate::events::EventBus>,
+    run_id: Option<&'a str>,
+    node_id: Option<&'a str>,
+    conversation_id: Option<&'a str>,
 }
 
 /// Heuristic — is the model id one we recognize as vision-capable?
@@ -323,6 +399,7 @@ async fn do_invoke(
     client: &InferenceClient,
     model_id: &str,
     cfg: &AskAgentConfig,
+    ctx: StreamingContext<'_>,
 ) -> Result<ExitToolCall, AskAgentError> {
     let exit_names: Vec<String> = cfg.exit_tools.iter().map(|t| t.name.clone()).collect();
     let exit_names_csv = exit_names.join(", ");
@@ -354,9 +431,19 @@ async fn do_invoke(
         model: ModelId(model_id.to_string()),
         messages: vec![ChatMessage::system(system_prompt), user_msg],
         tools: Some(tools),
-        stream: false,
+        // M6-D — streaming on so the SPA sees live text. The
+        // chat_completions_streamed helper fans deltas into the
+        // callback below + still returns the fully-assembled
+        // ChatResponse (including tool_calls) so the exit-tool
+        // extraction logic below is unchanged.
+        stream: true,
         temperature: Some(0.2),
-        max_tokens: Some(512),
+        // M6-D — bumped 512 → 4096 to match the legacy chat path's
+        // ceiling. The old cap was a hangover from when AskAgent was
+        // strictly single-shot small-text replies; in chat-context
+        // (envelope.origin = ChatAppend) the agent may produce real
+        // working text before terminating.
+        max_tokens: Some(4096),
         chat_template_kwargs: Some(serde_json::json!({"enable_thinking": false})),
         tool_choice: Some(serde_json::json!("required")),
         // `guided_decoding_backend = Some("outlines")` is safe to
@@ -365,8 +452,36 @@ async fn do_invoke(
         // ignore the field. The serializer skips None entirely.
         guided_decoding_backend: Some("outlines".into()),
     };
+    // Streaming chunk index counter — the on_text_delta callback runs
+    // once per non-empty content chunk and we want each
+    // FlowChannelEvent::AgentTextDelta to carry a monotone index.
+    let mut chunk_index: u32 = 0;
     let resp = client
-        .chat_completions(&request)
+        .chat_completions_streamed(&request, |delta_text| {
+            // Fan out to the FlowChannelHub for the SSE consumer.
+            if let (Some(hub), Some(run_id), Some(node_id)) =
+                (ctx.flow_channel, ctx.run_id, ctx.node_id)
+            {
+                hub.publish(crate::flow_channel::FlowChannelEvent::AgentTextDelta {
+                    run_id: run_id.to_owned(),
+                    node_id: node_id.to_owned(),
+                    index: chunk_index,
+                    text: delta_text.to_owned(),
+                });
+            }
+            // Mirror to the chat UI when this AskAgent run is wired
+            // back to a conversation. The SPA's existing
+            // `chat_token_delta` handler appends into the streaming
+            // buffer keyed on conversation_id — exactly the same
+            // contract the legacy chat path uses.
+            if let (Some(bus), Some(conv_id)) = (ctx.events, ctx.conversation_id) {
+                bus.publish(crate::events::UiEvent::ChatTokenDelta {
+                    conversation_id: conv_id.to_owned(),
+                    text: delta_text.to_owned(),
+                });
+            }
+            chunk_index = chunk_index.saturating_add(1);
+        })
         .await
         .map_err(|e| AskAgentError::LlmFailure(format!("{e}")))?;
     let choice = resp
@@ -448,9 +563,7 @@ mod tests {
             args: serde_json::json!({"species": "cat", "confidence": 0.91}),
         });
         let out = inv
-            .invoke(&AskAgentRequest {
-                config: cfg_no_attachments(),
-            })
+            .invoke(&AskAgentRequest::from_config(cfg_no_attachments()))
             .await
             .unwrap();
         assert_eq!(out.name, "notify");
@@ -461,9 +574,7 @@ mod tests {
     async fn stub_invoker_returns_scripted_error() {
         let inv = StubAgentInvoker::err("simulated llm failure");
         let err = inv
-            .invoke(&AskAgentRequest {
-                config: cfg_no_attachments(),
-            })
+            .invoke(&AskAgentRequest::from_config(cfg_no_attachments()))
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("simulated llm failure"));
@@ -507,9 +618,7 @@ mod tests {
             max_observed: max_observed.clone(),
         });
         let pool = AutomationsAgentPool::new(inv);
-        let req = AskAgentRequest {
-            config: cfg_no_attachments(),
-        };
+        let req = AskAgentRequest::from_config(cfg_no_attachments());
         // Fire 3 in parallel.
         let p1 = pool.clone();
         let r1 = req.clone();
@@ -563,9 +672,7 @@ mod tests {
             max_observed: max_observed.clone(),
         });
         let pool = AutomationsAgentPool::with_concurrency(inv, 2);
-        let req = AskAgentRequest {
-            config: cfg_no_attachments(),
-        };
+        let req = AskAgentRequest::from_config(cfg_no_attachments());
         let p1 = pool.clone();
         let r1 = req.clone();
         let p2 = pool.clone();
@@ -624,9 +731,7 @@ mod tests {
         let resolver = Arc::new(InferenceResolver::new(None));
         let invoker = InferenceAgentInvoker::new(db, resolver);
         let err = invoker
-            .invoke(&AskAgentRequest {
-                config: cfg_no_attachments(),
-            })
+            .invoke(&AskAgentRequest::from_config(cfg_no_attachments()))
             .await
             .unwrap_err();
         assert!(matches!(err, AskAgentError::NoLlmConfigured));
@@ -666,9 +771,7 @@ mod tests {
         let resolver = Arc::new(InferenceResolver::new(None));
         let invoker = InferenceAgentInvoker::new(db, resolver);
         let err = invoker
-            .invoke(&AskAgentRequest {
-                config: cfg_with_image(),
-            })
+            .invoke(&AskAgentRequest::from_config(cfg_with_image()))
             .await
             .unwrap_err();
         // Vision row WAS selected → no VisionRequiredButTextOnlyModel.
@@ -695,9 +798,7 @@ mod tests {
         resolver.bootstrap_model = Some("QuantTrio/Qwen3.5-27B-AWQ".into());
         let invoker = InferenceAgentInvoker::new(db, Arc::new(resolver));
         let err = invoker
-            .invoke(&AskAgentRequest {
-                config: cfg_with_image(),
-            })
+            .invoke(&AskAgentRequest::from_config(cfg_with_image()))
             .await
             .unwrap_err();
         match err {

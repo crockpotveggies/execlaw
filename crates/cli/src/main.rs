@@ -1876,18 +1876,24 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
     // the same instance. Future call sites (chat / routines /
     // research) wire the same handle for cross-consumer slicing.
     let inference_metrics = execlaw_server::inference_metrics::InferenceMetrics::new();
+    // M6 — shared flow-channel hub. Same instance lives on
+    // `AppState.flow_channel` AND inside the executor's ctx so SPA
+    // subscribers see events from real bus-driven runs.
+    let flow_channel = execlaw_server::flow_channel::FlowChannelHub::new();
+    // M6-D — invoker wired with the flow hub AND the UI event bus so
+    // streaming AskAgent runs fan deltas into the SSE flow-trace
+    // feed AND (when the trigger envelope's origin is ChatAppend)
+    // into the chat UI's live-token channel.
     let automation_agent_pool =
         execlaw_server::automation_agent::AutomationsAgentPool::new(std::sync::Arc::new(
             execlaw_server::automation_agent::InferenceAgentInvoker::new_with_metrics(
                 db.clone(),
                 inference.clone(),
                 inference_metrics.clone(),
-            ),
+            )
+            .with_flow_channel(flow_channel.clone())
+            .with_events(events.clone()),
         ));
-    // M6 — shared flow-channel hub. Same instance lives on
-    // `AppState.flow_channel` AND inside the executor's ctx so SPA
-    // subscribers see events from real bus-driven runs.
-    let flow_channel = execlaw_server::flow_channel::FlowChannelHub::new();
     let (automation_bus, automation_bus_tasks) =
         execlaw_server::automation_bus::AutomationBus::spawn(
             db.clone(),

@@ -401,7 +401,7 @@ fn execute_graph(
             node_id: node.id.clone(),
             node_kind: node.kind.as_str().to_owned(),
         });
-        let exec_result = execute_node(node, state, ctx, envelope);
+        let exec_result = execute_node(node, state, ctx, envelope, run_id);
         let ms = start.elapsed().as_millis() as u64;
 
         match exec_result {
@@ -523,6 +523,7 @@ fn execute_node(
     state: &HashMap<String, serde_json::Value>,
     ctx: &ExecutorContext,
     envelope: &execlaw_core::event_envelope::EventEnvelope,
+    run_id: &str,
 ) -> NodeOutcome {
     match node.kind {
         NodeKind::Filter => execute_filter(node, state),
@@ -535,7 +536,7 @@ fn execute_node(
             NodeOutcome::Output(serde_json::json!({}))
         }
         NodeKind::Terminal => NodeOutcome::Terminal,
-        NodeKind::AskAgent => execute_ask_agent(node, state, &ctx.pool),
+        NodeKind::AskAgent => execute_ask_agent(node, state, &ctx.pool, envelope, run_id),
         NodeKind::Notify => execute_notify(node, state, &ctx.db),
         NodeKind::CallPlugin => execute_call_plugin(node, state, ctx.plugin_host.as_ref()),
         NodeKind::SendReply => execute_send_reply(node, state, ctx, envelope),
@@ -886,6 +887,8 @@ fn execute_ask_agent(
     node: &NodeDef,
     state: &HashMap<String, serde_json::Value>,
     pool: &AutomationsAgentPool,
+    envelope: &execlaw_core::event_envelope::EventEnvelope,
+    run_id: &str,
 ) -> NodeOutcome {
     let mut cfg = match parse_ask_agent_config(&node.config) {
         Ok(c) => c,
@@ -901,7 +904,24 @@ fn execute_ask_agent(
         .into_iter()
         .map(|a| render_template(&a, state))
         .collect();
-    let req = AskAgentRequest { config: cfg };
+    // M6-D — derive the chat conversation_id from the trigger
+    // envelope's origin so the streaming text mirrors into the chat
+    // UI when this AskAgent run is tied to a thread. Other origins
+    // (PluginChannel, Alert, None, WebSocketSession) don't carry a
+    // conversation_id; live tokens still reach the flow-trace SSE
+    // feed via run_id/node_id below.
+    let conversation_id = match &envelope.origin {
+        execlaw_core::event_envelope::OriginRef::ChatAppend { conversation_id } => {
+            Some(conversation_id.clone())
+        }
+        _ => None,
+    };
+    let req = AskAgentRequest {
+        config: cfg,
+        run_id: Some(run_id.to_owned()),
+        node_id: Some(node.id.clone()),
+        conversation_id,
+    };
     // We're inside a `spawn_blocking` thread; `Handle::current()`
     // gives us the calling tokio runtime so we can drive the async
     // invocation to completion without holding a worker.
