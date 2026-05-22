@@ -216,29 +216,81 @@ pub fn default_web_flow_json() -> serde_json::Value {
 }
 
 /// Seed the core default web prompt flow into `state_automations`
-/// if no row claims the slot yet. Idempotent. Stamps `source = 'core'`
-/// so the row is protected from operator deletion via the regular
-/// admin endpoint (the install lifecycle owns these rows).
+/// if no row claims the slot yet, AND auto-heal stale rows that
+/// drifted from the current `default_web_flow_json()` shape (e.g.
+/// kept legacy `trigger.kind = "other"` after BusEventKind→String,
+/// or carry an explicit Terminal "end" node from before the END
+/// sentinel migration).
+///
+/// Idempotent:
+///   * Missing row → seed (source='core', operator_modified=false).
+///   * Present, `operator_modified=false`, definition matches canonical
+///     → no-op.
+///   * Present, `operator_modified=false`, definition differs → rewrite
+///     to canonical shape, re-stamp source='core' and operator_modified=0.
+///   * Present, `operator_modified=true` → respect the operator's edits;
+///     leave alone even if drifted.
 pub fn ensure_default_web_flow(db: &execlaw_core::Database) -> Result<(), String> {
     use execlaw_core::automations::{AutomationStore, AutomationUpsert};
 
     let store = AutomationStore::new(db);
     let rows = store.list_all().map_err(|e| format!("list: {e}"))?;
     const NAME: &str = "Default web prompt flow";
-    if rows.iter().any(|r| r.name == NAME) {
-        return Ok(());
-    }
-    let def: execlaw_core::automations::AutomationDef =
+
+    let canonical: execlaw_core::automations::AutomationDef =
         serde_json::from_value(default_web_flow_json())
             .map_err(|e| format!("default flow parse: {e}"))?;
     let now = chrono::Utc::now().timestamp_millis();
+
+    if let Some(existing) = rows.iter().find(|r| r.name == NAME) {
+        if existing.operator_modified {
+            // Operator has taken ownership of the row — respect that.
+            return Ok(());
+        }
+        if existing.definition == canonical {
+            // Already in sync.
+            return Ok(());
+        }
+        // Drifted — heal in place. We use the same upsert path the
+        // initial seed uses, then re-stamp source='core' and clear
+        // operator_modified (the upsert may have set updated_at but
+        // the row's source classification must remain "core").
+        tracing::info!(
+            id = %existing.id,
+            "M6: healing stale default web prompt flow (operator_modified=false, definition drifted from canonical)",
+        );
+        let row = store
+            .upsert(
+                &AutomationUpsert {
+                    id: Some(existing.id.clone()),
+                    name: NAME.into(),
+                    enabled: existing.enabled,
+                    definition: canonical,
+                },
+                now,
+            )
+            .map_err(|e| format!("upsert heal default flow: {e}"))?;
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE state_automations \
+                 SET source = 'core', operator_modified = 0 \
+                 WHERE id = ?1",
+                rusqlite::params![row.id],
+            )?;
+            Ok(())
+        })
+        .map_err(|e| format!("restamp source=core after heal: {e}"))?;
+        return Ok(());
+    }
+
+    // Fresh seed.
     let row = store
         .upsert(
             &AutomationUpsert {
                 id: None,
                 name: NAME.into(),
                 enabled: true,
-                definition: def,
+                definition: canonical,
             },
             now,
         )
@@ -284,5 +336,153 @@ mod tests {
         let def: execlaw_core::automations::AutomationDef =
             serde_json::from_value(v).unwrap();
         execlaw_core::automations::validate(&def).expect("default flow must validate clean");
+    }
+
+    // ---- ensure_default_web_flow heal-path coverage ----
+
+    fn fresh_db() -> execlaw_core::Database {
+        let db = execlaw_core::Database::open(
+            &execlaw_core::db::DbConfig::in_memory_unencrypted(),
+        )
+        .expect("open db");
+        execlaw_core::migrations::MigrationRunner::new(&db)
+            .apply_all()
+            .expect("apply migrations");
+        db
+    }
+
+    fn fetch_default_row(
+        db: &execlaw_core::Database,
+    ) -> Option<execlaw_core::automations::AutomationRow> {
+        execlaw_core::automations::AutomationStore::new(db)
+            .list_all()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.name == "Default web prompt flow")
+    }
+
+    #[test]
+    fn ensure_default_web_flow_seeds_when_missing() {
+        let db = fresh_db();
+        assert!(fetch_default_row(&db).is_none());
+        ensure_default_web_flow(&db).unwrap();
+        let row = fetch_default_row(&db).expect("seeded row");
+        assert_eq!(row.source, "core");
+        assert!(!row.operator_modified);
+        assert_eq!(row.definition.trigger.kind, "web.prompt.submitted");
+    }
+
+    #[test]
+    fn ensure_default_web_flow_is_idempotent() {
+        let db = fresh_db();
+        ensure_default_web_flow(&db).unwrap();
+        let first = fetch_default_row(&db).unwrap();
+        ensure_default_web_flow(&db).unwrap();
+        let second = fetch_default_row(&db).unwrap();
+        // Same id, same updated_at — the heal branch short-circuits on
+        // PartialEq match so no rewrite happens.
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.updated_at, second.updated_at);
+    }
+
+    #[test]
+    fn ensure_default_web_flow_heals_stale_row_when_operator_did_not_edit() {
+        // Simulate a row from an older build: trigger.kind = "other"
+        // (pre-BusEventKind→String) AND an explicit Terminal "end"
+        // node (pre-END-sentinel migration). operator_modified=false.
+        let db = fresh_db();
+        let store = execlaw_core::automations::AutomationStore::new(&db);
+        let stale_def: execlaw_core::automations::AutomationDef = serde_json::from_value(
+            serde_json::json!({
+                "trigger": {"kind": "other", "when": null},
+                "nodes": [
+                    {"id": "end", "kind": "Terminal", "config": {}}
+                ],
+                "edges": [
+                    {"from": "trigger", "to": "end", "when": null}
+                ]
+            }),
+        )
+        .unwrap();
+        let row = store
+            .upsert(
+                &execlaw_core::automations::AutomationUpsert {
+                    id: None,
+                    name: "Default web prompt flow".into(),
+                    enabled: true,
+                    definition: stale_def,
+                },
+                42,
+            )
+            .unwrap();
+        // Stamp as core (matches what the original seed did).
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE state_automations SET source = 'core', operator_modified = 0 WHERE id = ?1",
+                rusqlite::params![row.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        ensure_default_web_flow(&db).unwrap();
+
+        let healed = fetch_default_row(&db).expect("heal must leave a row");
+        assert_eq!(healed.id, row.id, "id must be preserved across heal");
+        assert_eq!(healed.source, "core");
+        assert!(!healed.operator_modified);
+        assert_eq!(healed.definition.trigger.kind, "web.prompt.submitted");
+        // Canonical shape has 2 operator nodes + 3 edges → END sentinel.
+        assert_eq!(healed.definition.nodes.len(), 2);
+        assert_eq!(healed.definition.edges.len(), 3);
+        assert!(healed.definition.edges.iter().any(|e| e.to == "END"));
+    }
+
+    #[test]
+    fn ensure_default_web_flow_respects_operator_edits() {
+        // Same legacy shape, but operator_modified=true. The heal
+        // logic MUST leave it alone — operator ownership is sacred.
+        let db = fresh_db();
+        let store = execlaw_core::automations::AutomationStore::new(&db);
+        let stale_def: execlaw_core::automations::AutomationDef = serde_json::from_value(
+            serde_json::json!({
+                "trigger": {"kind": "other", "when": null},
+                "nodes": [
+                    {"id": "end", "kind": "Terminal", "config": {}}
+                ],
+                "edges": [
+                    {"from": "trigger", "to": "end", "when": null}
+                ]
+            }),
+        )
+        .unwrap();
+        let row = store
+            .upsert(
+                &execlaw_core::automations::AutomationUpsert {
+                    id: None,
+                    name: "Default web prompt flow".into(),
+                    enabled: true,
+                    definition: stale_def.clone(),
+                },
+                42,
+            )
+            .unwrap();
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE state_automations SET source = 'core', operator_modified = 1 WHERE id = ?1",
+                rusqlite::params![row.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        ensure_default_web_flow(&db).unwrap();
+
+        let after = fetch_default_row(&db).expect("row must stay");
+        assert!(after.operator_modified);
+        assert_eq!(
+            after.definition.trigger.kind, "other",
+            "operator-edited row must NOT be healed"
+        );
     }
 }
