@@ -67,11 +67,6 @@ fn build_state(transcript: &'static str) -> AppState {
         skill_capture: execlaw_skills::AutoCaptureSink::noop(),
         reuse_update: execlaw_skills::ReuseUpdateSink::noop(),
         automation_bus: execlaw_server::automation_bus::AutomationBus::stub(db),
-        automation_agent_pool: execlaw_server::automation_agent::AutomationsAgentPool::new(
-            std::sync::Arc::new(execlaw_server::automation_agent::StubAgentInvoker::err(
-                "test pool: no LLM",
-            )),
-        ),
 
         data_dir: std::env::temp_dir().join(format!("execlaw-test-{}", uuid::Uuid::new_v4())),
         inference_metrics: execlaw_server::inference_metrics::InferenceMetrics::new(),

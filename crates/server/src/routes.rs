@@ -939,15 +939,6 @@ pub fn test_app_state() -> AppState {
         // `AutomationBus::spawn` inside a `#[tokio::test]` (the
         // automation_bus module's own tests do this).
         automation_bus: crate::automation_bus::AutomationBus::stub(db.clone()),
-        // M3 + M4c — test-fixture agent pool. The invoker returns an
-        // error for any AskAgent invocation, which is what we want
-        // in tests that don't exercise the LLM path. Tests that DO
-        // exercise AskAgent construct their own pool inline.
-        automation_agent_pool: crate::automation_agent::AutomationsAgentPool::new(
-            std::sync::Arc::new(crate::automation_agent::StubAgentInvoker::err(
-                "test fixture pool: no LLM wired",
-            )),
-        ),
         // M5 — empty metrics handle. Tests that exercise the metrics
         // page can pre-populate this via `state.inference_metrics
         // .observe(...)` and snapshot.

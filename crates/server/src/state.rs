@@ -1,6 +1,5 @@
 //! Shared application state.
 
-use crate::automation_agent::AutomationsAgentPool;
 use crate::automation_bus::AutomationBus;
 use crate::events::EventBus;
 use crate::inference_metrics::InferenceMetrics;
@@ -229,12 +228,6 @@ pub struct AppState {
     /// is the in-process SPA-broadcast bus; this one is the durable
     /// inbox for automation triggers.
     pub automation_bus: AutomationBus,
-    /// M3 + M4c — handle to the automations agent pool. The bus
-    /// handler closes over this (live dispatch); admin routes
-    /// (test-run, currently) also need it. Same `Arc<Semaphore>`
-    /// under the hood, so a test-run honors the pool's concurrency
-    /// cap alongside live runs.
-    pub automation_agent_pool: AutomationsAgentPool,
     /// M5 — per-consumer inference observability. Wrapping LLM
     /// calls with `metrics.observe(consumer, fut)` records
     /// in_flight, totals, and per-call latency for the

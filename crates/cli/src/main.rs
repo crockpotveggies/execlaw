@@ -1852,44 +1852,23 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
             inference.clone(),
         );
 
-    // M1/M2/M3 of Automations — spawn the durable event bus before
-    // constructing AppState so the dispatcher + poller are live
-    // before the first ingress (webhook routes mount after this
-    // point). The handler runs the automation matcher: for each
-    // delivered event, it looks up enabled automations whose
-    // trigger.kind matches, evaluates trigger.when predicates, and
-    // executes the typed graph. M3 adds the `AskAgent` node, which
-    // delegates to the `AutomationsAgentPool`. The pool wraps
-    // `InferenceAgentInvoker` (real LLM via the inference resolver)
-    // and bounds concurrency at the locked default (1). When no
-    // inference backend is configured, AskAgent fails fast with
-    // `NoLlmConfigured` rather than silently hanging.
-    let automation_bus_stop = std::sync::Arc::new(tokio::sync::Notify::new());
     // M5 — shared inference metrics handle. Threaded into the
-    // automations agent invoker (Automations consumer attribution)
-    // and stored on AppState so the `/admin/inference` page reads
-    // the same instance. Future call sites (chat / routines /
-    // research) wire the same handle for cross-consumer slicing.
+    // chat path's metrics-observer wrapper so the `/admin/inference`
+    // page sees per-consumer slices. Always present (cheap default
+    // constructor); future call sites (routines / research) wire
+    // the same handle for cross-consumer slicing.
     let inference_metrics = execlaw_server::inference_metrics::InferenceMetrics::new();
-    // 2026-05-22 — M6 rip-out preserves the test-run path (operators
-    // still edit + dry-run flows on the canvas) but deletes the
-    // event bus, ReplyRouter, AskAgent invoker, and per-run flow
-    // channel. AskAgent/SendReply node kinds remain in the enum so
-    // saved flows deserialize, but the executor returns a clean
-    // "node kind not supported in this build" error for them. The
-    // pool stays as a stub for the same reason — kept in AppState
-    // so admin handlers compile uniformly.
-    let automation_agent_pool =
-        execlaw_server::automation_agent::AutomationsAgentPool::new(std::sync::Arc::new(
-            execlaw_server::automation_agent::StubAgentInvoker::err(
-                "AskAgent: invoker removed in M6 rip-out — use the chat path or rebuild with a middleware-aware invoker",
-            ),
-        ));
-    // 2026-05-22 — M6 rip-out: the durable bus + live dispatcher
-    // are gone. A stub `AutomationBus` keeps `AppState.automation_bus`
-    // shape-valid until Rip 3 deletes the field outright.
+    // 2026-05-22 — M6 rip-out (Rip 2): the AskAgent invoker + pool
+    // are gone. Saved flows containing AskAgent nodes still
+    // deserialize; the runtime returns a clean "node kind not
+    // supported in this build" error at execution time. The
+    // middleware redesign reintroduces the agent surface as a
+    // pre-turn mutator instead of a node executor.
+    //
+    // Rip 3 (forthcoming) deletes the bus dispatcher entirely; the
+    // `AutomationBus::stub(db)` here keeps `AppState.automation_bus`
+    // shape-valid in the interim.
     let automation_bus = execlaw_server::automation_bus::AutomationBus::stub(db.clone());
-    let _ = automation_bus_stop;
 
     let state = execlaw_server::AppState {
         db: db.clone(),
@@ -1919,9 +1898,8 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         reuse_update: reuse_update_sink,
         data_dir: data_dir.clone(),
         automation_bus,
-        automation_agent_pool,
-        // M5 — same handle as the automations invoker holds, so the
-        // `/admin/inference` snapshot endpoint sees AskAgent calls.
+        // M5 — per-consumer inference observability; chat/research
+        // wrap their LLM calls with `metrics.observe(consumer, fut)`.
         inference_metrics,
     };
     // 2026-05-22 — automation_bus_tasks were the dispatcher + poller
@@ -2063,7 +2041,6 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
     }
     // 2026-05-22 — bus shutdown linkage retired with the M6 rip-out.
     // The stub AutomationBus has no background tasks to drain.
-    let _ = automation_bus_stop;
 
     // Phase 12.C — backend supervisor reconcile loop. Only spawns
     // if the Docker connect succeeded above; otherwise managed-mode

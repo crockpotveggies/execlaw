@@ -21,7 +21,6 @@ pub mod attachment_api;
 pub mod attachments_admin;
 pub mod auth;
 pub mod auth_extract;
-pub mod automation_agent;
 pub mod automation_bus;
 pub mod automation_runtime;
 pub mod automation_suggestions_sweeper;

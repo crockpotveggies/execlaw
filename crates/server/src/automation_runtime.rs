@@ -29,7 +29,6 @@
 //! so we shuttle the work onto a `spawn_blocking` thread to avoid
 //! parking the tokio runtime on SQLite writes.
 
-use crate::automation_agent::{AskAgentRequest, AutomationsAgentPool};
 use crate::automation_bus::EventHandler;
 use execlaw_core::Database;
 use execlaw_core::alerts::{AlertRow, AlertStatus, AlertStore, Severity};
@@ -37,7 +36,7 @@ use execlaw_core::automation_bus::BusEventRow;
 use execlaw_core::automation_runs::{AutomationRunStatus, AutomationRunStore, StepTrace};
 use execlaw_core::automations::{
     AutomationDef, AutomationRow, AutomationStore, END_SENTINEL, NodeDef, NodeKind,
-    TRIGGER_SENTINEL, TriggerDef, parse_ask_agent_config,
+    TRIGGER_SENTINEL, TriggerDef,
 };
 use execlaw_core::ids::AlertId;
 use execlaw_plugin_host::PluginHost;
@@ -54,7 +53,6 @@ use tracing::{debug, warn};
 #[derive(Clone)]
 pub struct ExecutorContext {
     pub db: Database,
-    pub pool: AutomationsAgentPool,
     /// Optional so tests that don't exercise CallPlugin can wire the
     /// runtime without spinning up a full plugin host. A `None` here
     /// turns CallPlugin into a clean per-node error rather than a
@@ -63,10 +61,9 @@ pub struct ExecutorContext {
 }
 
 impl ExecutorContext {
-    pub fn new(db: Database, pool: AutomationsAgentPool, plugin_host: Option<PluginHost>) -> Self {
+    pub fn new(db: Database, plugin_host: Option<PluginHost>) -> Self {
         Self {
             db,
-            pool,
             plugin_host,
         }
     }
@@ -927,14 +924,8 @@ fn eval_value(expr: &str, scope: &mut Scope<'static>) -> Result<serde_json::Valu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::automation_agent::{
-        AskAgentError, AutomationsAgentPool, ExitToolCall, StubAgentInvoker,
-    };
-    use execlaw_core::Database;
     use execlaw_core::automation_bus::{BusEventStore, Event as BusEvent};
-    use execlaw_core::automations::{
-        AutomationDef, AutomationStore, AutomationUpsert, EdgeDef, NodeDef, NodeKind, TriggerDef,
-    };
+    use execlaw_core::automations::{AutomationStore, AutomationUpsert, EdgeDef};
     use execlaw_core::db::DbConfig;
     use execlaw_core::migrations::MigrationRunner;
 
@@ -944,30 +935,11 @@ mod tests {
         db
     }
 
-    /// Pool used by tests that don't exercise AskAgent. Calling
-    /// `invoke` on it returns an error Ã¢â‚¬â€ fine, no test reaches that
-    /// path. Keeps the runtime signature uniform.
-    fn noop_pool() -> AutomationsAgentPool {
-        AutomationsAgentPool::new(Arc::new(StubAgentInvoker::err(
-            "noop pool Ã¢â‚¬â€ test should not exercise AskAgent",
-        )))
-    }
-
-    /// Executor context for tests that don't exercise CallPlugin Ã¢â‚¬â€
+    /// Executor context for tests that don't exercise CallPlugin —
     /// i.e., the default for Filter/Transform/Branch/Terminal/Notify
-    /// flows. `Notify` writes through the wired DB; CallPlugin tests
-    /// supply a plugin host via [`ExecutorContext::new`] directly.
+    /// flows. `Notify` writes through the wired DB.
     fn noop_ctx(db: &Database) -> ExecutorContext {
-        ExecutorContext::new(db.clone(), noop_pool(), None)
-    }
-
-    /// Context with a specific agent pool wired (for AskAgent tests).
-    fn agent_ctx(db: &Database, pool: AutomationsAgentPool) -> ExecutorContext {
-        ExecutorContext::new(db.clone(), pool, None)
-    }
-
-    fn stub_pool(call: ExitToolCall) -> AutomationsAgentPool {
-        AutomationsAgentPool::new(Arc::new(StubAgentInvoker::ok(call)))
+        ExecutorContext::new(db.clone(), None)
     }
 
     fn seed_bus_event(db: &Database, id: &str, payload: serde_json::Value) -> BusEventRow {

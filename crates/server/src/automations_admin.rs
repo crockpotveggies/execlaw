@@ -623,10 +623,9 @@ pub async fn test_run(
     // synchronously via `block_on`). Push it onto a blocking thread
     // so the admin handler doesn't park a runtime worker.
     let db = state.db.clone();
-    let pool = state.automation_agent_pool.clone();
     let plugin_host = Some(state.plugin_host.clone());
     let result = tokio::task::spawn_blocking(move || {
-        let ctx = automation_runtime::ExecutorContext::new(db, pool, plugin_host);
+        let ctx = automation_runtime::ExecutorContext::new(db, plugin_host);
         automation_runtime::dry_run(&ctx, &automation, &event)
     })
     .await
