@@ -1888,8 +1888,22 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
     // other group spawns on first inbound turn. `ensure_for_group`
     // returns the existing handle when one's already up so this
     // costs ~50µs in the hot path.
+    //
+    // Spawn deadline. Raised from 30s → 90s 2026-05-21 because cold
+    // starts that include image pulls or the python-sandbox sidecar
+    // bring-up routinely exceed 30s on real Docker installs, causing
+    // a confusing `runner turn failed: operation timed out` error
+    // for the operator on what should be a routine first-turn.
+    // EXECLAW_RUNNER_SPAWN_TIMEOUT_SECS lets power users tune it
+    // without a SPA setting + migration round-trip (proper Settings
+    // surface lives behind a longer-tail cleanup).
+    let spawn_deadline_secs: u64 = std::env::var("EXECLAW_RUNNER_SPAWN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&v: &u64| (5..=600).contains(&v))
+        .unwrap_or(90);
     supervisor
-        .ensure_for_group(group_id, std::time::Duration::from_secs(30))
+        .ensure_for_group(group_id, std::time::Duration::from_secs(spawn_deadline_secs))
         .await
         .map_err(|e| format!("ensure runner: {e}"))?;
 
