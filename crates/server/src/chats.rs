@@ -34,7 +34,7 @@ use crate::state::AppState;
 mod attachments;
 mod helpers;
 mod prompt;
-mod types;
+pub(crate) mod types;
 
 // 2026-05-16 — types lifted into `chats/types.rs`. Re-exported
 // here so external callers (and the OpenAPI generator) keep

@@ -536,7 +536,7 @@ fn execute_node(
             NodeOutcome::Output(serde_json::json!({}))
         }
         NodeKind::Terminal => NodeOutcome::Terminal,
-        NodeKind::AskAgent => execute_ask_agent(node, state, &ctx.pool, envelope, run_id),
+        NodeKind::AskAgent => execute_ask_agent(node, state, ctx, envelope, run_id),
         NodeKind::Notify => execute_notify(node, state, &ctx.db),
         NodeKind::CallPlugin => execute_call_plugin(node, state, ctx.plugin_host.as_ref()),
         NodeKind::SendReply => execute_send_reply(node, state, ctx, envelope),
@@ -886,10 +886,11 @@ fn render_template_in_value(
 fn execute_ask_agent(
     node: &NodeDef,
     state: &HashMap<String, serde_json::Value>,
-    pool: &AutomationsAgentPool,
+    ctx: &ExecutorContext,
     envelope: &execlaw_core::event_envelope::EventEnvelope,
     run_id: &str,
 ) -> NodeOutcome {
+    let pool = &ctx.pool;
     let mut cfg = match parse_ask_agent_config(&node.config) {
         Ok(c) => c,
         Err(msg) => return NodeOutcome::Error(msg),
@@ -916,11 +917,22 @@ fn execute_ask_agent(
         }
         _ => None,
     };
+    // M6-E — load conversation history when this run is bound to a
+    // chat thread. We replay every event from seq 0, project user_msg
+    // + model_turn to a role/text pair (the same `HistoryMessage`
+    // shape the legacy chat path consumes), then apply the same
+    // token-budget truncation policy so prompts don't blow past the
+    // operator-configured ceiling. Non-chat flows pass an empty Vec.
+    let history = match &conversation_id {
+        Some(cid_str) => load_history_for_conversation(ctx, cid_str.as_str()),
+        None => Vec::new(),
+    };
     let req = AskAgentRequest {
         config: cfg,
         run_id: Some(run_id.to_owned()),
         node_id: Some(node.id.clone()),
         conversation_id,
+        history,
     };
     // We're inside a `spawn_blocking` thread; `Handle::current()`
     // gives us the calling tokio runtime so we can drive the async
@@ -941,6 +953,94 @@ fn execute_ask_agent(
         })),
         Err(e) => NodeOutcome::Error(format!("{e}")),
     }
+}
+
+/// M6-E — load conversation history for a chat-context AskAgent
+/// invocation. Replays the conversation's event log, projects each
+/// `user_msg` / `model_turn` event to a role+text pair, and applies
+/// the operator-configured history-budget truncation policy. Returns
+/// an empty Vec on any error so the AskAgent run can still proceed
+/// without history rather than hard-failing.
+///
+/// Mirrors the projection logic in `chats::run_real_turn` (lines
+/// 829–855 there) so the chat-context flow path sees the same shape
+/// as the legacy chat path. Differences:
+///   * Tool-call events (`tool_use`/`tool_result`) are skipped — the
+///     M6 AskAgent doesn't replay multi-turn tool dialogue (M6-F is
+///     where that lands). Future: include them once the agent can
+///     actually act on prior tool results.
+///   * Spotlighting is intentionally NOT applied — the legacy chat
+///     path adds spotlight delimiters around user_msg text as a
+///     prompt-injection mitigation; M6 inherits that surface from
+///     the trust profile, not from this projection.
+fn load_history_for_conversation(
+    ctx: &ExecutorContext,
+    conversation_id: &str,
+) -> Vec<crate::automation_agent::HistoryEntry> {
+    use crate::automation_agent::{HistoryEntry, HistoryRole};
+    use execlaw_core::events::{EventKind, EventLog};
+    use execlaw_core::ids::{ConversationId, EventSeq};
+
+    let cid = ConversationId::from_string(conversation_id.to_owned());
+    let log = EventLog::new(&ctx.db);
+    let log = match &ctx.event_log_hmac_key {
+        Some(k) => log.with_hmac_key((**k).clone()),
+        None => log,
+    };
+    let history = match log.replay_since(&cid, EventSeq(0)) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(
+                target: "automation_runtime::ask_agent",
+                conversation_id = %conversation_id,
+                error = %e,
+                "history replay failed; AskAgent will proceed without prior turns",
+            );
+            return Vec::new();
+        }
+    };
+    let raw: Vec<execlaw_core::history_budget::HistoryMessage> = history
+        .iter()
+        .filter_map(|ev| match ev.kind {
+            EventKind::UserMsg => ev
+                .decode_payload::<crate::chats::types::UserMessagePayload>()
+                .ok()
+                .map(|p| execlaw_core::history_budget::HistoryMessage {
+                    role: execlaw_core::history_budget::HistoryRole::User,
+                    text: p.text,
+                }),
+            EventKind::ModelTurn => ev
+                .decode_payload::<crate::chats::types::RealModelTurnPayload>()
+                .ok()
+                .map(|p| execlaw_core::history_budget::HistoryMessage {
+                    role: execlaw_core::history_budget::HistoryRole::Assistant,
+                    text: p.text,
+                })
+                .or_else(|| {
+                    ev.decode_payload::<crate::chats::types::StubModelTurnPayload>()
+                        .ok()
+                        .map(|p| execlaw_core::history_budget::HistoryMessage {
+                            role: execlaw_core::history_budget::HistoryRole::Assistant,
+                            text: p.text,
+                        })
+                }),
+            _ => None,
+        })
+        .collect();
+    let budget = execlaw_core::history_budget::load_max_history_tokens(&ctx.db)
+        .unwrap_or(execlaw_core::history_budget::DEFAULT_HISTORY_TOKENS);
+    let truncated = execlaw_core::history_budget::truncate_to_budget(raw, budget);
+    truncated
+        .kept
+        .into_iter()
+        .map(|m| HistoryEntry {
+            role: match m.role {
+                execlaw_core::history_budget::HistoryRole::User => HistoryRole::User,
+                execlaw_core::history_budget::HistoryRole::Assistant => HistoryRole::Assistant,
+            },
+            text: m.text,
+        })
+        .collect()
 }
 
 /// Replace `{{path.to.field}}` tokens with the corresponding value

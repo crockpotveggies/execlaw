@@ -114,6 +114,29 @@ pub struct AskAgentRequest {
     /// mirrors text deltas to `UiEvent::ChatTokenDelta` so the chat
     /// UI receives live text alongside the flow-trace stream.
     pub conversation_id: Option<String>,
+    /// Conversation history for chat-context AskAgent runs (M6-E).
+    /// The runtime loads prior `user_msg` + `model_turn` events from
+    /// the conversation's event log and hands them in already
+    /// truncated to the token budget. The invoker prepends them to
+    /// `request.messages` between the system prompt and the
+    /// cfg.prompt-derived user message. Empty for non-chat flows.
+    pub history: Vec<HistoryEntry>,
+}
+
+/// One prior turn projection — role + text, the same shape the
+/// `execlaw_core::history_budget` policy hands the chat path. Kept
+/// in this crate so AskAgentRequest doesn't drag the wider
+/// `history_budget` type into the AgentInvoker trait surface.
+#[derive(Debug, Clone)]
+pub struct HistoryEntry {
+    pub role: HistoryRole,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryRole {
+    User,
+    Assistant,
 }
 
 impl AskAgentRequest {
@@ -126,6 +149,7 @@ impl AskAgentRequest {
             run_id: None,
             node_id: None,
             conversation_id: None,
+            history: Vec::new(),
         }
     }
 }
@@ -355,7 +379,14 @@ impl AgentInvoker for InferenceAgentInvoker {
         };
         self.metrics
             .observe(InferenceConsumer::Automations, async {
-                do_invoke(&resolved.client, &resolved.model_id, &req.config, stream_ctx).await
+                do_invoke(
+                    &resolved.client,
+                    &resolved.model_id,
+                    &req.config,
+                    &req.history,
+                    stream_ctx,
+                )
+                .await
             })
             .await
     }
@@ -399,6 +430,7 @@ async fn do_invoke(
     client: &InferenceClient,
     model_id: &str,
     cfg: &AskAgentConfig,
+    history: &[HistoryEntry],
     ctx: StreamingContext<'_>,
 ) -> Result<ExitToolCall, AskAgentError> {
     let exit_names: Vec<String> = cfg.exit_tools.iter().map(|t| t.name.clone()).collect();
@@ -415,6 +447,18 @@ async fn do_invoke(
     } else {
         ChatMessage::user_with_images(cfg.prompt.clone(), cfg.attachments.iter().cloned())
     };
+    // M6-E — prepend conversation history when the runtime hands us
+    // one. Empty for non-chat flows; for chat-context flows the
+    // runtime fetches replay_since(EventSeq(0)) on the trigger's
+    // conversation_id and applies `history_budget::truncate_to_budget`
+    // before passing in, so we just translate role → ChatMessage.
+    let mut history_msgs: Vec<ChatMessage> = Vec::with_capacity(history.len());
+    for h in history {
+        match h.role {
+            HistoryRole::User => history_msgs.push(ChatMessage::user(h.text.clone())),
+            HistoryRole::Assistant => history_msgs.push(ChatMessage::assistant(h.text.clone())),
+        }
+    }
     let tools: Vec<ToolDeclaration> = cfg
         .exit_tools
         .iter()
@@ -427,9 +471,13 @@ async fn do_invoke(
             },
         })
         .collect();
+    let mut messages: Vec<ChatMessage> = Vec::with_capacity(2 + history_msgs.len());
+    messages.push(ChatMessage::system(system_prompt));
+    messages.extend(history_msgs);
+    messages.push(user_msg);
     let request = ChatRequest {
         model: ModelId(model_id.to_string()),
-        messages: vec![ChatMessage::system(system_prompt), user_msg],
+        messages,
         tools: Some(tools),
         // M6-D — streaming on so the SPA sees live text. The
         // chat_completions_streamed helper fans deltas into the
