@@ -23,6 +23,7 @@ pub mod auth;
 pub mod auth_extract;
 pub mod automation_runtime;
 pub mod automations_admin;
+pub mod flow_middleware;
 pub mod backend_presets;
 pub mod backend_supervisor;
 pub mod backends;

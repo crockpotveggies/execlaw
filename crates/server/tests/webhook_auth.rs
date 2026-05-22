@@ -262,7 +262,7 @@ async fn query_token_mismatch_rejects_with_no_bus_event() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn query_token_with_missing_vault_row_rejects() {
     let tmp = tempfile::tempdir().unwrap();
-    let (app, state) = build_app(tmp.path().to_path_buf());
+    let (app, _state) = build_app(tmp.path().to_path_buf());
     install_plugin(app.clone(), MANIFEST_QUERY_TOKEN).await;
     // NOTE: deliberately not calling seed_secret â€” the vault row
     // is missing.
@@ -376,7 +376,7 @@ async fn hmac_header_missing_rejects() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_no_auth_field_still_dispatches() {
     let tmp = tempfile::tempdir().unwrap();
-    let (app, state) = build_app(tmp.path().to_path_buf());
+    let (app, _state) = build_app(tmp.path().to_path_buf());
     install_plugin(app.clone(), MANIFEST_LEGACY).await;
 
     let (status, _) = post_webhook(
@@ -402,7 +402,7 @@ async fn legacy_no_auth_field_still_dispatches() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_mode_still_redacts_known_secret_keys() {
     let tmp = tempfile::tempdir().unwrap();
-    let (app, state) = build_app(tmp.path().to_path_buf());
+    let (app, _state) = build_app(tmp.path().to_path_buf());
     install_plugin(app.clone(), MANIFEST_LEGACY).await;
 
     let (status, _) = post_webhook(

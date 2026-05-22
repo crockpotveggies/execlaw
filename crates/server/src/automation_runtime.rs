@@ -41,7 +41,6 @@ use execlaw_core::ids::AlertId;
 use execlaw_plugin_host::PluginHost;
 use rhai::{Dynamic, Engine, Scope};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, warn};
 
@@ -86,7 +85,16 @@ impl ExecutorContext {
 
 
 /// Top-level matcher: list enabled automations for the event's kind,
-/// filter by trigger predicate, run each that matches.
+/// filter by trigger predicate, run each that matches. Each match
+/// produces an `AutomationRunRow` so the SPA's "recent runs" tab
+/// has a record.
+///
+/// 2026-05-22: currently unused — Phase A of the Flows middleware
+/// uses [`dry_run`] for the hot path (no run persistence) and the
+/// bus dispatcher that previously called this is gone. Phase B will
+/// switch flow_middleware to drive this so chat-prompt flow runs
+/// show up in the SPA. Annotated `dead_code` until that lands.
+#[allow(dead_code)]
 pub(crate) fn run_matching_automations(ctx: &ExecutorContext, evt: &FlowEventInput) {
     let store = AutomationStore::new(&ctx.db);
     let matched = match store.list_enabled_for_kind(&evt.kind) {
@@ -121,7 +129,7 @@ pub(crate) fn run_matching_automations(ctx: &ExecutorContext, evt: &FlowEventInp
 /// Build the Rhai-facing event-shape map. We mirror the
 /// [`BusEvent`] envelope so flow authors write `event.payload.foo`
 /// without having to think about persistence shape.
-fn event_context(evt: &FlowEventInput) -> serde_json::Value {
+pub(crate) fn event_context(evt: &FlowEventInput) -> serde_json::Value {
     // The Rhai scope sees one object: `event`. Anything not exposed here
     // is invisible to trigger.when / edge.when expressions, which is
     // why the envelope is included verbatim — flows need to discriminate
@@ -138,7 +146,7 @@ fn event_context(evt: &FlowEventInput) -> serde_json::Value {
     })
 }
 
-fn trigger_matches(trigger: &TriggerDef, event_ctx: &serde_json::Value) -> bool {
+pub(crate) fn trigger_matches(trigger: &TriggerDef, event_ctx: &serde_json::Value) -> bool {
     let Some(expr) = trigger.when.as_ref() else {
         return true;
     };
@@ -156,6 +164,7 @@ fn trigger_matches(trigger: &TriggerDef, event_ctx: &serde_json::Value) -> bool 
     }
 }
 
+#[allow(dead_code)]
 fn run_one(
     ctx: &ExecutorContext,
     automation: &AutomationRow,
@@ -450,6 +459,7 @@ fn execute_node(
             NodeOutcome::Output(serde_json::json!({}))
         }
         NodeKind::Terminal => NodeOutcome::Terminal,
+        NodeKind::RewritePrompt => execute_rewrite_prompt(node, state),
         NodeKind::Notify => execute_notify(node, state, &ctx.db),
         NodeKind::CallPlugin => execute_call_plugin(node, state, ctx.plugin_host.as_ref()),
         // 2026-05-22 — AskAgent + SendReply executors removed in the
@@ -772,6 +782,51 @@ fn execute_transform(node: &NodeDef, state: &HashMap<String, serde_json::Value>)
     }
 }
 
+/// Phase A of the Flows middleware redesign — emit a typed
+/// rewritten-prompt mutation as the node's output. The
+/// `flow_middleware` harvester reads `state[node_id].text` and feeds
+/// it back to the chat handler as the effective user text. Validator
+/// already guarantees `config.expr` is a non-empty string; runtime
+/// failures (bad Rhai, non-string result, sandbox cap hit) land in
+/// the per-step trace and the chat handler falls through to the
+/// original user text untouched.
+fn execute_rewrite_prompt(
+    node: &NodeDef,
+    state: &HashMap<String, serde_json::Value>,
+) -> NodeOutcome {
+    let Some(expr) = node.config.get("expr").and_then(|v| v.as_str()) else {
+        return NodeOutcome::Error(
+            "RewritePrompt node missing config.expr (must be Rhai expression returning a string)"
+                .into(),
+        );
+    };
+    let mut scope = build_scope_from_state(state);
+    let value = match eval_value(expr, &mut scope) {
+        Ok(v) => v,
+        Err(e) => return NodeOutcome::Error(format!("RewritePrompt expr rhai eval failed: {e}")),
+    };
+    // Must reduce to a JSON string. Numbers, bools, objects, nulls
+    // all reject — the harvester needs an unambiguous string.
+    let text = match value {
+        serde_json::Value::String(s) => s,
+        other => {
+            return NodeOutcome::Error(format!(
+                "RewritePrompt expr returned non-string value (got {}): the Rhai expression \
+                 must evaluate to a string",
+                match other {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "bool",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::Object(_) => "object",
+                    serde_json::Value::String(_) => unreachable!(),
+                }
+            ));
+        }
+    };
+    NodeOutcome::Output(serde_json::json!({ "text": text }))
+}
+
 // ---------------------------------------------------------------------------
 // Rhai expression evaluation. Sandbox is intentionally tight: no
 // modules, no eval, no globals beyond a small set of helpers, hard
@@ -910,9 +965,7 @@ fn eval_value(expr: &str, scope: &mut Scope<'static>) -> Result<serde_json::Valu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use execlaw_core::automations::{
-        AutomationStore, AutomationUpsert, EdgeDef,
-    };
+    use execlaw_core::automations::{AutomationStore, AutomationUpsert};
     use execlaw_core::db::DbConfig;
     use execlaw_core::event_envelope::EventEnvelope;
     use execlaw_core::migrations::MigrationRunner;
@@ -1079,6 +1132,141 @@ mod tests {
         assert!(
             err.contains("AskAgent") && err.contains("not supported"),
             "AskAgent error must surface clearly; got: {err}",
+        );
+    }
+
+    // ---- RewritePrompt executor (Phase A) ----
+
+    /// Build a one-node flow that runs only the given RewritePrompt.
+    /// trigger → rw → END.
+    fn rewrite_prompt_flow(expr: &str) -> AutomationDef {
+        serde_json::from_value(serde_json::json!({
+            "trigger": {"kind": "chat.prompt", "when": null},
+            "nodes": [
+                {"id": "rw", "kind": "RewritePrompt", "config": {"expr": expr}},
+            ],
+            "edges": [
+                {"from": "trigger", "to": "rw", "when": null},
+                {"from": "rw", "to": "END", "when": null},
+            ],
+        })).unwrap()
+    }
+
+    fn run_rewrite_prompt(expr: &str, payload: serde_json::Value) -> DryRunResult {
+        let db = fresh_db();
+        let store = AutomationStore::new(&db);
+        let row = store
+            .upsert(
+                &AutomationUpsert {
+                    id: None,
+                    name: "rw-test".into(),
+                    enabled: true,
+                    definition: rewrite_prompt_flow(expr),
+                },
+                1000,
+            )
+            .unwrap();
+        let evt = sample_event("chat.prompt", payload);
+        dry_run(&noop_ctx(&db), &row, &evt)
+    }
+
+    #[test]
+    fn rewrite_prompt_concat_with_event_payload() {
+        // Rhai string concat off the trigger event's payload.text.
+        let result = run_rewrite_prompt(
+            r#""[bot-fix] " + event.payload.text"#,
+            serde_json::json!({"text": "hello world"}),
+        );
+        assert_eq!(result.outcome, ExecOutcome::Success);
+        let trace = result
+            .step_traces
+            .iter()
+            .find(|t| t.node_id == "rw")
+            .unwrap();
+        // The output carries the rewritten string under `text` so the
+        // middleware harvester (Phase A.3) can read it without
+        // additional rendering.
+        assert_eq!(
+            trace.output,
+            serde_json::json!({"text": "[bot-fix] hello world"})
+        );
+    }
+
+    #[test]
+    fn rewrite_prompt_constant_string() {
+        let result = run_rewrite_prompt(
+            r#""always this""#,
+            serde_json::json!({"text": "anything"}),
+        );
+        assert_eq!(result.outcome, ExecOutcome::Success);
+        let trace = result
+            .step_traces
+            .iter()
+            .find(|t| t.node_id == "rw")
+            .unwrap();
+        assert_eq!(trace.output, serde_json::json!({"text": "always this"}));
+    }
+
+    #[test]
+    fn rewrite_prompt_non_string_result_errors_clearly() {
+        // Rhai returns an integer — we must reject and surface a
+        // legible error in the trace so the operator can fix their
+        // expression instead of silently sending garbage to the LLM.
+        let result = run_rewrite_prompt("42", serde_json::json!({"text": "x"}));
+        assert_eq!(result.outcome, ExecOutcome::Failed);
+        let trace = result
+            .step_traces
+            .iter()
+            .find(|t| t.node_id == "rw")
+            .unwrap();
+        let err = trace.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("non-string") || err.contains("must evaluate to a string"),
+            "expected non-string error, got: {err}",
+        );
+    }
+
+    #[test]
+    fn rewrite_prompt_bad_rhai_errors_clearly() {
+        let result = run_rewrite_prompt(
+            "this is not valid rhai", // forces a parse/eval error
+            serde_json::json!({"text": "x"}),
+        );
+        assert_eq!(result.outcome, ExecOutcome::Failed);
+        let trace = result
+            .step_traces
+            .iter()
+            .find(|t| t.node_id == "rw")
+            .unwrap();
+        let err = trace.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("RewritePrompt expr rhai eval failed"),
+            "expected rhai eval failure marker, got: {err}",
+        );
+    }
+
+    #[test]
+    fn rewrite_prompt_respects_rhai_sandbox_op_limit() {
+        // Pathological infinite loop must hit RHAI_MAX_OPS and
+        // surface as a runtime error — never hang the chat handler.
+        let pathological = r#"
+            let i = 0;
+            while true {
+                i += 1;
+            }
+            "stuck"
+        "#;
+        let result = run_rewrite_prompt(pathological, serde_json::json!({"text": "x"}));
+        assert_eq!(result.outcome, ExecOutcome::Failed);
+        let trace = result
+            .step_traces
+            .iter()
+            .find(|t| t.node_id == "rw")
+            .unwrap();
+        let err = trace.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("rhai eval failed"),
+            "sandbox cap must surface as a clean rhai eval error; got: {err}",
         );
     }
 }

@@ -51,6 +51,10 @@ const STYLES: Record<string, KindStyle> = {
     Branch: { bg: "rgba(163, 113, 247, 0.18)", border: "#a371f7", icon: "bi-signpost-split" },
     // $text-muted
     Terminal: { bg: "rgba(125, 133, 144, 0.18)", border: "#7d8590", icon: "bi-stop-circle" },
+    // soft yellow — pre-turn prompt mutator, visually adjacent to
+    // Transform (the existing Rhai-value-expr node) but a distinct
+    // hue so authors can pick it out in a glance.
+    RewritePrompt: { bg: "rgba(245, 204, 84, 0.18)", border: "#f5cc54", icon: "bi-pencil-square" },
     // orange — agent identity color, kept distinct from amber Filter
     AskAgent: { bg: "rgba(255, 138, 56, 0.18)", border: "#ff8a38", icon: "bi-robot" },
     // $danger (red) — alarm tile
@@ -201,6 +205,18 @@ export function TerminalNode(props: NodeProps) {
     );
 }
 
+export function RewritePromptNode(props: NodeProps) {
+    const data = props.data as unknown as CanvasNodeData;
+    return (
+        <div style={nodeShellStyle("RewritePrompt", !!data.selected)} data-testid={`node-${props.id}`}>
+            <Handle type="target" position={Position.Top} />
+            <NodeHeader kind="RewritePrompt" label={data.label} />
+            <NodeDetail detail={data.detail} />
+            <Handle type="source" position={Position.Bottom} />
+        </div>
+    );
+}
+
 export function AskAgentNode(props: NodeProps) {
     const data = props.data as unknown as CanvasNodeData;
     return (
@@ -257,6 +273,7 @@ export const NODE_TYPES = {
     Transform: TransformNode,
     Branch: BranchNode,
     Terminal: TerminalNode,
+    RewritePrompt: RewritePromptNode,
     AskAgent: AskAgentNode,
     Notify: NotifyNode,
     CallPlugin: CallPluginNode,
@@ -268,6 +285,7 @@ export const KIND_ICONS: Record<string, string> = {
     Transform: STYLES.Transform.icon,
     Branch: STYLES.Branch.icon,
     Terminal: STYLES.Terminal.icon,
+    RewritePrompt: STYLES.RewritePrompt.icon,
     AskAgent: STYLES.AskAgent.icon,
     Notify: STYLES.Notify.icon,
     CallPlugin: STYLES.CallPlugin.icon,
@@ -279,6 +297,7 @@ export const KIND_COLORS: Record<string, string> = {
     Transform: STYLES.Transform.border,
     Branch: STYLES.Branch.border,
     Terminal: STYLES.Terminal.border,
+    RewritePrompt: STYLES.RewritePrompt.border,
     AskAgent: STYLES.AskAgent.border,
     Notify: STYLES.Notify.border,
     CallPlugin: STYLES.CallPlugin.border,

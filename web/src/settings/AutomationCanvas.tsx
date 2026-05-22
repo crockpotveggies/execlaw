@@ -150,6 +150,7 @@ function bodyFor(n: NodeDef): string | undefined {
     switch (n.kind) {
         case "Filter":
         case "Transform":
+        case "RewritePrompt":
             return shorten(cfg.expr as string | undefined);
         case "AskAgent":
             return shorten(cfg.prompt as string | undefined);
@@ -393,6 +394,10 @@ function defaultConfigFor(kind: NodeKind): unknown {
             return { expr: "true" };
         case "Transform":
             return { expr: "#{}" };
+        case "RewritePrompt":
+            // Sensible starter: echo the user's text untouched. The
+            // operator overwrites the Rhai with their own logic.
+            return { expr: "event.payload.text" };
         case "AskAgent":
             return {
                 prompt: "Decide.",
@@ -742,10 +747,15 @@ const PALETTE_KINDS: NodeKind[] = [
     "Transform",
     "Branch",
     "Terminal",
-    "AskAgent",
+    // Phase A of the Flows middleware redesign — pre-turn mutator
+    // that rewrites the user-facing prompt the chat turn sees.
+    "RewritePrompt",
     "Notify",
     "CallPlugin",
-    "SendReply",
+    // AskAgent + SendReply stay in the schema (saved flows
+    // containing them still load) but they're hidden from the
+    // palette pending the middleware redesign — operators
+    // shouldn't be authoring new graphs against the dead executors.
 ];
 
 function NodePalette() {
@@ -791,6 +801,8 @@ const PALETTE_TOOLTIPS: Record<NodeKind, string> = {
         "Routing junction with no config. Add multiple outgoing edges and set each one's `when` clause to fan out the flow.",
     Terminal:
         "Ends the run with status `success`. Optional — flows without an explicit Terminal also end at implicit graph leaves.",
+    RewritePrompt:
+        "Pre-turn mutator: runs a Rhai expression that returns a string. The result replaces the user-facing prompt the chat turn driver sees. Use to inject context, normalize phrasing, or add system guidance.",
     AskAgent:
         "Invokes the LLM with a prompt + attachments + exit tools. The agent picks one exit tool to terminate the turn; downstream Branches route on that tool name.",
     Notify:

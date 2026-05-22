@@ -163,11 +163,57 @@ pub async fn send_message(
                 }
             }
         };
-    let effective_user_text: String = if skill_prepend.is_empty() {
+    let composed_user_text: String = if skill_prepend.is_empty() {
         req.text.clone()
     } else {
         format!("{skill_prepend}{}", req.text)
     };
+
+    // 2026-05-22 — Phase A of the Flows middleware redesign. Run
+    // matching `chat.prompt` flows synchronously BEFORE the turn
+    // driver. The middleware can rewrite the prompt the model
+    // sees (RewritePrompt node). In Phase B the same hook
+    // surfaces SetSkills / SetTools / SetTrust / AddAttachment /
+    // AddMemory mutations.
+    //
+    // Performance: zero enabled flows → one indexed SELECT against
+    // state_automations + an immediate return. <100µs on warm
+    // SQLite. Flow execution itself caps Rhai ops at
+    // RHAI_MAX_OPS (100k) so pathological expressions can't hang
+    // the chat handler.
+    //
+    // Failure mode: any middleware error logs at WARN and the
+    // chat proceeds with the un-mutated text. Flows are
+    // best-effort customization, never a gate on the turn.
+    let flow_event = crate::flow_middleware::build_chat_prompt_event(
+        cid.as_str(),
+        &req.text,
+        req.sender_principal_id.as_deref(),
+        // No transport bridge metadata on this code path → "web".
+        // Channel-plugin inbound paths (Signal, WhatsApp) pass their
+        // own value once they're wired through generic_inbound.
+        "web",
+        &req.attachments.iter().map(|_| String::new()).collect::<Vec<_>>(),
+    );
+    let flow_outcome = crate::flow_middleware::evaluate(&state, &flow_event);
+    let effective_user_text: String = match &flow_outcome.rewritten_prompt {
+        Some(rewritten) if !rewritten.is_empty() => {
+            tracing::debug!(
+                target: "flow_middleware",
+                conversation_id = %cid.as_str(),
+                original_len = composed_user_text.len(),
+                rewritten_len = rewritten.len(),
+                "flow middleware rewrote prompt for this turn",
+            );
+            rewritten.clone()
+        }
+        _ => composed_user_text,
+    };
+    // `flow_outcome.dropped` is observed here but Phase A does not
+    // short-circuit the turn on it — that semantic lands in Phase B
+    // once the operator UX for "your message was filtered" is
+    // designed. For now a Filter-drop is informational only.
+    let _ = flow_outcome.dropped;
 
     // 2026-04-28 — incognito short-circuit. We branch BEFORE
     // identity resolution / policy evaluation / event-log writes
@@ -4904,6 +4950,109 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("execlaw dev stub")
+        );
+    }
+
+    /// Phase A of the Flows middleware redesign (2026-05-22):
+    /// end-to-end proof that an enabled `RewritePrompt` flow mutates
+    /// what the chat turn driver sees.
+    ///
+    /// Setup: insert a `chat.prompt` flow that prepends `[FLOW] ` to
+    /// the user text. Send `"hi"` (2 chars) through the chat
+    /// handler. The stub turn driver echoes back `"received N chars"`
+    /// where N is the length of `effective_user_text` — so if the
+    /// rewrite landed, N == 8 (`[FLOW] hi`), not 2. The persisted
+    /// `user_msg` event also reflects the rewrite (matches the
+    /// existing `effective_user_text` → log contract).
+    #[tokio::test]
+    async fn flow_middleware_rewrite_prompt_mutates_turn_text() {
+        use execlaw_core::automations::{
+            AutomationDef, AutomationStore, AutomationUpsert,
+        };
+        let state = crate::routes::test_app_state();
+
+        // Insert an enabled RewritePrompt flow.
+        let def: AutomationDef = serde_json::from_value(serde_json::json!({
+            "trigger": {"kind": "chat.prompt", "when": null},
+            "nodes": [{
+                "id": "rw",
+                "kind": "RewritePrompt",
+                "config": {"expr": "\"[FLOW] \" + event.payload.text"}
+            }],
+            "edges": [
+                {"from": "trigger", "to": "rw", "when": null},
+                {"from": "rw", "to": "END", "when": null}
+            ]
+        }))
+        .unwrap();
+        AutomationStore::new(&state.db)
+            .upsert(
+                &AutomationUpsert {
+                    id: None,
+                    name: "test-rewrite".into(),
+                    enabled: true,
+                    definition: def,
+                },
+                1000,
+            )
+            .unwrap();
+
+        let app = crate::routes::build_router(state);
+        let (status, body) = send(app, "hi").await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The stub turn driver returns "(execlaw dev stub) received N chars …"
+        // where N is the byte/char count of the text it received.
+        // Original input "hi" = 2 chars. Rewritten "[FLOW] hi" = 9 chars.
+        let reply = body["assistant_text"].as_str().unwrap();
+        assert!(
+            reply.contains("received 9 chars"),
+            "stub reply must reflect the rewritten char count (got: {reply})",
+        );
+    }
+
+    /// Same setup as the rewrite test, but with the flow DISABLED.
+    /// Confirms the hot path doesn't fire the flow and the original
+    /// text is what the turn driver sees.
+    #[tokio::test]
+    async fn flow_middleware_disabled_flow_does_not_rewrite() {
+        use execlaw_core::automations::{
+            AutomationDef, AutomationStore, AutomationUpsert,
+        };
+        let state = crate::routes::test_app_state();
+
+        let def: AutomationDef = serde_json::from_value(serde_json::json!({
+            "trigger": {"kind": "chat.prompt", "when": null},
+            "nodes": [{
+                "id": "rw",
+                "kind": "RewritePrompt",
+                "config": {"expr": "\"[FLOW] \" + event.payload.text"}
+            }],
+            "edges": [
+                {"from": "trigger", "to": "rw", "when": null},
+                {"from": "rw", "to": "END", "when": null}
+            ]
+        }))
+        .unwrap();
+        AutomationStore::new(&state.db)
+            .upsert(
+                &AutomationUpsert {
+                    id: None,
+                    name: "disabled-flow".into(),
+                    enabled: false,
+                    definition: def,
+                },
+                1000,
+            )
+            .unwrap();
+
+        let app = crate::routes::build_router(state);
+        let (status, body) = send(app, "hi").await;
+        assert_eq!(status, StatusCode::OK);
+        let reply = body["assistant_text"].as_str().unwrap();
+        assert!(
+            reply.contains("received 2 chars"),
+            "disabled flow must not rewrite; reply should reflect the original 2-char input (got: {reply})",
         );
     }
 

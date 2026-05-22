@@ -775,6 +775,76 @@ fn bench_build_turn_context_prose(c: &mut Criterion) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Flows pre-turn middleware (Phase A, 2026-05-22).
+//
+// Budgets (§0 axiom #14):
+//   * `flow_middleware::evaluate` with zero enabled flows must run in
+//     under 100µs — this fires on every chat turn, so any regression
+//     is felt instantly.
+//   * `flow_middleware::evaluate` with one enabled flow + one
+//     RewritePrompt node must run in under 2ms. Rhai eval dominates;
+//     this number sets the budget for the per-turn overhead of a
+//     trivial flow.
+// ---------------------------------------------------------------------------
+
+fn bench_flow_middleware(c: &mut Criterion) {
+    use execlaw_core::Database;
+    use execlaw_core::automations::{AutomationStore, AutomationUpsert};
+    use execlaw_core::db::DbConfig;
+    use execlaw_core::migrations::MigrationRunner;
+    use execlaw_server::flow_middleware::{build_chat_prompt_event, evaluate};
+    use execlaw_server::routes::test_app_state;
+
+    let state_empty = test_app_state();
+    let evt = build_chat_prompt_event("conv-bench", "hello world", Some("op"), "web", &[]);
+
+    c.bench_function("flow_middleware/evaluate_zero_flows", |b| {
+        b.iter(|| {
+            let outcome = evaluate(black_box(&state_empty), black_box(&evt));
+            black_box(outcome);
+        });
+    });
+
+    // Populate one enabled RewritePrompt flow against a fresh state.
+    let state_one = test_app_state();
+    let def: execlaw_core::automations::AutomationDef = serde_json::from_value(serde_json::json!({
+        "trigger": {"kind": "chat.prompt", "when": null},
+        "nodes": [{
+            "id": "rw",
+            "kind": "RewritePrompt",
+            "config": {"expr": "\"[bench] \" + event.payload.text"}
+        }],
+        "edges": [
+            {"from": "trigger", "to": "rw", "when": null},
+            {"from": "rw", "to": "END", "when": null}
+        ]
+    }))
+    .unwrap();
+    AutomationStore::new(&state_one.db)
+        .upsert(
+            &AutomationUpsert {
+                id: None,
+                name: "bench-rewrite".into(),
+                enabled: true,
+                definition: def,
+            },
+            1000,
+        )
+        .unwrap();
+
+    c.bench_function("flow_middleware/evaluate_one_rewrite_prompt", |b| {
+        b.iter(|| {
+            let outcome = evaluate(black_box(&state_one), black_box(&evt));
+            black_box(outcome);
+        });
+    });
+
+    // Silence unused-import warnings on the helper imports above when
+    // run with `--no-run`.
+    let _ = (Database::open, DbConfig::in_memory_unencrypted, MigrationRunner::new);
+}
+
 criterion_group!(
     benches,
     bench_jwt_access,
@@ -792,5 +862,6 @@ criterion_group!(
     // benches when that surface is ready.
     bench_group_addressing_name_in_text,
     bench_build_turn_context_prose,
+    bench_flow_middleware,
 );
 criterion_main!(benches);

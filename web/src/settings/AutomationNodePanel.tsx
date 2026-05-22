@@ -212,6 +212,17 @@ function KindForm({
                     They have no config and no outgoing edges.
                 </div>
             );
+        case "RewritePrompt":
+            return (
+                <ExprField
+                    label="Rewrite expression (Rhai value → string)"
+                    placeholder='"[fix] " + event.payload.text'
+                    value={(cfg.expr as string | undefined) ?? ""}
+                    onChange={(v) => setConfig({ ...cfg, expr: v })}
+                    help="Must return a string. The result replaces the user-facing prompt the chat turn driver sees. Errors (non-string result, bad Rhai) surface in the run trace and the chat falls back to the un-mutated input."
+                    testId="node-panel-rewrite-prompt-expr"
+                />
+            );
         case "AskAgent":
             return <AskAgentForm node={node} onChange={onChange} />;
         case "Notify":

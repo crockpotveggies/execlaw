@@ -47,6 +47,13 @@ pub enum NodeKind {
     /// Explicit no-op end. Optional Ã¢â‚¬â€ a node with no outgoing edges
     /// also ends the run.
     Terminal,
+    /// Pre-turn middleware mutator (Phase A of the Flows redesign).
+    /// Runs a Rhai value expression that must evaluate to a string;
+    /// the result becomes the rewritten user prompt the chat handler
+    /// hands to the turn driver. Output shape: `{ "text": "<string>" }`
+    /// in `state[node_id]` so the harvester in `flow_middleware`
+    /// picks it up.
+    RewritePrompt,
     // Reserved (validator rejects with NotYetImplemented):
     AskAgent,
     CallPlugin,
@@ -70,6 +77,7 @@ impl NodeKind {
             NodeKind::Transform => "Transform",
             NodeKind::Branch => "Branch",
             NodeKind::Terminal => "Terminal",
+            NodeKind::RewritePrompt => "RewritePrompt",
             NodeKind::AskAgent => "AskAgent",
             NodeKind::CallPlugin => "CallPlugin",
             NodeKind::AppendToChat => "AppendToChat",
@@ -89,6 +97,7 @@ impl NodeKind {
             "Transform" => Some(NodeKind::Transform),
             "Branch" => Some(NodeKind::Branch),
             "Terminal" => Some(NodeKind::Terminal),
+            "RewritePrompt" => Some(NodeKind::RewritePrompt),
             "AskAgent" => Some(NodeKind::AskAgent),
             "CallPlugin" => Some(NodeKind::CallPlugin),
             "AppendToChat" => Some(NodeKind::AppendToChat),
@@ -113,6 +122,7 @@ impl NodeKind {
                 | NodeKind::Transform
                 | NodeKind::Branch
                 | NodeKind::Terminal
+                | NodeKind::RewritePrompt
                 | NodeKind::AskAgent
                 | NodeKind::Notify
                 | NodeKind::CallPlugin
@@ -443,6 +453,18 @@ pub fn validate(def: &AutomationDef) -> Result<(), AutomationError> {
                     "CallPlugin node '{}': config.args must be a JSON object (got {})",
                     n.id,
                     args_kind(args),
+                )));
+            }
+        }
+        if matches!(n.kind, NodeKind::RewritePrompt) {
+            // expr is required + non-empty Rhai source. Cheap shape
+            // check at save time; the Rhai engine runs the real
+            // parse during execute (eval failures land in the trace).
+            let expr = n.config.get("expr").and_then(|v| v.as_str()).unwrap_or("");
+            if expr.trim().is_empty() {
+                return Err(AutomationError::Validation(format!(
+                    "RewritePrompt node '{}': config.expr is required and must be a non-empty Rhai value expression returning a string",
+                    n.id
                 )));
             }
         }
@@ -1075,6 +1097,57 @@ mod tests {
         }));
         let err = validate(&def).unwrap_err();
         assert!(format!("{err}").contains("args"));
+    }
+
+    // ---- RewritePrompt (Phase A of Flows middleware) ----
+
+    fn rewrite_prompt_def(config: serde_json::Value) -> AutomationDef {
+        AutomationDef {
+            trigger: TriggerDef {
+                kind: "chat.prompt".to_owned(),
+                when: None,
+            },
+            nodes: vec![NodeDef {
+                id: "rw".into(),
+                kind: NodeKind::RewritePrompt,
+                config,
+                position: None,
+            }],
+            edges: vec![
+                EdgeDef {
+                    from: TRIGGER_SENTINEL.into(),
+                    to: "rw".into(),
+                    when: None,
+                },
+                EdgeDef {
+                    from: "rw".into(),
+                    to: END_SENTINEL.into(),
+                    when: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_rewrite_prompt() {
+        let def = rewrite_prompt_def(serde_json::json!({
+            "expr": "\"[prefix] \" + event.payload.text"
+        }));
+        validate(&def).expect("well-formed RewritePrompt must validate");
+    }
+
+    #[test]
+    fn validate_rejects_rewrite_prompt_with_missing_expr() {
+        let def = rewrite_prompt_def(serde_json::json!({}));
+        let err = validate(&def).unwrap_err();
+        assert!(format!("{err}").contains("config.expr"));
+    }
+
+    #[test]
+    fn validate_rejects_rewrite_prompt_with_blank_expr() {
+        let def = rewrite_prompt_def(serde_json::json!({"expr": "   "}));
+        let err = validate(&def).unwrap_err();
+        assert!(format!("{err}").contains("non-empty"));
     }
 
     #[test]

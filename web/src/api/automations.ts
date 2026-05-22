@@ -35,6 +35,10 @@ export type NodeKind =
     | "Transform"
     | "Branch"
     | "Terminal"
+    // Phase A of the Flows middleware redesign (2026-05-22):
+    // rewrites the user-facing prompt the chat turn driver sees.
+    // Config: { expr: "<Rhai expression returning a string>" }
+    | "RewritePrompt"
     | "AskAgent"
     | "Notify"
     | "CallPlugin"
