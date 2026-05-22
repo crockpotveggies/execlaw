@@ -177,7 +177,6 @@ fn build_app(stage_root: PathBuf) -> (axum::Router, AppState) {
         host_transports: execlaw_server::transport_registry::HostTransportRegistry::new(),
         skill_capture: execlaw_skills::AutoCaptureSink::noop(),
         reuse_update: execlaw_skills::ReuseUpdateSink::noop(),
-        automation_bus: execlaw_server::automation_bus::AutomationBus::stub(db),
 
         data_dir: std::env::temp_dir().join(format!("execlaw-test-{}", uuid::Uuid::new_v4())),
         inference_metrics: execlaw_server::inference_metrics::InferenceMetrics::new(),

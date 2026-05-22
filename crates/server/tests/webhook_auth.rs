@@ -17,7 +17,6 @@
 
 use axum::body::{self, Body};
 use axum::http::{Method, Request, StatusCode, header};
-use execlaw_core::automation_bus::{BusEventKind, BusEventStore};
 use execlaw_core::db::{Database, DbConfig};
 use execlaw_core::migrations::MigrationRunner;
 use execlaw_core::vault_row::VaultRowStore;
@@ -164,7 +163,6 @@ fn build_app(stage_root: std::path::PathBuf) -> (axum::Router, AppState) {
         host_transports: execlaw_server::transport_registry::HostTransportRegistry::new(),
         skill_capture: execlaw_skills::AutoCaptureSink::noop(),
         reuse_update: execlaw_skills::ReuseUpdateSink::noop(),
-        automation_bus: execlaw_server::automation_bus::AutomationBus::stub(db),
         data_dir: std::env::temp_dir().join(format!("execlaw-test-{}", uuid::Uuid::new_v4())),
         inference_metrics: execlaw_server::inference_metrics::InferenceMetrics::new(),
     };
@@ -226,12 +224,6 @@ async fn post_webhook(
     (status, body_bytes.to_vec())
 }
 
-fn count_webhook_events(state: &AppState) -> usize {
-    BusEventStore::new(&state.db)
-        .list_recent_for_kind(BusEventKind::WebhookReceived.as_str(), 100)
-        .unwrap()
-        .len()
-}
 
 /// Critical: missing token â†’ 401, NO bus event, NO handler call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -244,11 +236,6 @@ async fn query_token_missing_rejects_with_no_bus_event() {
     let (status, _body) =
         post_webhook(app, "/api/webhooks/wh-test/event", &[], br#"{"hello":1}"#).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(
-        count_webhook_events(&state),
-        0,
-        "missing token must NOT create a bus event"
-    );
 }
 
 /// Critical: wrong token â†’ 401, NO bus event.
@@ -267,11 +254,6 @@ async fn query_token_mismatch_rejects_with_no_bus_event() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(
-        count_webhook_events(&state),
-        0,
-        "wrong token must NOT create a bus event"
-    );
 }
 
 /// Critical: vault row absent â†’ 401, NO bus event, even if caller
@@ -293,7 +275,6 @@ async fn query_token_with_missing_vault_row_rejects() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(count_webhook_events(&state), 0);
 }
 
 /// Happy path: correct token â†’ 200 from handler AND a bus event.
@@ -315,25 +296,10 @@ async fn query_token_valid_accepts_and_redacts_payload() {
         String::from_utf8_lossy(&resp_body)
     );
 
-    let events = BusEventStore::new(&state.db)
-        .list_recent_for_kind(BusEventKind::WebhookReceived.as_str(), 10)
-        .unwrap();
-    assert_eq!(
-        events.len(),
-        1,
-        "valid token must create exactly one bus event"
-    );
-    let payload = &events[0].payload;
-    // Persisted payload's query.token must be redacted.
-    assert_eq!(
-        payload["query"]["token"], "<redacted>",
-        "secret must be redacted in persisted payload"
-    );
-    let payload_str = serde_json::to_string(payload).unwrap();
-    assert!(
-        !payload_str.contains(WEBHOOK_SECRET),
-        "secret leaked into persisted payload: {payload_str}"
-    );
+    // 2026-05-22 — bus removed in M6 rip-out. Bus-event persistence
+    // assertions retired; the success-status assertion above is the
+    // meaningful contract for this test. Payload redaction moves
+    // to a plugin-level test if/when reintroduced.
 }
 
 /// HMAC-SHA256 header auth: matching signature â†’ 200 + bus event.
@@ -357,7 +323,6 @@ async fn hmac_header_valid_accepts() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(count_webhook_events(&state), 1);
 }
 
 /// HMAC-SHA256 header auth: wrong signature â†’ 401, no bus event.
@@ -382,7 +347,6 @@ async fn hmac_header_mismatch_rejects() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(count_webhook_events(&state), 0);
 }
 
 /// HMAC-SHA256 header auth: signature header absent entirely â†’ 401.
@@ -401,7 +365,6 @@ async fn hmac_header_missing_rejects() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(count_webhook_events(&state), 0);
 }
 
 /// Backward compatibility: a plugin manifest with NO `auth` field
@@ -428,11 +391,6 @@ async fn legacy_no_auth_field_still_dispatches() {
         StatusCode::OK,
         "manifest without `auth` must still dispatch (legacy compat)"
     );
-    assert_eq!(
-        count_webhook_events(&state),
-        1,
-        "legacy mode still publishes a bus event"
-    );
 }
 
 /// Legacy mode also redacts common secret query keys from the
@@ -455,10 +413,6 @@ async fn legacy_mode_still_redacts_known_secret_keys() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let events = BusEventStore::new(&state.db)
-        .list_recent_for_kind(BusEventKind::WebhookReceived.as_str(), 10)
-        .unwrap();
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].payload["query"]["token"], "<redacted>");
-    assert_eq!(events[0].payload["query"]["user"], "alice");
+    // 2026-05-22 — bus removed; persisted-payload-redaction check
+    // moves to a follow-up plugin-level test.
 }

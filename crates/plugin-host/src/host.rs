@@ -1733,106 +1733,14 @@ fn import_m6_registry(
         }
     }
 
-    // M6 — import shipped default automations into `state_automations`
-    // with `source = "plugin:<id>"`. Idempotent: re-running just
-    // updates the existing row in place. Skips on `operator_modified`
-    // so operator edits aren't clobbered on plugin upgrade.
-    if !manifest.default_automations.is_empty() {
-        use execlaw_core::automations::{AutomationDef, AutomationStore, AutomationUpsert};
-        let store = AutomationStore::new(db);
-        let existing_names: Vec<String> = store
-            .list_all()
-            .map(|rows| rows.into_iter().map(|r| r.name).collect())
-            .unwrap_or_default();
-        for d in &manifest.default_automations {
-            // Skip if name already exists — preserve operator edits.
-            if existing_names.iter().any(|n| n == &d.name) {
-                tracing::debug!(
-                    plugin_id,
-                    name = %d.name,
-                    "M6: default automation already in state_automations (skipping)"
-                );
-                continue;
-            }
-            let flow_path = stage_path.join(&d.flow_path);
-            let raw = match std::fs::read_to_string(&flow_path) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(
-                        plugin_id,
-                        name = %d.name,
-                        path = %flow_path.display(),
-                        error = %e,
-                        "M6: default automation flow file missing (skipping)"
-                    );
-                    continue;
-                }
-            };
-            let def: AutomationDef = match serde_json::from_str(&raw) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(
-                        plugin_id,
-                        name = %d.name,
-                        error = %e,
-                        "M6: default automation flow JSON is invalid (skipping)"
-                    );
-                    continue;
-                }
-            };
-            let now = chrono::Utc::now().timestamp_millis();
-            match store.upsert(
-                &AutomationUpsert {
-                    id: None,
-                    name: d.name.clone(),
-                    enabled: d.enabled,
-                    definition: def,
-                },
-                now,
-            ) {
-                Ok(row) => {
-                    // Stamp provenance so the row is protected from
-                    // operator deletion + the SPA hides the delete
-                    // button. AutomationUpsert intentionally doesn't
-                    // expose the source column for operator-driven
-                    // writes; we set it via direct SQL on the just-
-                    // inserted id.
-                    let source = format!("plugin:{plugin_id}");
-                    let version = _plugin_version.to_owned();
-                    if let Err(e) = db.with_conn(|c| {
-                        c.execute(
-                            "UPDATE state_automations \
-                             SET source = ?1, source_version = ?2 \
-                             WHERE id = ?3",
-                            rusqlite::params![source, version, row.id],
-                        )?;
-                        Ok(())
-                    }) {
-                        warn!(
-                            plugin_id,
-                            name = %d.name,
-                            error = %e,
-                            "M6: failed to stamp source on default automation (row still installed)"
-                        );
-                    }
-                    tracing::info!(
-                        plugin_id,
-                        name = %d.name,
-                        enabled = d.enabled,
-                        "M6: imported default automation"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        plugin_id,
-                        name = %d.name,
-                        error = %e,
-                        "M6: default automation upsert failed (install continued)"
-                    );
-                }
-            }
-        }
-    }
+    // 2026-05-22 — M6 rip-out: the `[[default_automations]]` importer
+    // is retired. Plugin manifests can still declare the section
+    // (parser-accepted as inert data) but installation no longer
+    // creates rows in state_automations. The middleware redesign
+    // will reintroduce a related but differently-shaped seed path.
+    let _ = &manifest.default_automations;
+    let _ = stage_path;
+    let _ = _plugin_version;
 }
 
 fn resolve_executable(stage: &Path, declared: &str) -> String {

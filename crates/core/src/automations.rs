@@ -740,7 +740,6 @@ impl<'a> AutomationStore<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::automation_bus::BusEventKind;
     use crate::db::DbConfig;
     use crate::migrations::MigrationRunner;
 
@@ -1154,13 +1153,13 @@ mod tests {
         // Two automations on WebhookReceived, one on RoutineFired,
         // one disabled.
         for (name, kind, enabled) in [
-            ("wh-1", BusEventKind::WebhookReceived, true),
-            ("wh-2", BusEventKind::WebhookReceived, true),
-            ("rt-1", BusEventKind::RoutineFired, true),
-            ("wh-disabled", BusEventKind::WebhookReceived, false),
+            ("wh-1", "webhook.received", true),
+            ("wh-2", "webhook.received", true),
+            ("rt-1", "routine.fired", true),
+            ("wh-disabled", "webhook.received", false),
         ] {
             let mut def = linear_def();
-            def.trigger.kind = kind.as_str().to_owned();
+            def.trigger.kind = kind.to_owned();
             store
                 .upsert(
                     &AutomationUpsert {

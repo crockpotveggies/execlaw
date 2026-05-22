@@ -934,11 +934,6 @@ pub fn test_app_state() -> AppState {
         // resolve `<data_dir>/bundled-plugins/...` deterministically
         // without writing into a real user dir.
         data_dir: std::env::temp_dir().join(format!("execlaw-test-data-{}", uuid::Uuid::new_v4())),
-        // M1 of Automations — stub bus that writes durably but doesn't
-        // dispatch. Tests exercising end-to-end dispatch should use
-        // `AutomationBus::spawn` inside a `#[tokio::test]` (the
-        // automation_bus module's own tests do this).
-        automation_bus: crate::automation_bus::AutomationBus::stub(db.clone()),
         // M5 — empty metrics handle. Tests that exercise the metrics
         // page can pre-populate this via `state.inference_metrics
         // .observe(...)` and snapshot.

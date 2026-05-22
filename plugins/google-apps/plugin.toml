@@ -362,8 +362,3 @@ max_attachments_per_message = 25
 max_text_length = 102400
 allowed_mime_prefixes = ["image/", "application/pdf", "text/", "application/"]
 
-[[default_automations]]
-name = "Calendar event briefing"
-flow_path = "flows/calendar_briefing.json"
-enabled = false
-description = "When a calendar event is starting soon, ask the agent to draft a brief summary and surface it as an Info alert. Disabled by default — operator opts in once they've reviewed the prompt."

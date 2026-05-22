@@ -223,8 +223,3 @@ max_attachments_per_message = 1
 max_text_length = 4096
 allowed_mime_prefixes = ["image/", "video/", "audio/", "application/pdf"]
 
-[[default_automations]]
-name = "WhatsApp inbound default"
-flow_path = "flows/default.json"
-enabled = true
-description = "Default flow for inbound WhatsApp messages: route through the agent and reply back."

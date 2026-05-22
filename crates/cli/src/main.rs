@@ -1865,10 +1865,6 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
     // middleware redesign reintroduces the agent surface as a
     // pre-turn mutator instead of a node executor.
     //
-    // Rip 3 (forthcoming) deletes the bus dispatcher entirely; the
-    // `AutomationBus::stub(db)` here keeps `AppState.automation_bus`
-    // shape-valid in the interim.
-    let automation_bus = execlaw_server::automation_bus::AutomationBus::stub(db.clone());
 
     let state = execlaw_server::AppState {
         db: db.clone(),
@@ -1897,14 +1893,10 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         skill_capture: skill_capture_sink,
         reuse_update: reuse_update_sink,
         data_dir: data_dir.clone(),
-        automation_bus,
         // M5 — per-consumer inference observability; chat/research
         // wrap their LLM calls with `metrics.observe(consumer, fut)`.
         inference_metrics,
     };
-    // 2026-05-22 — automation_bus_tasks were the dispatcher + poller
-    // spawned by `AutomationBus::spawn`; with the M6 rip-out the bus
-    // is a stub (no background tasks), nothing to drop here.
 
     // Phase B (channel-plugin surface): wire the host-capabilities
     // arc into the script engine NOW that AppState exists. The
@@ -2014,33 +2006,10 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         tokio::spawn(async move { routine_run_sweeper.run(stop).await });
     }
 
-    // M1 of Automations — retention sweep for `state_bus_events`.
-    // Only dispatched rows are eligible (the sweeper's underlying
-    // store call enforces this); pending rows are preserved
-    // regardless of age so a stuck dispatcher stays visible.
-    // 2-hour cadence matches `EventRetentionSweeper`.
-    {
-        let stop = sweep_stop.clone();
-        let bus_event_sweeper =
-            execlaw_core::bus_event_retention::BusEventRetentionSweeper::new(db.clone());
-        tokio::spawn(async move { bus_event_sweeper.run(stop).await });
-    }
-    // M4 of Automations — daily sweep that populates
-    // `state_automation_suggestions`. Groups recent bus events by
-    // (kind, source), surfaces high-volume patterns that have no
-    // matching enabled automation, and skips muted patterns.
-    // The landing page reads from this table; agent-drafted
-    // suggestions (M5) plug in at the same seam.
-    {
-        let stop = sweep_stop.clone();
-        let sugg_sweeper =
-            execlaw_server::automation_suggestions_sweeper::AutomationSuggestionsSweeper::new(
-                db.clone(),
-            );
-        tokio::spawn(async move { sugg_sweeper.run(stop).await });
-    }
-    // 2026-05-22 — bus shutdown linkage retired with the M6 rip-out.
-    // The stub AutomationBus has no background tasks to drain.
+    // 2026-05-22 — bus retention sweeper + bus-event-driven
+    // suggestions sweeper retired with the M6 rip-out. The Flows
+    // canvas + SuggestionStore CRUD survive; future middleware
+    // sweeper will repopulate suggestions from chat-prompt patterns.
 
     // Phase 12.C — backend supervisor reconcile loop. Only spawns
     // if the Docker connect succeeded above; otherwise managed-mode
