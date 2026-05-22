@@ -1979,8 +1979,16 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
 
     while let Some(ev) = rx.recv().await {
         match ev {
-            TurnEvent::TokenDelta { .. } => {
-                // Already on the EventBus via supervisor.handle_inbound.
+            TurnEvent::TokenDelta { text } => {
+                // Already on the EventBus via supervisor.handle_inbound
+                // for live UI streaming. ALSO accumulate locally so the
+                // abnormal-end branch below can commit whatever the
+                // agent produced before the failure — without this,
+                // refresh-after-timeout shows the placeholder
+                // "(turn errored before completion)" and the streamed
+                // text the operator already saw is lost. (2026-05-21
+                // triage C: streaming text disappears on refresh.)
+                assistant_text.push_str(&text);
             }
             TurnEvent::Phase { .. } => {
                 // Same.
@@ -2172,7 +2180,14 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
     //      audit-relevant to record and the user_msg already in the
     //      log keeps the prior SPA contract.
     let abnormal_end = !got_complete && error_message.is_some();
-    if abnormal_end && pending.is_empty() && !was_cancelled {
+    // 2026-05-21 (triage C): also commit when the agent streamed some
+    // text before the error/timeout, even if no tools executed. Prior
+    // logic returned Err without committing whenever `pending` was
+    // empty + not a cancel, which meant a "spawn timed out mid-stream"
+    // sequence dropped the streamed text on the floor — the operator
+    // saw the text live, refreshed, and it was gone.
+    let have_streamed_text = !assistant_text.is_empty();
+    if abnormal_end && pending.is_empty() && !was_cancelled && !have_streamed_text {
         return Err(error_message.unwrap_or_else(|| "runner error".into()));
     }
     if abnormal_end {
