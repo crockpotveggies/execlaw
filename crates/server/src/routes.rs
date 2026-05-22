@@ -774,7 +774,6 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::my_identities::my_identities_router())
         .merge(crate::routines::routines_router())
         .merge(crate::automations_admin::router())
-        .merge(crate::web_prompt::router())
         .merge(crate::inference_admin::router())
         .merge(crate::personality::personality_router())
         .merge(crate::runners_admin::runners_admin_router())
@@ -949,8 +948,6 @@ pub fn test_app_state() -> AppState {
                 "test fixture pool: no LLM wired",
             )),
         ),
-        // M6 — fresh flow-channel hub per test fixture.
-        flow_channel: crate::flow_channel::FlowChannelHub::new(),
         // M5 — empty metrics handle. Tests that exercise the metrics
         // page can pre-populate this via `state.inference_metrics
         // .observe(...)` and snapshot.

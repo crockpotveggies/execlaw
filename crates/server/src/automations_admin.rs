@@ -283,16 +283,6 @@ pub struct TestRunRequest {
     pub event_id: Option<String>,
     #[serde(default)]
     pub sample_event: Option<SampleEventBody>,
-    /// Optional caller-supplied id used as the dry-run id for this
-    /// invocation. When set, the FlowChannelHub publishes events
-    /// under this id so the SPA can subscribe to
-    /// `/api/admin/automations/flow-runs/{client_run_id}/events`
-    /// BEFORE issuing the POST and receive the live trace as the run
-    /// executes. When omitted (default), the server mints
-    /// `dry-{uuid}` and no SSE subscription is possible because the
-    /// caller doesn't know the id. Audit fix #8.
-    #[serde(default)]
-    pub client_run_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -635,16 +625,9 @@ pub async fn test_run(
     let db = state.db.clone();
     let pool = state.automation_agent_pool.clone();
     let plugin_host = Some(state.plugin_host.clone());
-    let flow_channel = state.flow_channel.clone();
-    let events_bus = state.events.clone();
-    let hmac_key = state.event_log_hmac_key.clone();
-    let client_run_id = req.client_run_id;
     let result = tokio::task::spawn_blocking(move || {
-        let ctx = automation_runtime::ExecutorContext::new(db, pool, plugin_host)
-            .with_flow_channel(flow_channel)
-            .with_events(events_bus)
-            .with_event_log_hmac_key(hmac_key);
-        automation_runtime::dry_run_with_id(&ctx, &automation, &event, client_run_id)
+        let ctx = automation_runtime::ExecutorContext::new(db, pool, plugin_host);
+        automation_runtime::dry_run(&ctx, &automation, &event)
     })
     .await
     .map_err(|e| ApiError {

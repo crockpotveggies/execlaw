@@ -72,7 +72,6 @@ fn build_state(transcript: &'static str) -> AppState {
                 "test pool: no LLM",
             )),
         ),
-            flow_channel: execlaw_server::flow_channel::FlowChannelHub::new(),
 
         data_dir: std::env::temp_dir().join(format!("execlaw-test-{}", uuid::Uuid::new_v4())),
         inference_metrics: execlaw_server::inference_metrics::InferenceMetrics::new(),

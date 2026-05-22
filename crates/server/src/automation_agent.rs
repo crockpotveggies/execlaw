@@ -270,12 +270,6 @@ pub struct InferenceAgentInvoker {
     db: Database,
     inference: Arc<InferenceResolver>,
     metrics: InferenceMetrics,
-    /// FlowChannelHub for live token-delta streaming (M6-D). When
-    /// `Some`, each text chunk emits a `FlowChannelEvent::AgentTextDelta`
-    /// under the request's `run_id` so the SPA's flow-trace SSE feed
-    /// sees streaming text. `None` disables — tests + reduced
-    /// configurations work without.
-    flow_channel: Option<crate::flow_channel::FlowChannelHub>,
     /// UiEvent bus for mirroring text deltas to chat-context
     /// conversations (M6-D). When set + the request carries a
     /// `conversation_id`, each chunk is also published as
@@ -303,16 +297,8 @@ impl InferenceAgentInvoker {
             db,
             inference,
             metrics,
-            flow_channel: None,
             events: None,
         }
-    }
-
-    /// Wire the FlowChannelHub so streaming text deltas reach the
-    /// SPA's `/api/automations/flow-runs/{run_id}/events` SSE feed.
-    pub fn with_flow_channel(mut self, hub: crate::flow_channel::FlowChannelHub) -> Self {
-        self.flow_channel = Some(hub);
-        self
     }
 
     /// Wire the UiEvent bus so streaming text deltas to ChatAppend
@@ -371,10 +357,7 @@ impl AgentInvoker for InferenceAgentInvoker {
         // observer so `/admin/inference` can attribute load to the
         // Automations consumer.
         let stream_ctx = StreamingContext {
-            flow_channel: self.flow_channel.as_ref(),
             events: self.events.as_ref(),
-            run_id: req.run_id.as_deref(),
-            node_id: req.node_id.as_deref(),
             conversation_id: req.conversation_id.as_deref(),
         };
         self.metrics
@@ -397,10 +380,7 @@ impl AgentInvoker for InferenceAgentInvoker {
 /// the right places. Borrowed view — the invoker owns the hub/bus.
 #[derive(Clone, Copy)]
 struct StreamingContext<'a> {
-    flow_channel: Option<&'a crate::flow_channel::FlowChannelHub>,
     events: Option<&'a crate::events::EventBus>,
-    run_id: Option<&'a str>,
-    node_id: Option<&'a str>,
     conversation_id: Option<&'a str>,
 }
 
@@ -500,23 +480,8 @@ async fn do_invoke(
         // ignore the field. The serializer skips None entirely.
         guided_decoding_backend: Some("outlines".into()),
     };
-    // Streaming chunk index counter — the on_text_delta callback runs
-    // once per non-empty content chunk and we want each
-    // FlowChannelEvent::AgentTextDelta to carry a monotone index.
-    let mut chunk_index: u32 = 0;
     let resp = client
         .chat_completions_streamed(&request, |delta_text| {
-            // Fan out to the FlowChannelHub for the SSE consumer.
-            if let (Some(hub), Some(run_id), Some(node_id)) =
-                (ctx.flow_channel, ctx.run_id, ctx.node_id)
-            {
-                hub.publish(crate::flow_channel::FlowChannelEvent::AgentTextDelta {
-                    run_id: run_id.to_owned(),
-                    node_id: node_id.to_owned(),
-                    index: chunk_index,
-                    text: delta_text.to_owned(),
-                });
-            }
             // Mirror to the chat UI when this AskAgent run is wired
             // back to a conversation. The SPA's existing
             // `chat_token_delta` handler appends into the streaming
@@ -528,7 +493,6 @@ async fn do_invoke(
                     text: delta_text.to_owned(),
                 });
             }
-            chunk_index = chunk_index.saturating_add(1);
         })
         .await
         .map_err(|e| AskAgentError::LlmFailure(format!("{e}")))?;

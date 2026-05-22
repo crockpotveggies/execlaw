@@ -60,17 +60,6 @@ pub struct ExecutorContext {
     /// turns CallPlugin into a clean per-node error rather than a
     /// runtime panic.
     pub plugin_host: Option<PluginHost>,
-    /// M6 — live event hub. Executor publishes `FlowChannelEvent`
-    /// frames during graph execution; the SPA subscribes by `run_id`.
-    pub flow_channel: crate::flow_channel::FlowChannelHub,
-    /// M6 — UiEvent broadcast bus, forwarded into the ReplyRouter
-    /// so the `chat_append` handler can publish
-    /// `UiEvent::ChatMessageOutbound` to live SPA subscribers.
-    pub events: Option<crate::events::EventBus>,
-    /// M6 — event-log HMAC key, forwarded into the ReplyRouter so
-    /// chat replies persist into `state_events` with the proper
-    /// HMAC chain.
-    pub event_log_hmac_key: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 impl ExecutorContext {
@@ -79,28 +68,7 @@ impl ExecutorContext {
             db,
             pool,
             plugin_host,
-            flow_channel: crate::flow_channel::FlowChannelHub::new(),
-            events: None,
-            event_log_hmac_key: None,
         }
-    }
-
-    pub fn with_flow_channel(mut self, hub: crate::flow_channel::FlowChannelHub) -> Self {
-        self.flow_channel = hub;
-        self
-    }
-
-    pub fn with_events(mut self, events: crate::events::EventBus) -> Self {
-        self.events = Some(events);
-        self
-    }
-
-    pub fn with_event_log_hmac_key(
-        mut self,
-        key: Option<std::sync::Arc<Vec<u8>>>,
-    ) -> Self {
-        self.event_log_hmac_key = key;
-        self
     }
 }
 
@@ -267,16 +235,7 @@ fn run_one(
             "automation runtime: failed to finalize run row",
         );
     }
-    // M6 — emit the run-finished event onto the live channel.
-    ctx.flow_channel.publish(crate::flow_channel::FlowChannelEvent::RunFinished {
-        run_id: run_id.to_string(),
-        outcome: match outcome {
-            ExecOutcome::Success => "success",
-            ExecOutcome::Skipped => "skipped",
-            ExecOutcome::Failed => "failed",
-        }
-        .to_owned(),
-    });
+    let _ = (run_id, outcome);
 }
 
 /// Result of a [`dry_run`] Ã¢â‚¬â€ outcome + captured per-node trace.
@@ -301,25 +260,11 @@ pub fn dry_run(
     automation: &AutomationRow,
     sample: &BusEventRow,
 ) -> DryRunResult {
-    dry_run_with_id(ctx, automation, sample, None)
-}
-
-/// Like [`dry_run`], but lets the caller supply the run id. When
-/// `client_run_id` is `Some`, the FlowChannelHub publishes events
-/// under that id so SPA SSE subscribers can correlate (audit fix
-/// #8). When `None`, falls back to the legacy `dry-{uuid}` mint.
-pub fn dry_run_with_id(
-    ctx: &ExecutorContext,
-    automation: &AutomationRow,
-    sample: &BusEventRow,
-    client_run_id: Option<String>,
-) -> DryRunResult {
     let event_ctx = event_context(sample);
     let mut state: HashMap<String, serde_json::Value> = HashMap::new();
     state.insert("event".to_string(), event_ctx);
     let mut traces: Vec<StepTrace> = Vec::new();
-    let dry_run_id =
-        client_run_id.unwrap_or_else(|| format!("dry-{}", uuid::Uuid::new_v4()));
+    let dry_run_id = format!("dry-{}", uuid::Uuid::new_v4());
     let outcome = execute_graph(
         &automation.definition,
         &mut state,
@@ -395,12 +340,6 @@ fn execute_graph(
 
         let start = Instant::now();
         let input_snapshot = snapshot_state(state);
-        // M6 — emit NodeStarted onto the run channel.
-        ctx.flow_channel.publish(crate::flow_channel::FlowChannelEvent::NodeStarted {
-            run_id: run_id.to_string(),
-            node_id: node.id.clone(),
-            node_kind: node.kind.as_str().to_owned(),
-        });
         let exec_result = execute_node(node, state, ctx, envelope, run_id);
         let ms = start.elapsed().as_millis() as u64;
 
@@ -414,14 +353,6 @@ fn execute_graph(
                     error: None,
                 };
                 trace_sink(trace);
-                ctx.flow_channel
-                    .publish(crate::flow_channel::FlowChannelEvent::NodeFinished {
-                        run_id: run_id.to_string(),
-                        node_id: node.id.clone(),
-                        output: value.clone(),
-                        ms,
-                        error: None,
-                    });
                 state.insert(node.id.clone(), value);
                 current = node.id.clone();
             }
@@ -536,154 +467,38 @@ fn execute_node(
             NodeOutcome::Output(serde_json::json!({}))
         }
         NodeKind::Terminal => NodeOutcome::Terminal,
-        NodeKind::AskAgent => execute_ask_agent(node, state, ctx, envelope, run_id),
         NodeKind::Notify => execute_notify(node, state, &ctx.db),
         NodeKind::CallPlugin => execute_call_plugin(node, state, ctx.plugin_host.as_ref()),
-        NodeKind::SendReply => execute_send_reply(node, state, ctx, envelope),
+        // 2026-05-22 — AskAgent + SendReply executors removed in the
+        // M6 rip-out. Their NodeKind variants remain so saved flows
+        // deserialize cleanly, but execution returns a clean,
+        // operator-actionable error. Reintroduce as the middleware
+        // redesign (pre-turn flow mutators) lands.
+        NodeKind::AskAgent => NodeOutcome::Error(
+            "AskAgent: not supported in this build — the M6 single-shot \
+             agent invoker was removed pending the middleware redesign. \
+             Use the legacy chat path or rebuild a middleware-aware \
+             AskAgent."
+                .into(),
+        ),
+        NodeKind::SendReply => NodeOutcome::Error(
+            "SendReply: not supported in this build — the ReplyRouter \
+             was removed in the M6 rip-out. Future flows will mutate the \
+             chat turn pre-execution; SendReply is no longer the delivery \
+             abstraction."
+                .into(),
+        ),
         _ => NodeOutcome::Error(format!(
             "node kind '{}' not implemented in this milestone",
             node.kind.as_str()
         )),
     }
+    // `envelope` + `run_id` retained on the signature for future use
+    // (middleware redesign), but currently consumed only by the
+    // surviving Filter/Transform/Branch/Terminal/Notify/CallPlugin
+    // executors that don't need them.
 }
 
-/// SendReply (M6) — build a `ReplyPayload` per the node's config and
-/// hand it to the [`crate::reply_router`]. Output = serialized
-/// `RouteResult` for downstream Branches.
-fn execute_send_reply(
-    node: &NodeDef,
-    state: &HashMap<String, serde_json::Value>,
-    ctx: &ExecutorContext,
-    envelope: &execlaw_core::event_envelope::EventEnvelope,
-) -> NodeOutcome {
-    let cfg = &node.config;
-    let source = cfg
-        .get("source")
-        .and_then(|v| v.as_str())
-        .unwrap_or("from_agent");
-
-    let payload = match build_reply_payload(source, cfg, state) {
-        Ok(p) => p,
-        Err(msg) => return NodeOutcome::Error(format!("SendReply: {msg}")),
-    };
-
-    let effective_envelope = match cfg.get("target_override") {
-        Some(v) if !v.is_null() => match serde_json::from_value::<
-            execlaw_core::event_envelope::OriginRef,
-        >(v.clone())
-        {
-            Ok(origin) => execlaw_core::event_envelope::EventEnvelope {
-                origin,
-                identity: envelope.identity.clone(),
-                correlation_id: envelope.correlation_id.clone(),
-                parent_event_id: envelope.parent_event_id.clone(),
-            },
-            Err(e) => {
-                return NodeOutcome::Error(format!(
-                    "SendReply: target_override is not a valid OriginRef: {e}"
-                ));
-            }
-        },
-        _ => envelope.clone(),
-    };
-
-    let mut router_ctx =
-        crate::reply_router::RouterCtx::new(ctx.db.clone(), ctx.plugin_host.clone());
-    if let Some(events) = ctx.events.clone() {
-        router_ctx = router_ctx.with_events(events);
-    }
-    router_ctx = router_ctx.with_event_log_hmac_key(ctx.event_log_hmac_key.clone());
-
-    let handle = match tokio::runtime::Handle::try_current() {
-        Ok(h) => h,
-        Err(_) => {
-            return NodeOutcome::Error(
-                "SendReply: no tokio runtime in scope".into(),
-            );
-        }
-    };
-    let result = handle.block_on(crate::reply_router::route(
-        &router_ctx,
-        &effective_envelope,
-        payload,
-    ));
-    NodeOutcome::Output(serde_json::to_value(&result).unwrap_or(serde_json::Value::Null))
-}
-
-fn build_reply_payload(
-    source: &str,
-    cfg: &serde_json::Value,
-    state: &HashMap<String, serde_json::Value>,
-) -> Result<execlaw_core::reply::ReplyPayload, String> {
-    use execlaw_core::reply::{ReplyHints, ReplyPart, ReplyPayload};
-
-    let hints: ReplyHints = cfg
-        .get("hints")
-        .cloned()
-        .map(|h| serde_json::from_value::<ReplyHints>(h).unwrap_or_default())
-        .unwrap_or_default();
-
-    match source {
-        "from_agent" | "from_node_output" => {
-            let node_id = cfg
-                .get("from_node")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_owned())
-                .or_else(|| infer_last_ask_node(state))
-                .ok_or_else(|| "could not infer upstream node — set config.from_node".to_owned())?;
-            let out = state
-                .get(&node_id)
-                .ok_or_else(|| format!("upstream node '{node_id}' has no recorded output"))?;
-            // AskAgent emits `{ tool, args }`; the exit-tool args may
-            // already be a `ReplyPayload` shape. If so, use it; else
-            // synthesize.
-            let args = out.get("args").cloned().unwrap_or(out.clone());
-            if let Ok(p) = serde_json::from_value::<ReplyPayload>(args.clone()) {
-                let mut p = p;
-                p.hints = hints;
-                Ok(p)
-            } else {
-                let text = args
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_owned();
-                Ok(ReplyPayload {
-                    text,
-                    parts: vec![],
-                    hints,
-                })
-            }
-        }
-        "template" => {
-            let text_template = cfg.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            let text = render_template(text_template, state);
-            let parts: Vec<ReplyPart> = cfg
-                .get("parts")
-                .cloned()
-                .and_then(|v| serde_json::from_value(v).ok())
-                .unwrap_or_default();
-            Ok(ReplyPayload {
-                text,
-                parts,
-                hints,
-            })
-        }
-        other => Err(format!(
-            "unknown SendReply.source '{other}' (expected from_agent | from_node_output | template)"
-        )),
-    }
-}
-
-fn infer_last_ask_node(state: &HashMap<String, serde_json::Value>) -> Option<String> {
-    let mut candidates: Vec<&String> = state
-        .iter()
-        .filter(|(_, v)| v.get("tool").is_some())
-        .map(|(k, _)| k)
-        .collect();
-    candidates.sort_by_key(|k| std::cmp::Reverse(k.len()));
-    candidates.into_iter().next().cloned()
-}
 
 /// Notify (M6) Ã¢â‚¬â€ insert a row into `state_alerts` via
 /// [`AlertStore::insert_firing`]. The alert's `source` defaults to
@@ -865,183 +680,6 @@ fn render_template_in_value(
     }
 }
 
-/// AskAgent (M3) Ã¢â‚¬â€ delegates to the [`AutomationsAgentPool`]. The
-/// pool's semaphore bounds in-flight invocations; the invoker
-/// translates the request into a single chat-completion call
-/// (production) or a scripted reply (tests).
-///
-/// Node output shape: `{ "tool": "<exit-tool-name>", "args": {...} }`.
-/// Downstream edges route on `<node_id>.tool`; downstream nodes can
-/// read `<node_id>.args.*` for the structured payload the agent
-/// produced.
-///
-/// Template substitution: `prompt` and each entry of `attachments`
-/// pass through [`render_template`] before reaching the invoker, so
-/// authors can write `{{event.payload.image_url}}` in the JSON
-/// definition and have it resolved against the run's state map.
-///
-/// M3a single-turn limitation: `max_turns` Ã¢â€°Â¥ 1 is treated as 1.
-/// The framework is sized for multi-turn (the invoker exposes the
-/// effective turn count) but the loop body is a follow-up.
-fn execute_ask_agent(
-    node: &NodeDef,
-    state: &HashMap<String, serde_json::Value>,
-    ctx: &ExecutorContext,
-    envelope: &execlaw_core::event_envelope::EventEnvelope,
-    run_id: &str,
-) -> NodeOutcome {
-    let pool = &ctx.pool;
-    let mut cfg = match parse_ask_agent_config(&node.config) {
-        Ok(c) => c,
-        Err(msg) => return NodeOutcome::Error(msg),
-    };
-    // Substitute `{{path.to.field}}` references in prompt + each
-    // attachment URL using the current state. Filter/Transform's
-    // Rhai expressions already access state via field syntax; this
-    // is the string-substitution analog for free-text fields.
-    cfg.prompt = render_template(&cfg.prompt, state);
-    cfg.attachments = cfg
-        .attachments
-        .into_iter()
-        .map(|a| render_template(&a, state))
-        .collect();
-    // M6-D — derive the chat conversation_id from the trigger
-    // envelope's origin so the streaming text mirrors into the chat
-    // UI when this AskAgent run is tied to a thread. Other origins
-    // (PluginChannel, Alert, None, WebSocketSession) don't carry a
-    // conversation_id; live tokens still reach the flow-trace SSE
-    // feed via run_id/node_id below.
-    let conversation_id = match &envelope.origin {
-        execlaw_core::event_envelope::OriginRef::ChatAppend { conversation_id } => {
-            Some(conversation_id.clone())
-        }
-        _ => None,
-    };
-    // M6-E — load conversation history when this run is bound to a
-    // chat thread. We replay every event from seq 0, project user_msg
-    // + model_turn to a role/text pair (the same `HistoryMessage`
-    // shape the legacy chat path consumes), then apply the same
-    // token-budget truncation policy so prompts don't blow past the
-    // operator-configured ceiling. Non-chat flows pass an empty Vec.
-    let history = match &conversation_id {
-        Some(cid_str) => load_history_for_conversation(ctx, cid_str.as_str()),
-        None => Vec::new(),
-    };
-    let req = AskAgentRequest {
-        config: cfg,
-        run_id: Some(run_id.to_owned()),
-        node_id: Some(node.id.clone()),
-        conversation_id,
-        history,
-    };
-    // We're inside a `spawn_blocking` thread; `Handle::current()`
-    // gives us the calling tokio runtime so we can drive the async
-    // invocation to completion without holding a worker.
-    let handle = match tokio::runtime::Handle::try_current() {
-        Ok(h) => h,
-        Err(_) => {
-            return NodeOutcome::Error(
-                "AskAgent: no tokio runtime in scope (executor must run under spawn_blocking)"
-                    .into(),
-            );
-        }
-    };
-    match handle.block_on(pool.invoke(&req)) {
-        Ok(call) => NodeOutcome::Output(serde_json::json!({
-            "tool": call.name,
-            "args": call.args,
-        })),
-        Err(e) => NodeOutcome::Error(format!("{e}")),
-    }
-}
-
-/// M6-E — load conversation history for a chat-context AskAgent
-/// invocation. Replays the conversation's event log, projects each
-/// `user_msg` / `model_turn` event to a role+text pair, and applies
-/// the operator-configured history-budget truncation policy. Returns
-/// an empty Vec on any error so the AskAgent run can still proceed
-/// without history rather than hard-failing.
-///
-/// Mirrors the projection logic in `chats::run_real_turn` (lines
-/// 829–855 there) so the chat-context flow path sees the same shape
-/// as the legacy chat path. Differences:
-///   * Tool-call events (`tool_use`/`tool_result`) are skipped — the
-///     M6 AskAgent doesn't replay multi-turn tool dialogue (M6-F is
-///     where that lands). Future: include them once the agent can
-///     actually act on prior tool results.
-///   * Spotlighting is intentionally NOT applied — the legacy chat
-///     path adds spotlight delimiters around user_msg text as a
-///     prompt-injection mitigation; M6 inherits that surface from
-///     the trust profile, not from this projection.
-fn load_history_for_conversation(
-    ctx: &ExecutorContext,
-    conversation_id: &str,
-) -> Vec<crate::automation_agent::HistoryEntry> {
-    use crate::automation_agent::{HistoryEntry, HistoryRole};
-    use execlaw_core::events::{EventKind, EventLog};
-    use execlaw_core::ids::{ConversationId, EventSeq};
-
-    let cid = ConversationId::from_string(conversation_id.to_owned());
-    let log = EventLog::new(&ctx.db);
-    let log = match &ctx.event_log_hmac_key {
-        Some(k) => log.with_hmac_key((**k).clone()),
-        None => log,
-    };
-    let history = match log.replay_since(&cid, EventSeq(0)) {
-        Ok(h) => h,
-        Err(e) => {
-            tracing::warn!(
-                target: "automation_runtime::ask_agent",
-                conversation_id = %conversation_id,
-                error = %e,
-                "history replay failed; AskAgent will proceed without prior turns",
-            );
-            return Vec::new();
-        }
-    };
-    let raw: Vec<execlaw_core::history_budget::HistoryMessage> = history
-        .iter()
-        .filter_map(|ev| match ev.kind {
-            EventKind::UserMsg => ev
-                .decode_payload::<crate::chats::types::UserMessagePayload>()
-                .ok()
-                .map(|p| execlaw_core::history_budget::HistoryMessage {
-                    role: execlaw_core::history_budget::HistoryRole::User,
-                    text: p.text,
-                }),
-            EventKind::ModelTurn => ev
-                .decode_payload::<crate::chats::types::RealModelTurnPayload>()
-                .ok()
-                .map(|p| execlaw_core::history_budget::HistoryMessage {
-                    role: execlaw_core::history_budget::HistoryRole::Assistant,
-                    text: p.text,
-                })
-                .or_else(|| {
-                    ev.decode_payload::<crate::chats::types::StubModelTurnPayload>()
-                        .ok()
-                        .map(|p| execlaw_core::history_budget::HistoryMessage {
-                            role: execlaw_core::history_budget::HistoryRole::Assistant,
-                            text: p.text,
-                        })
-                }),
-            _ => None,
-        })
-        .collect();
-    let budget = execlaw_core::history_budget::load_max_history_tokens(&ctx.db)
-        .unwrap_or(execlaw_core::history_budget::DEFAULT_HISTORY_TOKENS);
-    let truncated = execlaw_core::history_budget::truncate_to_budget(raw, budget);
-    truncated
-        .kept
-        .into_iter()
-        .map(|m| HistoryEntry {
-            role: match m.role {
-                execlaw_core::history_budget::HistoryRole::User => HistoryRole::User,
-                execlaw_core::history_budget::HistoryRole::Assistant => HistoryRole::Assistant,
-            },
-            text: m.text,
-        })
-        .collect()
-}
 
 /// Replace `{{path.to.field}}` tokens with the corresponding value
 /// from `state`. Unresolved paths are preserved verbatim (so the
@@ -1826,480 +1464,6 @@ mod tests {
         tasks.join().await;
     }
 
-    fn ask_agent_def_two_outcomes() -> AutomationDef {
-        AutomationDef {
-            trigger: TriggerDef {
-                kind: "webhook.received".to_owned(),
-                when: None,
-            },
-            nodes: vec![
-                NodeDef {
-                    id: "ask".into(),
-                    kind: NodeKind::AskAgent,
-                    config: serde_json::json!({
-                        "prompt": "Decide notify or ignore",
-                        "attachments": [],
-                        "reasoning_tools": [],
-                        "exit_tools": [
-                            {
-                                "name": "notify",
-                                "description": "Call on detection",
-                                "args_schema": {"type": "object"}
-                            },
-                            {
-                                "name": "ignore",
-                                "description": "Call otherwise",
-                                "args_schema": {"type": "object"}
-                            }
-                        ]
-                    }),
-                    position: None,
-                },
-                NodeDef {
-                    id: "did-notify".into(),
-                    kind: NodeKind::Terminal,
-                    config: serde_json::json!({}),
-                    position: None,
-                },
-                NodeDef {
-                    id: "did-ignore".into(),
-                    kind: NodeKind::Terminal,
-                    config: serde_json::json!({}),
-                    position: None,
-                },
-            ],
-            edges: vec![
-                EdgeDef {
-                    from: TRIGGER_SENTINEL.into(),
-                    to: "ask".into(),
-                    when: None,
-                },
-                EdgeDef {
-                    from: "ask".into(),
-                    to: "did-notify".into(),
-                    when: Some(r#"ask.tool == "notify""#.into()),
-                },
-                EdgeDef {
-                    from: "ask".into(),
-                    to: "did-ignore".into(),
-                    when: None, // fallback
-                },
-            ],
-        }
-    }
-
-    #[tokio::test]
-    async fn ask_agent_notify_outcome_routes_to_notify_branch() {
-        let db = fresh_db();
-        let auto_store = AutomationStore::new(&db);
-        let run_store = AutomationRunStore::new(&db);
-        let evt = seed_bus_event(&db, "e-notify", serde_json::json!({}));
-
-        let row = auto_store
-            .upsert(
-                &AutomationUpsert {
-                    id: None,
-                    name: "stub-notify".into(),
-                    enabled: true,
-                    definition: ask_agent_def_two_outcomes(),
-                },
-                1000,
-            )
-            .unwrap();
-
-        // Stub the pool to ALWAYS return `notify`.
-        let pool = stub_pool(ExitToolCall {
-            name: "notify".into(),
-            args: serde_json::json!({"species": "cat", "confidence": 0.91}),
-        });
-        // Drive the executor synchronously via spawn_blocking (matches
-        // production code path).
-        let db_for_blocking = db.clone();
-        let evt_for_blocking = evt.clone();
-        tokio::task::spawn_blocking(move || {
-            let ctx = agent_ctx(&db_for_blocking, pool);
-            run_matching_automations(&ctx, &evt_for_blocking);
-        })
-        .await
-        .unwrap();
-
-        let runs = run_store.list_for_automation(&row.id, 10).unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].status, AutomationRunStatus::Success);
-        let trace_ids: Vec<_> = runs[0]
-            .step_traces
-            .iter()
-            .map(|t| t.node_id.clone())
-            .collect();
-        assert!(trace_ids.contains(&"did-notify".to_string()));
-        assert!(!trace_ids.contains(&"did-ignore".to_string()));
-        // The AskAgent step's output carries the chosen tool + args
-        // for downstream nodes to read.
-        let ask_trace = runs[0]
-            .step_traces
-            .iter()
-            .find(|t| t.node_id == "ask")
-            .unwrap();
-        assert_eq!(ask_trace.output["tool"], "notify");
-        assert_eq!(ask_trace.output["args"]["species"], "cat");
-    }
-
-    #[tokio::test]
-    async fn ask_agent_ignore_outcome_routes_to_fallback_branch() {
-        let db = fresh_db();
-        let auto_store = AutomationStore::new(&db);
-        let run_store = AutomationRunStore::new(&db);
-        let evt = seed_bus_event(&db, "e-ignore", serde_json::json!({}));
-
-        let row = auto_store
-            .upsert(
-                &AutomationUpsert {
-                    id: None,
-                    name: "stub-ignore".into(),
-                    enabled: true,
-                    definition: ask_agent_def_two_outcomes(),
-                },
-                1000,
-            )
-            .unwrap();
-
-        let pool = stub_pool(ExitToolCall {
-            name: "ignore".into(),
-            args: serde_json::json!({}),
-        });
-        let db_for_blocking = db.clone();
-        let evt_for_blocking = evt.clone();
-        tokio::task::spawn_blocking(move || {
-            let ctx = agent_ctx(&db_for_blocking, pool);
-            run_matching_automations(&ctx, &evt_for_blocking);
-        })
-        .await
-        .unwrap();
-
-        let runs = run_store.list_for_automation(&row.id, 10).unwrap();
-        let trace_ids: Vec<_> = runs[0]
-            .step_traces
-            .iter()
-            .map(|t| t.node_id.clone())
-            .collect();
-        assert!(trace_ids.contains(&"did-ignore".to_string()));
-        assert!(!trace_ids.contains(&"did-notify".to_string()));
-    }
-
-    #[tokio::test]
-    async fn ask_agent_invoker_error_marks_run_failed_with_clear_message() {
-        let db = fresh_db();
-        let auto_store = AutomationStore::new(&db);
-        let run_store = AutomationRunStore::new(&db);
-        let evt = seed_bus_event(&db, "e1", serde_json::json!({}));
-
-        let row = auto_store
-            .upsert(
-                &AutomationUpsert {
-                    id: None,
-                    name: "stub-err".into(),
-                    enabled: true,
-                    definition: ask_agent_def_two_outcomes(),
-                },
-                1000,
-            )
-            .unwrap();
-
-        // Pool that always errors.
-        let pool =
-            AutomationsAgentPool::new(Arc::new(StubAgentInvoker::err("simulated llm timeout")));
-        let db_for_blocking = db.clone();
-        let evt_for_blocking = evt.clone();
-        tokio::task::spawn_blocking(move || {
-            let ctx = agent_ctx(&db_for_blocking, pool);
-            run_matching_automations(&ctx, &evt_for_blocking);
-        })
-        .await
-        .unwrap();
-
-        let runs = run_store.list_for_automation(&row.id, 10).unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].status, AutomationRunStatus::Failed);
-        let ask_trace = runs[0]
-            .step_traces
-            .iter()
-            .find(|t| t.node_id == "ask")
-            .unwrap();
-        assert!(
-            ask_trace
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("simulated llm timeout"),
-            "error message must surface invoker failure verbatim",
-        );
-    }
-
-    #[test]
-    fn render_template_substitutes_dotted_paths() {
-        let mut state = HashMap::new();
-        state.insert(
-            "event".to_string(),
-            serde_json::json!({
-                "id": "evt-1",
-                "payload": {"zone": "driveway", "n": 7, "active": true}
-            }),
-        );
-        assert_eq!(
-            render_template("zone={{event.payload.zone}}", &state),
-            "zone=driveway"
-        );
-        assert_eq!(render_template("n={{event.payload.n}}", &state), "n=7");
-        assert_eq!(
-            render_template("on={{event.payload.active}}", &state),
-            "on=true"
-        );
-        assert_eq!(
-            render_template("id={{ event.id }} n={{event.payload.n}}", &state),
-            "id=evt-1 n=7"
-        );
-    }
-
-    #[test]
-    fn render_template_preserves_unresolved_paths() {
-        let mut state = HashMap::new();
-        state.insert("event".to_string(), serde_json::json!({"id": "x"}));
-        // Unknown root.
-        assert_eq!(render_template("hi {{nope.x}}", &state), "hi {{nope.x}}");
-        // Known root, unknown leaf.
-        assert_eq!(
-            render_template("hi {{event.missing}}", &state),
-            "hi {{event.missing}}"
-        );
-    }
-
-    #[test]
-    fn render_template_handles_unterminated_braces() {
-        let state = HashMap::new();
-        // Unterminated `{{` must not crash; we just preserve the input.
-        assert_eq!(render_template("hi {{ event.x", &state), "hi {{ event.x");
-        assert_eq!(render_template("plain text", &state), "plain text");
-    }
-
-    #[tokio::test]
-    async fn ask_agent_prompt_templating_substitutes_event_payload() {
-        // Verifies the Ring-style usage: prompt + attachments are
-        // rendered against state at execute time. We use a stub
-        // invoker that captures the rendered request so the
-        // assertion is direct.
-        use crate::automation_agent::{AgentInvoker, AskAgentRequest};
-        use async_trait::async_trait;
-        use std::sync::Mutex;
-
-        struct CapturingInvoker {
-            captured: Arc<Mutex<Option<AskAgentRequest>>>,
-        }
-        #[async_trait]
-        impl AgentInvoker for CapturingInvoker {
-            async fn invoke(&self, req: &AskAgentRequest) -> Result<ExitToolCall, AskAgentError> {
-                *self.captured.lock().unwrap() = Some(req.clone());
-                Ok(ExitToolCall {
-                    name: "notify".into(),
-                    args: serde_json::json!({}),
-                })
-            }
-        }
-        let captured = Arc::new(Mutex::new(None));
-        let pool = AutomationsAgentPool::new(Arc::new(CapturingInvoker {
-            captured: captured.clone(),
-        }));
-
-        let db = fresh_db();
-        let auto_store = AutomationStore::new(&db);
-        let evt = seed_bus_event(
-            &db,
-            "e-tmpl",
-            serde_json::json!({
-                "zone": "driveway",
-                "image_url": "data:image/png;base64,AAAA"
-            }),
-        );
-        let def = AutomationDef {
-            trigger: TriggerDef {
-                kind: "webhook.received".to_owned(),
-                when: None,
-            },
-            nodes: vec![
-                NodeDef {
-                    id: "ask".into(),
-                    kind: NodeKind::AskAgent,
-                    config: serde_json::json!({
-                        "prompt": "Animal in {{event.payload.zone}}?",
-                        "attachments": ["{{event.payload.image_url}}"],
-                        "exit_tools": [
-                            {"name": "notify", "description": "yes", "args_schema": {"type":"object"}},
-                            {"name": "ignore", "description": "no",  "args_schema": {"type":"object"}}
-                        ]
-                    }),
-                    position: None,
-                },
-                NodeDef {
-                    id: "end".into(),
-                    kind: NodeKind::Terminal,
-                    config: serde_json::json!({}),
-                    position: None,
-                },
-            ],
-            edges: vec![
-                EdgeDef {
-                    from: TRIGGER_SENTINEL.into(),
-                    to: "ask".into(),
-                    when: None,
-                },
-                EdgeDef {
-                    from: "ask".into(),
-                    to: "end".into(),
-                    when: None,
-                },
-            ],
-        };
-        auto_store
-            .upsert(
-                &AutomationUpsert {
-                    id: None,
-                    name: "tmpl".into(),
-                    enabled: true,
-                    definition: def,
-                },
-                1000,
-            )
-            .unwrap();
-
-        let db_for_blocking = db.clone();
-        let evt_for_blocking = evt.clone();
-        tokio::task::spawn_blocking(move || {
-            let ctx = agent_ctx(&db_for_blocking, pool);
-            run_matching_automations(&ctx, &evt_for_blocking);
-        })
-        .await
-        .unwrap();
-
-        let req = captured
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("invoker should have been called");
-        assert_eq!(req.config.prompt, "Animal in driveway?");
-        assert_eq!(
-            req.config.attachments,
-            vec!["data:image/png;base64,AAAA".to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn ring_use_case_with_text_only_model_fails_with_clear_error() {
-        // The locked Ring use case: webhook with image Ã¢â€ â€™ AskAgent
-        // with attachments Ã¢â€ â€™ text-only model in inference resolver Ã¢â€ â€™
-        // VisionRequiredButTextOnlyModel surfaces in the run trace
-        // with operator-actionable guidance.
-        use crate::automation_agent::InferenceAgentInvoker;
-        use execlaw_inference_api::InferenceClient;
-
-        let db = fresh_db();
-        let auto_store = AutomationStore::new(&db);
-        let run_store = AutomationRunStore::new(&db);
-        let evt = seed_bus_event(
-            &db,
-            "e-ring",
-            serde_json::json!({"image_url": "data:image/png;base64,iVBORw0KGgo"}),
-        );
-
-        // Ring-style definition: pass the event's image through the
-        // attachments list. The capability check fires before any
-        // HTTP request, so the URL is dummy.
-        let def = AutomationDef {
-            trigger: TriggerDef {
-                kind: "webhook.received".to_owned(),
-                when: None,
-            },
-            nodes: vec![
-                NodeDef {
-                    id: "ask".into(),
-                    kind: NodeKind::AskAgent,
-                    config: serde_json::json!({
-                        "prompt": "Is there an animal in this image?",
-                        // The locked design routes attachments through
-                        // payload templating; M3a hardcodes the path
-                        // for the capability-check test.
-                        "attachments": ["data:image/png;base64,iVBORw0KGgo"],
-                        "exit_tools": [
-                            {"name": "notify", "description": "Animal", "args_schema": {"type":"object"}},
-                            {"name": "ignore", "description": "No animal", "args_schema": {"type":"object"}}
-                        ]
-                    }),
-                    position: None,
-                },
-                NodeDef {
-                    id: "end".into(),
-                    kind: NodeKind::Terminal,
-                    config: serde_json::json!({}),
-                    position: None,
-                },
-            ],
-            edges: vec![
-                EdgeDef {
-                    from: TRIGGER_SENTINEL.into(),
-                    to: "ask".into(),
-                    when: None,
-                },
-                EdgeDef {
-                    from: "ask".into(),
-                    to: "end".into(),
-                    when: None,
-                },
-            ],
-        };
-        let row = auto_store
-            .upsert(
-                &AutomationUpsert {
-                    id: None,
-                    name: "ring".into(),
-                    enabled: true,
-                    definition: def,
-                },
-                1000,
-            )
-            .unwrap();
-
-        // Configure a resolver that returns the current text-only
-        // default model Ã¢â‚¬â€ the capability check should reject the
-        // request before the bogus URL is ever contacted.
-        let bootstrap = Arc::new(InferenceClient::new("http://127.0.0.1:1"));
-        let mut resolver = crate::inference_resolver::InferenceResolver::new(Some(bootstrap));
-        resolver.bootstrap_model = Some("QuantTrio/Qwen3.5-27B-AWQ".into());
-        let pool = AutomationsAgentPool::new(Arc::new(InferenceAgentInvoker::new(
-            db.clone(),
-            Arc::new(resolver),
-        )));
-
-        let db_for_blocking = db.clone();
-        let evt_for_blocking = evt.clone();
-        tokio::task::spawn_blocking(move || {
-            let ctx = agent_ctx(&db_for_blocking, pool);
-            run_matching_automations(&ctx, &evt_for_blocking);
-        })
-        .await
-        .unwrap();
-
-        let runs = run_store.list_for_automation(&row.id, 10).unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].status, AutomationRunStatus::Failed);
-        let ask_trace = runs[0]
-            .step_traces
-            .iter()
-            .find(|t| t.node_id == "ask")
-            .unwrap();
-        let err = ask_trace.error.as_deref().unwrap_or("");
-        assert!(
-            err.contains("vision") && err.contains("text-only"),
-            "vision-required error message must surface clearly; got: {err}",
-        );
-    }
 
     #[tokio::test]
     async fn end_to_end_non_matching_event_produces_no_run() {

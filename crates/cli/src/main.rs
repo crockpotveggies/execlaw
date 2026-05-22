@@ -1278,11 +1278,6 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
     if let Err(e) = execlaw_core::event_registry::register_core_event_kinds(&db) {
         tracing::warn!(error = %e, "M6: core event registry seed failed (continuing)");
     }
-    // M6 — seed the core default web prompt flow (shadow mode,
-    // disabled by default). Idempotent.
-    if let Err(e) = execlaw_server::web_prompt::ensure_default_web_flow(&db) {
-        tracing::warn!(error = %e, "M6: default web flow seed failed (continuing)");
-    }
 
     // Resolve the data directory once at boot so downstream code
     // (bundled-plugins mirror, settings paths, etc.) doesn't have
@@ -1876,39 +1871,25 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
     // the same instance. Future call sites (chat / routines /
     // research) wire the same handle for cross-consumer slicing.
     let inference_metrics = execlaw_server::inference_metrics::InferenceMetrics::new();
-    // M6 — shared flow-channel hub. Same instance lives on
-    // `AppState.flow_channel` AND inside the executor's ctx so SPA
-    // subscribers see events from real bus-driven runs.
-    let flow_channel = execlaw_server::flow_channel::FlowChannelHub::new();
-    // M6-D — invoker wired with the flow hub AND the UI event bus so
-    // streaming AskAgent runs fan deltas into the SSE flow-trace
-    // feed AND (when the trigger envelope's origin is ChatAppend)
-    // into the chat UI's live-token channel.
+    // 2026-05-22 — M6 rip-out preserves the test-run path (operators
+    // still edit + dry-run flows on the canvas) but deletes the
+    // event bus, ReplyRouter, AskAgent invoker, and per-run flow
+    // channel. AskAgent/SendReply node kinds remain in the enum so
+    // saved flows deserialize, but the executor returns a clean
+    // "node kind not supported in this build" error for them. The
+    // pool stays as a stub for the same reason — kept in AppState
+    // so admin handlers compile uniformly.
     let automation_agent_pool =
         execlaw_server::automation_agent::AutomationsAgentPool::new(std::sync::Arc::new(
-            execlaw_server::automation_agent::InferenceAgentInvoker::new_with_metrics(
-                db.clone(),
-                inference.clone(),
-                inference_metrics.clone(),
-            )
-            .with_flow_channel(flow_channel.clone())
-            .with_events(events.clone()),
-        ));
-    let (automation_bus, automation_bus_tasks) =
-        execlaw_server::automation_bus::AutomationBus::spawn(
-            db.clone(),
-            execlaw_server::automation_runtime::build_handler(
-                execlaw_server::automation_runtime::ExecutorContext::new(
-                    db.clone(),
-                    automation_agent_pool.clone(),
-                    Some(plugin_host.clone()),
-                )
-                .with_flow_channel(flow_channel.clone())
-                .with_events(events.clone())
-                .with_event_log_hmac_key(hmac_key.clone()),
+            execlaw_server::automation_agent::StubAgentInvoker::err(
+                "AskAgent: invoker removed in M6 rip-out — use the chat path or rebuild with a middleware-aware invoker",
             ),
-            automation_bus_stop.clone(),
-        );
+        ));
+    // 2026-05-22 — M6 rip-out: the durable bus + live dispatcher
+    // are gone. A stub `AutomationBus` keeps `AppState.automation_bus`
+    // shape-valid until Rip 3 deletes the field outright.
+    let automation_bus = execlaw_server::automation_bus::AutomationBus::stub(db.clone());
+    let _ = automation_bus_stop;
 
     let state = execlaw_server::AppState {
         db: db.clone(),
@@ -1939,17 +1920,13 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         data_dir: data_dir.clone(),
         automation_bus,
         automation_agent_pool,
-        flow_channel,
         // M5 — same handle as the automations invoker holds, so the
         // `/admin/inference` snapshot endpoint sees AskAgent calls.
         inference_metrics,
     };
-    // We don't await `automation_bus_tasks` — letting the spawned
-    // dispatcher + poller run for the process lifetime. The `stop`
-    // notify is held by the same shutdown path that drives the rest
-    // of the sweepers (`sweep_stop`); we link them below so a SIGTERM
-    // drains everything together.
-    drop(automation_bus_tasks);
+    // 2026-05-22 — automation_bus_tasks were the dispatcher + poller
+    // spawned by `AutomationBus::spawn`; with the M6 rip-out the bus
+    // is a stub (no background tasks), nothing to drop here.
 
     // Phase B (channel-plugin surface): wire the host-capabilities
     // arc into the script engine NOW that AppState exists. The
@@ -2084,17 +2061,9 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
             );
         tokio::spawn(async move { sugg_sweeper.run(stop).await });
     }
-    // Link the automation bus's dispatcher + poller into the same
-    // shutdown signal as the sweepers — a SIGTERM drains the bus
-    // alongside everything else.
-    {
-        let stop = sweep_stop.clone();
-        let bus_stop = automation_bus_stop.clone();
-        tokio::spawn(async move {
-            stop.notified().await;
-            bus_stop.notify_waiters();
-        });
-    }
+    // 2026-05-22 — bus shutdown linkage retired with the M6 rip-out.
+    // The stub AutomationBus has no background tasks to drain.
+    let _ = automation_bus_stop;
 
     // Phase 12.C — backend supervisor reconcile loop. Only spawns
     // if the Docker connect succeeded above; otherwise managed-mode
