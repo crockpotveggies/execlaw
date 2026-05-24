@@ -3241,6 +3241,109 @@ pub async fn dispatch_external_turn(
     ensure_conversation(&store, cid);
     refresh_conversation_kind(&store, cid, principal.trust_level.class_tag());
 
+    // 2026-05-22 — Phase C of the Flows middleware redesign. Run
+    // matching `chat.prompt` flows before policy + turn dispatch on
+    // the channel-plugin inbound path (Signal, WhatsApp, …) — the
+    // same evaluation `send_message` runs for the web composer.
+    // The `event.payload.channel` field carries the plugin id
+    // (e.g. `"signal"`) so per-channel Filter Rhai (`event.payload
+    // .channel == "signal"`) narrows the flow set.
+    //
+    // Skipped mutations on this path: SetSkills (channel plugins
+    // don't carry the composer's `+` skill picker; resolving an
+    // unknown skill would error out the inbound which is
+    // user-hostile — skip silently here, surface in the run trace).
+    //
+    // Failure mode + perf budget identical to send_message: any
+    // middleware error logs WARN and the turn proceeds unmutated.
+    let flow_outcome = {
+        let flow_event = crate::flow_middleware::build_chat_prompt_event(
+            cid.as_str(),
+            text,
+            Some(principal.id.as_str()),
+            inbound_channel_origin.unwrap_or("unknown"),
+            &attachment_ids,
+        );
+        crate::flow_middleware::evaluate(state, &flow_event)
+    };
+    if !flow_outcome.appended_skills.is_empty() {
+        // Document the skip in the trace (single WARN per turn at
+        // most — flows that touch SetSkills on a transport-bridged
+        // inbound are operator-authored mistakes, not normal flow).
+        tracing::warn!(
+            target: "flow_middleware",
+            conversation_id = %cid.as_str(),
+            channel = %inbound_channel_origin.unwrap_or("unknown"),
+            skipped_count = flow_outcome.appended_skills.len(),
+            "SetSkills flow mutation ignored on plugin-inbound turn: transports don't carry a skill resolver",
+        );
+    }
+    let _ = flow_outcome.dropped; // Phase A/B decision: observe but don't short-circuit.
+
+    // Apply trust override BEFORE evaluate_turn so the policy
+    // engine's spotlighting + planner/executor split engage on
+    // demotion. SetTrust → Blocked / UnknownPending takes the
+    // inbound out of the routable path — surface as an alert
+    // (same shape as the rule-of-two breach below) and bail.
+    let mut sender_trust = sender_trust;
+    if let Some(class) = flow_outcome.trust_override {
+        let overridden = crate::flow_middleware::trust_class_to_policy_level(class);
+        tracing::debug!(
+            target: "flow_middleware",
+            conversation_id = %cid.as_str(),
+            channel = %inbound_channel_origin.unwrap_or("unknown"),
+            original = %sender_trust.as_str(),
+            overridden = %overridden.as_str(),
+            "flow middleware overrode sender trust on plugin inbound",
+        );
+        sender_trust = overridden;
+    }
+    if matches!(
+        sender_trust,
+        TrustLevel::Blocked | TrustLevel::UnknownPending
+    ) {
+        // SetTrust pushed this inbound out of the routable set
+        // post-flow. Surface as a Warning alert so the operator
+        // sees the override took effect; same shape as the
+        // rule-of-two alert below.
+        state.events.publish(UiEvent::AlertFired {
+            alert_id: format!("appr-{}", uuid::Uuid::new_v4()),
+            severity: "Warning".into(),
+            source: "core.flow_trust_override".into(),
+            title: format!(
+                "Flow override demoted inbound from {} to {} — turn dropped",
+                principal.id.as_str(),
+                sender_trust.as_str(),
+            ),
+        });
+        return Ok(());
+    }
+
+    // Compose the effective text: memory_prepend +
+    // (rewritten_prompt || raw text). No skill_prepend on this
+    // path — channel plugins don't carry the composer's skill
+    // picker. Owned String so downstream borrows survive.
+    let memory_prepend = crate::flow_middleware::render_memory_prepend(
+        &flow_outcome.injected_memory,
+    );
+    let base_text: String = match &flow_outcome.rewritten_prompt {
+        Some(rewritten) if !rewritten.is_empty() => rewritten.clone(),
+        _ => text.to_owned(),
+    };
+    let effective_text: String = format!("{memory_prepend}{base_text}");
+    let text: &str = &effective_text;
+
+    // AddAttachment merges into the inbound's attachment_ids
+    // (deduped, additive). Owned Vec — shadows the parameter so
+    // downstream `attachment_ids.clone()` picks up the merged
+    // version.
+    let mut attachment_ids = attachment_ids;
+    for id in &flow_outcome.added_attachment_ids {
+        if !attachment_ids.contains(id) {
+            attachment_ids.push(id.clone());
+        }
+    }
+
     let policy = evaluate_turn(TurnPolicyInput {
         effective_trust: sender_trust,
         sender_trust,
@@ -3285,11 +3388,19 @@ pub async fn dispatch_external_turn(
     let _typing_guard = TypingIndicatorGuard::for_conversation(state, cid).await;
 
     let sender = Some(principal.id.as_str().to_owned());
-    let caller_caps: Vec<String> = policy
+    // Phase B SetTools mutator applied on the plugin-inbound path
+    // too — additive, deduped against the policy-engine's natural
+    // cap set.
+    let mut caller_caps: Vec<String> = policy
         .capability_set
         .iter()
         .map(|s| (*s).to_owned())
         .collect();
+    for tool in &flow_outcome.added_tools {
+        if !caller_caps.contains(tool) {
+            caller_caps.push(tool.clone());
+        }
+    }
     let caller_trust = sender_trust;
 
     let has_plugin_tools = !state.plugin_host.registry().all_tools().is_empty();
@@ -5273,6 +5384,187 @@ mod tests {
     // surface that echoes caller_caps to assert against; an end-to-
     // end SetTools test would need a real tool to call, which sits
     // beyond Phase B's scope.
+
+    // ---- Phase C end-to-end: plugin-inbound flow evaluation ----
+
+    /// Build a controller-class Principal that mirrors the
+    /// `resolve_sender("controller")` fast-path. Lets tests call
+    /// `dispatch_external_turn` directly without needing a real
+    /// channel-plugin inbound.
+    fn controller_principal() -> Principal {
+        Principal {
+            id: execlaw_core::ids::PrincipalId::from("controller"),
+            identifiers: vec![],
+            trust_level: CoreTrustLevel::Controller,
+            resolved_by: vec![],
+            metadata: serde_json::json!({}),
+            first_seen: 0,
+            last_seen: Some(0),
+            controller_notes: None,
+        }
+    }
+
+    /// Phase C: a flow with `event.payload.channel == "signal"`
+    /// fires on a Signal-source inbound (RewritePrompt mutates the
+    /// persisted user_msg text) but does NOT fire on a web
+    /// composer send (same flow, different channel).
+    #[tokio::test]
+    async fn flow_per_channel_filter_only_fires_on_matching_channel() {
+        use execlaw_core::events::{EventKind, EventLog};
+        use execlaw_core::ids::EventSeq;
+
+        let state = crate::routes::test_app_state();
+        // Flow rewrites prompt to "[SIG] <text>" only when
+        // payload.channel == "signal".
+        install_flow(
+            &state,
+            "signal-only-prefix",
+            serde_json::json!({
+                "trigger": {
+                    "kind": "chat.prompt",
+                    "when": "event.payload.channel == \"signal\""
+                },
+                "nodes": [{
+                    "id": "rw",
+                    "kind": "RewritePrompt",
+                    "config": {"expr": "\"[SIG] \" + event.payload.text"}
+                }],
+                "edges": [
+                    {"from": "trigger", "to": "rw", "when": null},
+                    {"from": "rw", "to": "END", "when": null}
+                ]
+            }),
+        );
+
+        // 1. Plugin inbound (channel = "signal") → flow fires.
+        let cid_signal = ConversationId::from("conv-signal");
+        crate::chats::dispatch_external_turn(
+            &state,
+            &cid_signal,
+            &controller_principal(),
+            TrustLevel::Controller,
+            "hello",
+            Some("signal"),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+        let log = EventLog::new(&state.db);
+        let evts = log.replay_since(&cid_signal, EventSeq(0)).unwrap();
+        let user_msg = evts
+            .iter()
+            .find(|e| e.kind == EventKind::UserMsg)
+            .expect("signal inbound should commit a user_msg event");
+        let p: crate::chats::types::UserMessagePayload = user_msg.decode_payload().unwrap();
+        assert_eq!(
+            p.text, "[SIG] hello",
+            "signal-channel flow should fire and rewrite text",
+        );
+
+        // 2. Web composer (channel = "web") → flow's `when`
+        // predicate is false, no mutation.
+        let app = crate::routes::build_router(state);
+        let (status, body) = send(app, "hi").await;
+        assert_eq!(status, StatusCode::OK);
+        let reply = body["assistant_text"].as_str().unwrap();
+        assert!(
+            reply.contains("received 2 chars"),
+            "web composer should NOT trigger signal-only flow (expected 2-char input, got: {reply})",
+        );
+    }
+
+    /// Phase C: AddMemory + RewritePrompt on a plugin inbound both
+    /// land. The persisted user_msg text reflects the composed
+    /// `<memory>...</memory>` + rewritten body.
+    #[tokio::test]
+    async fn flow_memory_and_rewrite_apply_to_plugin_inbound() {
+        use execlaw_core::events::{EventKind, EventLog};
+        use execlaw_core::ids::EventSeq;
+
+        let state = crate::routes::test_app_state();
+        install_flow(
+            &state,
+            "memory-plus-rewrite",
+            serde_json::json!({
+                "trigger": {"kind": "chat.prompt", "when": null},
+                "nodes": [
+                    {"id": "m", "kind": "AddMemory", "config": {"text": "ctx"}},
+                    {"id": "rw", "kind": "RewritePrompt", "config": {"expr": "\"BODY\""}}
+                ],
+                "edges": [
+                    {"from": "trigger", "to": "m", "when": null},
+                    {"from": "m", "to": "rw", "when": null},
+                    {"from": "rw", "to": "END", "when": null}
+                ]
+            }),
+        );
+
+        let cid = ConversationId::from("conv-plugin");
+        crate::chats::dispatch_external_turn(
+            &state,
+            &cid,
+            &controller_principal(),
+            TrustLevel::Controller,
+            "ignored",
+            Some("signal"),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let log = EventLog::new(&state.db);
+        let evts = log.replay_since(&cid, EventSeq(0)).unwrap();
+        let user_msg = evts
+            .iter()
+            .find(|e| e.kind == EventKind::UserMsg)
+            .expect("plugin inbound should commit a user_msg event");
+        let p: crate::chats::types::UserMessagePayload = user_msg.decode_payload().unwrap();
+        assert_eq!(
+            p.text, "<memory>\nctx\n</memory>\n\nBODY",
+            "memory block must prepend rewritten body",
+        );
+    }
+
+    /// Phase C: SetTrust → Blocked on a plugin-inbound flow drops
+    /// the turn at the post-override gate and fires a
+    /// `core.flow_trust_override` alert (mirrors the rule-of-two
+    /// alert shape). The conversation log stays empty of user_msg.
+    #[tokio::test]
+    async fn flow_set_trust_blocked_on_plugin_inbound_drops_turn() {
+        use execlaw_core::events::{EventKind, EventLog};
+        use execlaw_core::ids::EventSeq;
+
+        let state = crate::routes::test_app_state();
+        install_flow(
+            &state,
+            "demote-to-blocked",
+            simple_node_flow("SetTrust", serde_json::json!({"trust": "blocked"})),
+        );
+
+        let cid = ConversationId::from("conv-blocked");
+        let result = crate::chats::dispatch_external_turn(
+            &state,
+            &cid,
+            &controller_principal(),
+            TrustLevel::Controller,
+            "should not land",
+            Some("signal"),
+            None,
+            vec![],
+        )
+        .await;
+        assert!(result.is_ok(), "drop-turn returns Ok(()) (the inbound was processed, just not dispatched)");
+
+        let log = EventLog::new(&state.db);
+        let evts = log.replay_since(&cid, EventSeq(0)).unwrap();
+        let user_msg = evts.iter().find(|e| e.kind == EventKind::UserMsg);
+        assert!(
+            user_msg.is_none(),
+            "Blocked override must drop the turn; no user_msg should be committed",
+        );
+    }
 
     #[tokio::test]
     async fn send_message_rejects_empty_text() {

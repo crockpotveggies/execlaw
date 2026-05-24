@@ -344,9 +344,40 @@ impl<'db> EventRegistry<'db> {
 pub fn core_event_kinds() -> Vec<RegisteredEventKind> {
     vec![
         RegisteredEventKind {
+            // Phase A/B/C of the Flows middleware redesign
+            // (2026-05-22). The single canonical trigger kind for
+            // pre-turn chat-context flows. Channel (`web` /
+            // `signal` / `whatsapp` / …) lives in `payload.channel`
+            // so operators narrow with Filter Rhai (e.g.
+            // `event.payload.channel == "signal"`) rather than
+            // splitting the kind alphabet per transport.
+            kind: "chat.prompt".into(),
+            source: "core".into(),
+            description: "An inbound chat-context message (web composer or channel plugin) — fires pre-turn middleware flows. Filter on `event.payload.channel` to narrow per-transport.".into(),
+            payload_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["text", "channel"],
+                "properties": {
+                    "text": {"type": "string"},
+                    "conversation_id": {"type": "string"},
+                    "sender_principal_id": {"type": ["string", "null"]},
+                    "channel": {
+                        "type": "string",
+                        "description": "Inbound transport: `web` for SPA composer, plugin id (`signal`, `whatsapp`, …) for channel-plugin inbounds.",
+                    },
+                    "attachment_ids": {"type": "array", "items": {"type": "string"}},
+                },
+            })),
+            // chat.prompt fires pre-turn middleware; the chat
+            // handler owns reply emission, so the trigger itself
+            // doesn't claim expects_reply.
+            expects_reply: false,
+            default_origin_kind: "chat_append".into(),
+        },
+        RegisteredEventKind {
             kind: "web.prompt.submitted".into(),
             source: "core".into(),
-            description: "An operator submitted a prompt via the web SPA chat input.".into(),
+            description: "Legacy (pre-M6 rip-out). Kept registered so saved flows referencing this kind round-trip cleanly. Prefer `chat.prompt` for new flows.".into(),
             payload_schema: Some(serde_json::json!({
                 "type": "object",
                 "required": ["text"],
@@ -476,6 +507,30 @@ mod tests {
             && k.expects_reply
             && k.source == "core"));
         assert!(kinds.iter().any(|k| k.kind == "routine.fired" && !k.expects_reply));
+    }
+
+    #[test]
+    fn chat_prompt_is_registered_with_channel_in_payload_schema() {
+        // Phase C of the Flows middleware redesign — the SPA
+        // trigger picker reads from this list. `chat.prompt` must
+        // be present + carry a payload schema documenting the
+        // `channel` field so authors can write Filter Rhai like
+        // `event.payload.channel == "signal"`.
+        let db = fresh_db();
+        register_core_event_kinds(&db).unwrap();
+        let reg = EventRegistry::new(&db);
+        let chat_prompt = reg
+            .get_event_kind("chat.prompt")
+            .unwrap()
+            .expect("chat.prompt must be in the core event registry");
+        assert_eq!(chat_prompt.source, "core");
+        let schema = chat_prompt
+            .payload_schema
+            .as_ref()
+            .expect("chat.prompt should declare a payload schema");
+        let props = schema.get("properties").and_then(|v| v.as_object()).unwrap();
+        assert!(props.contains_key("channel"), "schema must document `channel`");
+        assert!(props.contains_key("text"), "schema must document `text`");
     }
 
     #[test]
