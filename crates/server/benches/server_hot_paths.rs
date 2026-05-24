@@ -840,6 +840,45 @@ fn bench_flow_middleware(c: &mut Criterion) {
         });
     });
 
+    // Phase B perf gate: a realistic chat-prompt flow exercising
+    // three mutator nodes in sequence (SetSkills + AddMemory +
+    // RewritePrompt). Each adds a small amount of Rhai + JSON
+    // shuffling on top of the per-node baseline. Budget: under 500µs
+    // measured.
+    let state_three = test_app_state();
+    let def_three: execlaw_core::automations::AutomationDef = serde_json::from_value(serde_json::json!({
+        "trigger": {"kind": "chat.prompt", "when": null},
+        "nodes": [
+            {"id": "s", "kind": "SetSkills", "config": {"skills": ["calendar"]}},
+            {"id": "m", "kind": "AddMemory", "config": {"text": "ctx: {{event.payload.text}}"}},
+            {"id": "rw", "kind": "RewritePrompt", "config": {"expr": "\"[p] \" + event.payload.text"}}
+        ],
+        "edges": [
+            {"from": "trigger", "to": "s", "when": null},
+            {"from": "s", "to": "m", "when": null},
+            {"from": "m", "to": "rw", "when": null},
+            {"from": "rw", "to": "END", "when": null}
+        ]
+    })).unwrap();
+    AutomationStore::new(&state_three.db)
+        .upsert(
+            &AutomationUpsert {
+                id: None,
+                name: "three-mutator-bench".into(),
+                enabled: true,
+                definition: def_three,
+            },
+            1000,
+        )
+        .unwrap();
+
+    c.bench_function("flow_middleware/evaluate_three_mutator_flow", |b| {
+        b.iter(|| {
+            let outcome = evaluate(black_box(&state_three), black_box(&evt));
+            black_box(outcome);
+        });
+    });
+
     // Silence unused-import warnings on the helper imports above when
     // run with `--no-run`.
     let _ = (Database::open, DbConfig::in_memory_unencrypted, MigrationRunner::new);

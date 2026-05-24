@@ -460,6 +460,11 @@ fn execute_node(
         }
         NodeKind::Terminal => NodeOutcome::Terminal,
         NodeKind::RewritePrompt => execute_rewrite_prompt(node, state),
+        NodeKind::SetSkills => execute_set_skills(node, state),
+        NodeKind::SetTools => execute_set_tools(node, state),
+        NodeKind::SetTrust => execute_set_trust(node, state),
+        NodeKind::AddAttachment => execute_add_attachment(node, state),
+        NodeKind::AddMemory => execute_add_memory(node, state),
         NodeKind::Notify => execute_notify(node, state, &ctx.db),
         NodeKind::CallPlugin => execute_call_plugin(node, state, ctx.plugin_host.as_ref()),
         // 2026-05-22 — AskAgent + SendReply executors removed in the
@@ -825,6 +830,112 @@ fn execute_rewrite_prompt(
         }
     };
     NodeOutcome::Output(serde_json::json!({ "text": text }))
+}
+
+// ---------------------------------------------------------------------------
+// Phase B mutators — emit typed JSON outputs for the flow_middleware
+// harvester to pick up. Each refuses bad config defensively even
+// though the validator already enforces shape at save time (defense
+// in depth: someone could insert a row via raw SQL).
+// ---------------------------------------------------------------------------
+
+/// Helper: pull a list-of-strings from `node.config[key]`. Validator
+/// guarantees presence/non-empty + per-element non-blankness; this
+/// re-checks because the executor is the only thing standing between
+/// a malformed row and a panic in the harvester.
+fn extract_string_list(
+    node: &NodeDef,
+    key: &'static str,
+    label: &'static str,
+) -> Result<Vec<String>, String> {
+    let arr = node
+        .config
+        .get(key)
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| format!("{label} node missing config.{key} (must be a JSON array of strings)"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, v) in arr.iter().enumerate() {
+        let s = v
+            .as_str()
+            .ok_or_else(|| format!("{label} node config.{key}[{i}] is not a string"))?
+            .trim();
+        if s.is_empty() {
+            return Err(format!("{label} node config.{key}[{i}] is empty"));
+        }
+        out.push(s.to_owned());
+    }
+    Ok(out)
+}
+
+fn execute_set_skills(
+    node: &NodeDef,
+    _state: &HashMap<String, serde_json::Value>,
+) -> NodeOutcome {
+    match extract_string_list(node, "skills", "SetSkills") {
+        Ok(skills) => NodeOutcome::Output(serde_json::json!({ "skills": skills })),
+        Err(e) => NodeOutcome::Error(e),
+    }
+}
+
+fn execute_set_tools(
+    node: &NodeDef,
+    _state: &HashMap<String, serde_json::Value>,
+) -> NodeOutcome {
+    match extract_string_list(node, "tools", "SetTools") {
+        Ok(tools) => NodeOutcome::Output(serde_json::json!({ "tools": tools })),
+        Err(e) => NodeOutcome::Error(e),
+    }
+}
+
+fn execute_set_trust(
+    node: &NodeDef,
+    _state: &HashMap<String, serde_json::Value>,
+) -> NodeOutcome {
+    let raw = match node.config.get("trust").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return NodeOutcome::Error("SetTrust node missing config.trust".into()),
+    };
+    // Normalize through TrustClass::parse so PascalCase + snake_case
+    // both round-trip to the canonical Serialize form. The harvester
+    // re-parses on the chat side to apply.
+    let class = match execlaw_core::event_envelope::TrustClass::parse(raw) {
+        Some(c) => c,
+        None => {
+            return NodeOutcome::Error(format!(
+                "SetTrust: unknown trust class '{raw}' (expected Controller | Delegated | KnownTrusted | KnownLimited | UnknownPending | ColdContact | Blocked, or their snake_case aliases)"
+            ));
+        }
+    };
+    NodeOutcome::Output(serde_json::json!({ "trust": class.as_str() }))
+}
+
+fn execute_add_attachment(
+    node: &NodeDef,
+    _state: &HashMap<String, serde_json::Value>,
+) -> NodeOutcome {
+    match extract_string_list(node, "attachment_ids", "AddAttachment") {
+        Ok(ids) => NodeOutcome::Output(serde_json::json!({ "attachment_ids": ids })),
+        Err(e) => NodeOutcome::Error(e),
+    }
+}
+
+fn execute_add_memory(
+    node: &NodeDef,
+    state: &HashMap<String, serde_json::Value>,
+) -> NodeOutcome {
+    let raw = match node.config.get("text").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return NodeOutcome::Error("AddMemory node missing config.text".into()),
+    };
+    let rendered = render_template(raw, state);
+    if rendered.trim().is_empty() {
+        return NodeOutcome::Error(
+            "AddMemory: rendered memory text is empty (template tokens may have stripped it; \
+             check `event.payload.*` references)"
+                .into(),
+        );
+    }
+    NodeOutcome::Output(serde_json::json!({ "text": rendered }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1267,6 +1378,142 @@ mod tests {
         assert!(
             err.contains("rhai eval failed"),
             "sandbox cap must surface as a clean rhai eval error; got: {err}",
+        );
+    }
+
+    // ---- Phase B mutator executor tests ----
+
+    fn one_node_flow(node_kind: NodeKind, config: serde_json::Value) -> AutomationDef {
+        serde_json::from_value(serde_json::json!({
+            "trigger": {"kind": "chat.prompt", "when": null},
+            "nodes": [
+                {"id": "m", "kind": node_kind.as_str(), "config": config},
+            ],
+            "edges": [
+                {"from": "trigger", "to": "m", "when": null},
+                {"from": "m", "to": "END", "when": null},
+            ],
+        })).unwrap()
+    }
+
+    fn run_mutator(node_kind: NodeKind, config: serde_json::Value) -> DryRunResult {
+        let db = fresh_db();
+        let store = AutomationStore::new(&db);
+        let row = store
+            .upsert(
+                &AutomationUpsert {
+                    id: None,
+                    name: "mutator-test".into(),
+                    enabled: true,
+                    definition: one_node_flow(node_kind, config),
+                },
+                1000,
+            )
+            .unwrap();
+        let evt = sample_event("chat.prompt", serde_json::json!({"text": "hi"}));
+        dry_run(&noop_ctx(&db), &row, &evt)
+    }
+
+    #[test]
+    fn set_skills_emits_typed_output() {
+        let result = run_mutator(
+            NodeKind::SetSkills,
+            serde_json::json!({"skills": ["calendar", "notes"]}),
+        );
+        assert_eq!(result.outcome, ExecOutcome::Success);
+        let t = result.step_traces.iter().find(|t| t.node_id == "m").unwrap();
+        assert_eq!(
+            t.output,
+            serde_json::json!({"skills": ["calendar", "notes"]})
+        );
+    }
+
+    #[test]
+    fn set_tools_emits_typed_output() {
+        let result = run_mutator(
+            NodeKind::SetTools,
+            serde_json::json!({"tools": ["python.execute"]}),
+        );
+        assert_eq!(result.outcome, ExecOutcome::Success);
+        let t = result.step_traces.iter().find(|t| t.node_id == "m").unwrap();
+        assert_eq!(t.output, serde_json::json!({"tools": ["python.execute"]}));
+    }
+
+    #[test]
+    fn set_trust_normalizes_snake_to_pascal_case() {
+        let result = run_mutator(
+            NodeKind::SetTrust,
+            serde_json::json!({"trust": "known_high"}),
+        );
+        assert_eq!(result.outcome, ExecOutcome::Success);
+        let t = result.step_traces.iter().find(|t| t.node_id == "m").unwrap();
+        // Output is the canonical PascalCase form (what TrustClass::as_str emits).
+        assert_eq!(t.output, serde_json::json!({"trust": "KnownTrusted"}));
+    }
+
+    // (validator already rejects unknown trust classes at save time;
+    // see `validate_rejects_set_trust_unknown_class` in
+    // crates/core/src/automations.rs — the executor's defensive
+    // check is unreachable via the store path.)
+
+    #[test]
+    fn add_attachment_emits_typed_output() {
+        let result = run_mutator(
+            NodeKind::AddAttachment,
+            serde_json::json!({"attachment_ids": ["att-1", "att-2"]}),
+        );
+        assert_eq!(result.outcome, ExecOutcome::Success);
+        let t = result.step_traces.iter().find(|t| t.node_id == "m").unwrap();
+        assert_eq!(
+            t.output,
+            serde_json::json!({"attachment_ids": ["att-1", "att-2"]})
+        );
+    }
+
+    #[test]
+    fn add_memory_renders_template_tokens() {
+        // {{event.payload.text}} → "hi" (from sample_event).
+        let result = run_mutator(
+            NodeKind::AddMemory,
+            serde_json::json!({"text": "User said: {{event.payload.text}}"}),
+        );
+        assert_eq!(result.outcome, ExecOutcome::Success);
+        let t = result.step_traces.iter().find(|t| t.node_id == "m").unwrap();
+        assert_eq!(t.output, serde_json::json!({"text": "User said: hi"}));
+    }
+
+    #[test]
+    fn add_memory_empty_after_template_render_errors_cleanly() {
+        // Validator rejects blank text at save time, but template
+        // tokens can RESOLVE to empty strings at execute time. This
+        // path drives a template that resolves to "" via an empty
+        // payload field; the executor's runtime guard must surface a
+        // clean error instead of producing an empty memory block.
+        let db = fresh_db();
+        let store = AutomationStore::new(&db);
+        let row = store
+            .upsert(
+                &AutomationUpsert {
+                    id: None,
+                    name: "memory-empty-template".into(),
+                    enabled: true,
+                    definition: one_node_flow(
+                        NodeKind::AddMemory,
+                        serde_json::json!({"text": "{{event.payload.text}}"}),
+                    ),
+                },
+                1000,
+            )
+            .unwrap();
+        // Empty-string payload field → template renders to "".
+        let evt = sample_event("chat.prompt", serde_json::json!({"text": ""}));
+        let result = dry_run(&noop_ctx(&db), &row, &evt);
+        assert_eq!(result.outcome, ExecOutcome::Failed);
+        let t = result.step_traces.iter().find(|t| t.node_id == "m").unwrap();
+        let err = t.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("AddMemory") && err.contains("empty"),
+            "expected runtime guard error; got: {err}",
         );
     }
 }

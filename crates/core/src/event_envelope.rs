@@ -77,6 +77,34 @@ impl TrustClass {
             Self::Blocked => "Blocked",
         }
     }
+
+    /// Reverse of [`as_str`]. Accepts both the canonical PascalCase
+    /// form (what serde emits) and operator-friendly snake_case
+    /// aliases that the SPA + flow-config UX exposes — so
+    /// `"Controller"` and `"controller"` both round-trip cleanly.
+    /// `KnownTrusted` also has the alias `known_high` to mirror the
+    /// SPA's TypeScript TrustClass union which uses that label.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            // Canonical PascalCase
+            "Controller" => Some(Self::Controller),
+            "Delegated" => Some(Self::Delegated),
+            "KnownTrusted" => Some(Self::KnownTrusted),
+            "KnownLimited" => Some(Self::KnownLimited),
+            "UnknownPending" => Some(Self::UnknownPending),
+            "ColdContact" => Some(Self::ColdContact),
+            "Blocked" => Some(Self::Blocked),
+            // Operator-friendly snake_case (matches SPA TypeScript)
+            "controller" => Some(Self::Controller),
+            "delegated" => Some(Self::Delegated),
+            "known_trusted" | "known_high" => Some(Self::KnownTrusted),
+            "known_limited" => Some(Self::KnownLimited),
+            "unknown_pending" => Some(Self::UnknownPending),
+            "cold_contact" => Some(Self::ColdContact),
+            "blocked" => Some(Self::Blocked),
+            _ => None,
+        }
+    }
 }
 
 /// How to reply to this event. `None` means the event is

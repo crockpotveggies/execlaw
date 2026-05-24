@@ -54,6 +54,32 @@ pub enum NodeKind {
     /// in `state[node_id]` so the harvester in `flow_middleware`
     /// picks it up.
     RewritePrompt,
+    /// Pre-turn middleware mutator (Phase B). Appends skill names to
+    /// the upcoming chat turn's `applied_skill_names` list — the
+    /// composer's skill-prepend resolver folds them into the
+    /// user-message body. Output shape: `{ "skills": ["name", ...] }`.
+    SetSkills,
+    /// Pre-turn middleware mutator (Phase B). Appends tool names to
+    /// the upcoming chat turn's `caller_caps`. Additive only — to
+    /// narrow the tool palette, use SetTrust to downgrade to a more
+    /// restrictive trust class. Output shape: `{ "tools": ["name", ...] }`.
+    SetTools,
+    /// Pre-turn middleware mutator (Phase B). Overrides the chat
+    /// turn's `caller_trust`. Scalar last-writer-wins across flows.
+    /// Output shape: `{ "trust": "controller" | "known_high" | ... }`.
+    SetTrust,
+    /// Pre-turn middleware mutator (Phase B). Appends attachment IDs
+    /// to the upcoming chat turn's persisted attachments list.
+    /// Validator checks shape only; existence is resolved at the
+    /// chat handler's attachment-decode step. Output shape:
+    /// `{ "attachment_ids": ["id", ...] }`.
+    AddAttachment,
+    /// Pre-turn middleware mutator (Phase B). Prepends an inline
+    /// memory block to the upcoming chat turn's user message,
+    /// wrapped in `<memory>…</memory>` (same pattern as skill
+    /// prepends). Multiple AddMemory nodes accumulate. Output
+    /// shape: `{ "text": "<string>" }`.
+    AddMemory,
     // Reserved (validator rejects with NotYetImplemented):
     AskAgent,
     CallPlugin,
@@ -78,6 +104,11 @@ impl NodeKind {
             NodeKind::Branch => "Branch",
             NodeKind::Terminal => "Terminal",
             NodeKind::RewritePrompt => "RewritePrompt",
+            NodeKind::SetSkills => "SetSkills",
+            NodeKind::SetTools => "SetTools",
+            NodeKind::SetTrust => "SetTrust",
+            NodeKind::AddAttachment => "AddAttachment",
+            NodeKind::AddMemory => "AddMemory",
             NodeKind::AskAgent => "AskAgent",
             NodeKind::CallPlugin => "CallPlugin",
             NodeKind::AppendToChat => "AppendToChat",
@@ -98,6 +129,11 @@ impl NodeKind {
             "Branch" => Some(NodeKind::Branch),
             "Terminal" => Some(NodeKind::Terminal),
             "RewritePrompt" => Some(NodeKind::RewritePrompt),
+            "SetSkills" => Some(NodeKind::SetSkills),
+            "SetTools" => Some(NodeKind::SetTools),
+            "SetTrust" => Some(NodeKind::SetTrust),
+            "AddAttachment" => Some(NodeKind::AddAttachment),
+            "AddMemory" => Some(NodeKind::AddMemory),
             "AskAgent" => Some(NodeKind::AskAgent),
             "CallPlugin" => Some(NodeKind::CallPlugin),
             "AppendToChat" => Some(NodeKind::AppendToChat),
@@ -123,6 +159,11 @@ impl NodeKind {
                 | NodeKind::Branch
                 | NodeKind::Terminal
                 | NodeKind::RewritePrompt
+                | NodeKind::SetSkills
+                | NodeKind::SetTools
+                | NodeKind::SetTrust
+                | NodeKind::AddAttachment
+                | NodeKind::AddMemory
                 | NodeKind::AskAgent
                 | NodeKind::Notify
                 | NodeKind::CallPlugin
@@ -464,6 +505,113 @@ pub fn validate(def: &AutomationDef) -> Result<(), AutomationError> {
             if expr.trim().is_empty() {
                 return Err(AutomationError::Validation(format!(
                     "RewritePrompt node '{}': config.expr is required and must be a non-empty Rhai value expression returning a string",
+                    n.id
+                )));
+            }
+        }
+        if matches!(n.kind, NodeKind::SetSkills) {
+            // skills: required non-empty array of non-empty strings.
+            let arr = match n.config.get("skills").and_then(|v| v.as_array()) {
+                Some(a) => a,
+                None => return Err(AutomationError::Validation(format!(
+                    "SetSkills node '{}': config.skills is required and must be a JSON array of skill names",
+                    n.id
+                ))),
+            };
+            if arr.is_empty() {
+                return Err(AutomationError::Validation(format!(
+                    "SetSkills node '{}': config.skills must be non-empty (drop the node if you don't want to add skills)",
+                    n.id
+                )));
+            }
+            for s in arr {
+                let name = s.as_str().unwrap_or("");
+                if name.trim().is_empty() {
+                    return Err(AutomationError::Validation(format!(
+                        "SetSkills node '{}': skill names must be non-empty strings",
+                        n.id
+                    )));
+                }
+            }
+        }
+        if matches!(n.kind, NodeKind::SetTools) {
+            // tools: required non-empty array of non-empty strings.
+            let arr = match n.config.get("tools").and_then(|v| v.as_array()) {
+                Some(a) => a,
+                None => return Err(AutomationError::Validation(format!(
+                    "SetTools node '{}': config.tools is required and must be a JSON array of tool names",
+                    n.id
+                ))),
+            };
+            if arr.is_empty() {
+                return Err(AutomationError::Validation(format!(
+                    "SetTools node '{}': config.tools must be non-empty",
+                    n.id
+                )));
+            }
+            for s in arr {
+                let name = s.as_str().unwrap_or("");
+                if name.trim().is_empty() {
+                    return Err(AutomationError::Validation(format!(
+                        "SetTools node '{}': tool names must be non-empty strings",
+                        n.id
+                    )));
+                }
+            }
+        }
+        if matches!(n.kind, NodeKind::SetTrust) {
+            // trust: required string matching a known TrustClass.
+            let trust = n.config.get("trust").and_then(|v| v.as_str()).unwrap_or("");
+            if trust.trim().is_empty() {
+                return Err(AutomationError::Validation(format!(
+                    "SetTrust node '{}': config.trust is required",
+                    n.id
+                )));
+            }
+            if crate::event_envelope::TrustClass::parse(trust).is_none() {
+                return Err(AutomationError::Validation(format!(
+                    "SetTrust node '{}': unknown trust class '{}' (expected controller | known_high | known_limited | cold_contact | blocked)",
+                    n.id, trust
+                )));
+            }
+        }
+        if matches!(n.kind, NodeKind::AddAttachment) {
+            // attachment_ids: required non-empty array of non-empty
+            // strings. Existence check defers to the chat handler's
+            // attachment-decode step (IDs may be templated via Rhai
+            // in the future; existence checks at save-time would be
+            // brittle anyway).
+            let arr = match n.config.get("attachment_ids").and_then(|v| v.as_array()) {
+                Some(a) => a,
+                None => return Err(AutomationError::Validation(format!(
+                    "AddAttachment node '{}': config.attachment_ids is required and must be a JSON array",
+                    n.id
+                ))),
+            };
+            if arr.is_empty() {
+                return Err(AutomationError::Validation(format!(
+                    "AddAttachment node '{}': config.attachment_ids must be non-empty",
+                    n.id
+                )));
+            }
+            for s in arr {
+                let id = s.as_str().unwrap_or("");
+                if id.trim().is_empty() {
+                    return Err(AutomationError::Validation(format!(
+                        "AddAttachment node '{}': attachment ids must be non-empty strings",
+                        n.id
+                    )));
+                }
+            }
+        }
+        if matches!(n.kind, NodeKind::AddMemory) {
+            // text: required non-empty string. May contain
+            // `{{event.payload.x}}` template tokens — rendered at
+            // execute time, not validated here.
+            let text = n.config.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            if text.trim().is_empty() {
+                return Err(AutomationError::Validation(format!(
+                    "AddMemory node '{}': config.text is required and must be a non-empty string",
                     n.id
                 )));
             }
@@ -1148,6 +1296,159 @@ mod tests {
         let def = rewrite_prompt_def(serde_json::json!({"expr": "   "}));
         let err = validate(&def).unwrap_err();
         assert!(format!("{err}").contains("non-empty"));
+    }
+
+    // ---- Phase B mutator validator tests ----
+
+    fn single_mutator_def(kind: NodeKind, config: serde_json::Value) -> AutomationDef {
+        AutomationDef {
+            trigger: TriggerDef {
+                kind: "chat.prompt".to_owned(),
+                when: None,
+            },
+            nodes: vec![NodeDef {
+                id: "m".into(),
+                kind,
+                config,
+                position: None,
+            }],
+            edges: vec![
+                EdgeDef {
+                    from: TRIGGER_SENTINEL.into(),
+                    to: "m".into(),
+                    when: None,
+                },
+                EdgeDef {
+                    from: "m".into(),
+                    to: END_SENTINEL.into(),
+                    when: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_set_skills() {
+        let def = single_mutator_def(
+            NodeKind::SetSkills,
+            serde_json::json!({"skills": ["notes_taker", "calendar"]}),
+        );
+        validate(&def).expect("well-formed SetSkills must validate");
+    }
+
+    #[test]
+    fn validate_rejects_set_skills_missing_array() {
+        let def = single_mutator_def(NodeKind::SetSkills, serde_json::json!({}));
+        let err = format!("{}", validate(&def).unwrap_err());
+        assert!(err.contains("config.skills"));
+    }
+
+    #[test]
+    fn validate_rejects_set_skills_empty_array() {
+        let def = single_mutator_def(NodeKind::SetSkills, serde_json::json!({"skills": []}));
+        let err = format!("{}", validate(&def).unwrap_err());
+        assert!(err.contains("non-empty"));
+    }
+
+    #[test]
+    fn validate_rejects_set_skills_blank_name() {
+        let def = single_mutator_def(
+            NodeKind::SetSkills,
+            serde_json::json!({"skills": ["ok", "   "]}),
+        );
+        let err = format!("{}", validate(&def).unwrap_err());
+        assert!(err.contains("non-empty"));
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_set_tools() {
+        let def = single_mutator_def(
+            NodeKind::SetTools,
+            serde_json::json!({"tools": ["python.execute"]}),
+        );
+        validate(&def).expect("well-formed SetTools must validate");
+    }
+
+    #[test]
+    fn validate_rejects_set_tools_missing() {
+        let def = single_mutator_def(NodeKind::SetTools, serde_json::json!({}));
+        let err = format!("{}", validate(&def).unwrap_err());
+        assert!(err.contains("config.tools"));
+    }
+
+    #[test]
+    fn validate_accepts_set_trust_pascal_and_snake_case() {
+        for trust in [
+            "Controller", "controller",
+            "KnownLimited", "known_limited",
+            "Blocked", "blocked",
+            "known_high", // SPA snake-case alias for KnownTrusted
+        ] {
+            let def = single_mutator_def(
+                NodeKind::SetTrust,
+                serde_json::json!({"trust": trust}),
+            );
+            validate(&def).unwrap_or_else(|e| panic!("trust '{trust}' should validate: {e}"));
+        }
+    }
+
+    #[test]
+    fn validate_rejects_set_trust_unknown_class() {
+        let def = single_mutator_def(
+            NodeKind::SetTrust,
+            serde_json::json!({"trust": "super_admin"}),
+        );
+        let err = format!("{}", validate(&def).unwrap_err());
+        assert!(err.contains("unknown trust class"));
+    }
+
+    #[test]
+    fn validate_rejects_set_trust_missing() {
+        let def = single_mutator_def(NodeKind::SetTrust, serde_json::json!({}));
+        let err = format!("{}", validate(&def).unwrap_err());
+        assert!(err.contains("config.trust"));
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_add_attachment() {
+        let def = single_mutator_def(
+            NodeKind::AddAttachment,
+            serde_json::json!({"attachment_ids": ["att-123", "att-456"]}),
+        );
+        validate(&def).expect("well-formed AddAttachment must validate");
+    }
+
+    #[test]
+    fn validate_rejects_add_attachment_empty_array() {
+        let def = single_mutator_def(
+            NodeKind::AddAttachment,
+            serde_json::json!({"attachment_ids": []}),
+        );
+        let err = format!("{}", validate(&def).unwrap_err());
+        assert!(err.contains("non-empty"));
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_add_memory() {
+        let def = single_mutator_def(
+            NodeKind::AddMemory,
+            serde_json::json!({"text": "Operator prefers concise replies."}),
+        );
+        validate(&def).expect("well-formed AddMemory must validate");
+    }
+
+    #[test]
+    fn validate_rejects_add_memory_blank_text() {
+        let def = single_mutator_def(NodeKind::AddMemory, serde_json::json!({"text": "   "}));
+        let err = format!("{}", validate(&def).unwrap_err());
+        assert!(err.contains("non-empty"));
+    }
+
+    #[test]
+    fn validate_rejects_add_memory_missing_text() {
+        let def = single_mutator_def(NodeKind::AddMemory, serde_json::json!({}));
+        let err = format!("{}", validate(&def).unwrap_err());
+        assert!(err.contains("config.text"));
     }
 
     #[test]

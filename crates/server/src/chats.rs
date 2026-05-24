@@ -136,8 +136,51 @@ pub async fn send_message(
             }
         };
 
+    // 2026-05-22 — Flows middleware (Phase A + B). Run matching
+    // `chat.prompt` flows synchronously BEFORE skill resolution
+    // and turn dispatch. The middleware can:
+    //   * RewritePrompt — replace the user-facing text the model sees
+    //   * SetSkills    — append to the skill list (composer + flow merge)
+    //   * SetTools     — add capabilities to caller_caps
+    //   * SetTrust     — override the policy engine's sender_trust
+    //   * AddAttachment — append attachment IDs
+    //   * AddMemory    — prepend `<memory>...</memory>` to the user text
+    //
+    // Skipped for incognito (no persistent state, no flow eval).
+    //
+    // Performance: zero enabled flows → one indexed SELECT against
+    // `state_automations` + immediate return (~4µs measured on warm
+    // SQLite). One flow + RewritePrompt → ~125µs measured. Rhai
+    // is sandboxed at RHAI_MAX_OPS (100k) so a pathological flow
+    // can't hang the chat handler.
+    //
+    // Failure mode: any middleware error logs WARN and the chat
+    // proceeds with un-mutated inputs. Flows are best-effort
+    // customization, never a gate on the turn.
+    let flow_outcome = if req.incognito {
+        crate::flow_middleware::FlowOutcome::default()
+    } else {
+        let flow_event = crate::flow_middleware::build_chat_prompt_event(
+            cid.as_str(),
+            &req.text,
+            req.sender_principal_id.as_deref(),
+            // No transport bridge metadata on this code path → "web".
+            // Channel-plugin inbound paths (Signal, WhatsApp) pass their
+            // own value once they're wired through generic_inbound.
+            "web",
+            &Vec::<String>::new(),
+        );
+        crate::flow_middleware::evaluate(&state, &flow_event)
+    };
+    // `flow_outcome.dropped` is observed but Phases A/B do NOT
+    // short-circuit the turn on it — that semantic lands once the
+    // operator UX for "your message was filtered" is designed. For
+    // now a Filter-drop is informational only.
+    let _ = flow_outcome.dropped;
+
     // 2026-05-15 — operator-picked skills (composer `+` menu, second
-    // item). Resolve every name to its current body and build the
+    // item) + flow-injected skills (Phase B SetSkills mutator).
+    // Resolve the merged list to its current bodies and build the
     // `<skill name="...">...</skill>\n\n` prepend block. Validation
     // failures (unknown / archived / prepend too large) short-circuit
     // BEFORE any event-log write so a typo'd skill name doesn't
@@ -146,12 +189,23 @@ pub async fn send_message(
     // regardless of which runtime answers. Skipped for incognito
     // (no DB read against the transient session) and for non-web
     // inbounds (transports don't surface a skill picker today).
+    let merged_skill_names: Vec<String> = if req.incognito {
+        Vec::new()
+    } else {
+        let mut merged = req.skill_names.clone();
+        for s in &flow_outcome.appended_skills {
+            if !merged.contains(s) {
+                merged.push(s.clone());
+            }
+        }
+        merged
+    };
     let (skill_prepend, applied_skill_names): (String, Vec<String>) =
-        if req.incognito || req.skill_names.is_empty() {
+        if merged_skill_names.is_empty() {
             (String::new(), Vec::new())
         } else {
-            match resolve_skill_prepend(&state.db, &req.skill_names) {
-                Ok(block) => (block, req.skill_names.clone()),
+            match resolve_skill_prepend(&state.db, &merged_skill_names) {
+                Ok(block) => (block, merged_skill_names.clone()),
                 Err((status, code, message)) => {
                     return (
                         status,
@@ -163,57 +217,30 @@ pub async fn send_message(
                 }
             }
         };
-    let composed_user_text: String = if skill_prepend.is_empty() {
-        req.text.clone()
-    } else {
-        format!("{skill_prepend}{}", req.text)
-    };
 
-    // 2026-05-22 — Phase A of the Flows middleware redesign. Run
-    // matching `chat.prompt` flows synchronously BEFORE the turn
-    // driver. The middleware can rewrite the prompt the model
-    // sees (RewritePrompt node). In Phase B the same hook
-    // surfaces SetSkills / SetTools / SetTrust / AddAttachment /
-    // AddMemory mutations.
-    //
-    // Performance: zero enabled flows → one indexed SELECT against
-    // state_automations + an immediate return. <100µs on warm
-    // SQLite. Flow execution itself caps Rhai ops at
-    // RHAI_MAX_OPS (100k) so pathological expressions can't hang
-    // the chat handler.
-    //
-    // Failure mode: any middleware error logs at WARN and the
-    // chat proceeds with the un-mutated text. Flows are
-    // best-effort customization, never a gate on the turn.
-    let flow_event = crate::flow_middleware::build_chat_prompt_event(
-        cid.as_str(),
-        &req.text,
-        req.sender_principal_id.as_deref(),
-        // No transport bridge metadata on this code path → "web".
-        // Channel-plugin inbound paths (Signal, WhatsApp) pass their
-        // own value once they're wired through generic_inbound.
-        "web",
-        &req.attachments.iter().map(|_| String::new()).collect::<Vec<_>>(),
+    // Compose the effective user text. Order:
+    //   <memory>…</memory>\n\n   ← Phase B AddMemory aggregation
+    //   <skill name="…">…</skill>\n\n  ← composer + Phase B SetSkills
+    //   <body>                    ← RewritePrompt result OR raw req.text
+    let memory_prepend = crate::flow_middleware::render_memory_prepend(
+        &flow_outcome.injected_memory,
     );
-    let flow_outcome = crate::flow_middleware::evaluate(&state, &flow_event);
-    let effective_user_text: String = match &flow_outcome.rewritten_prompt {
+    let base_text: String = match &flow_outcome.rewritten_prompt {
         Some(rewritten) if !rewritten.is_empty() => {
             tracing::debug!(
                 target: "flow_middleware",
                 conversation_id = %cid.as_str(),
-                original_len = composed_user_text.len(),
+                original_len = req.text.len(),
                 rewritten_len = rewritten.len(),
                 "flow middleware rewrote prompt for this turn",
             );
             rewritten.clone()
         }
-        _ => composed_user_text,
+        _ => req.text.clone(),
     };
-    // `flow_outcome.dropped` is observed here but Phase A does not
-    // short-circuit the turn on it — that semantic lands in Phase B
-    // once the operator UX for "your message was filtered" is
-    // designed. For now a Filter-drop is informational only.
-    let _ = flow_outcome.dropped;
+    let effective_user_text: String = format!(
+        "{memory_prepend}{skill_prepend}{base_text}"
+    );
 
     // 2026-04-28 — incognito short-circuit. We branch BEFORE
     // identity resolution / policy evaluation / event-log writes
@@ -247,11 +274,30 @@ pub async fn send_message(
     // per §2.14). Otherwise persist as UnknownPending so the
     // cold-contact flow below can park the conversation.
     let principals = PrincipalStore::new(&state.db);
-    let (principal, sender_trust) =
+    let (principal, sender_trust_raw) =
         match resolve_sender(&state, &principals, &req.sender_principal_id).await {
             Ok(pair) => pair,
             Err(e) => return err_500(&format!("identity resolution: {e}")),
         };
+    // 2026-05-22 — Phase B SetTrust override. The flow-authored
+    // override takes precedence when set. Maps the operator-facing
+    // `TrustClass` onto the flat policy `TrustLevel` the policy
+    // engine matches on. Ignored when no flow set a trust.
+    let sender_trust = match flow_outcome.trust_override {
+        Some(class) => {
+            let overridden =
+                crate::flow_middleware::trust_class_to_policy_level(class);
+            tracing::debug!(
+                target: "flow_middleware",
+                conversation_id = %cid.as_str(),
+                original = %sender_trust_raw.as_str(),
+                overridden = %overridden.as_str(),
+                "flow middleware overrode sender trust",
+            );
+            overridden
+        }
+        None => sender_trust_raw,
+    };
     // §2.6: re-derive ConversationKind from participants. Phase 3
     // single-participant chat: the conversation kind reflects the
     // sender's trust class. Group + multi-transport derivation
@@ -339,11 +385,18 @@ pub async fn send_message(
     let registry_for_tools = state.plugin_host.registry();
     let has_plugin_tools =
         !registry_for_tools.all_tools().is_empty() || !registry_for_tools.all_builtins().is_empty();
-    let caller_caps: Vec<String> = policy
+    // Start from the policy engine's cap set, then extend with any
+    // tools flow-injected via SetTools. Dedupes additively.
+    let mut caller_caps: Vec<String> = policy
         .capability_set
         .iter()
         .map(|s| (*s).to_owned())
         .collect();
+    for tool in &flow_outcome.added_tools {
+        if !caller_caps.contains(tool) {
+            caller_caps.push(tool.clone());
+        }
+    }
     let spotlight_content = policy.spotlighting;
     // Planner/executor containment (§9.2): when `policy.planner_executor`
     // fires — i.e. effective_trust < KnownTrusted — the model that sees
@@ -434,7 +487,7 @@ pub async fn send_message(
     // write the blobs + `state_attachments` rows. Failure surfaces
     // as a 500 — there's nothing useful the caller can do besides
     // retry.
-    let persisted_attachments: Vec<String> = if decoded_attachments.is_empty() {
+    let mut persisted_attachments: Vec<String> = if decoded_attachments.is_empty() {
         Vec::new()
     } else {
         match crate::chats::attachments::commit_decoded_attachments(
@@ -447,6 +500,19 @@ pub async fn send_message(
         }
     };
     drop(decoded_attachments);
+
+    // 2026-05-22 — Phase B AddAttachment mutator. Flow-added IDs
+    // append to the persisted list (deduped). The chat handler's
+    // attachment-decode step doesn't re-validate existence here;
+    // the turn driver consumes IDs as-is and surfaces missing-blob
+    // errors at use time. Flows should reference IDs already
+    // persisted to `state_attachments` (e.g. uploaded earlier in
+    // the conversation).
+    for id in &flow_outcome.added_attachment_ids {
+        if !persisted_attachments.contains(id) {
+            persisted_attachments.push(id.clone());
+        }
+    }
 
     let (user_msg_seq, assistant_text, assistant_seq) =
         match (inference_for_turn, runner_routed.as_deref()) {
@@ -5055,6 +5121,158 @@ mod tests {
             "disabled flow must not rewrite; reply should reflect the original 2-char input (got: {reply})",
         );
     }
+
+    // ---- Phase B end-to-end mutator tests ----
+
+    /// Helper: insert an enabled flow with the given graph JSON.
+    fn install_flow(state: &AppState, name: &str, def_json: serde_json::Value) {
+        use execlaw_core::automations::{AutomationStore, AutomationUpsert};
+        let def: execlaw_core::automations::AutomationDef =
+            serde_json::from_value(def_json).expect("flow def must parse");
+        AutomationStore::new(&state.db)
+            .upsert(
+                &AutomationUpsert {
+                    id: None,
+                    name: name.into(),
+                    enabled: true,
+                    definition: def,
+                },
+                1000,
+            )
+            .unwrap();
+    }
+
+    fn simple_node_flow(node_kind: &str, config: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "trigger": {"kind": "chat.prompt", "when": null},
+            "nodes": [
+                {"id": "n", "kind": node_kind, "config": config}
+            ],
+            "edges": [
+                {"from": "trigger", "to": "n", "when": null},
+                {"from": "n", "to": "END", "when": null}
+            ]
+        })
+    }
+
+    /// SetTrust → Blocked: the chat handler's policy gate returns
+    /// 403 sender_blocked when the override demotes the controller
+    /// all the way down. Proves the override reaches `evaluate_turn`.
+    #[tokio::test]
+    async fn flow_set_trust_blocked_returns_403() {
+        let state = crate::routes::test_app_state();
+        install_flow(
+            &state,
+            "block-all",
+            simple_node_flow("SetTrust", serde_json::json!({"trust": "blocked"})),
+        );
+        let app = crate::routes::build_router(state);
+        let (status, body) = send(app, "hi").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["code"], "sender_blocked");
+    }
+
+    /// AddMemory prepends a `<memory>...</memory>` block to the user
+    /// text. The stub turn driver echoes back `received N chars` so
+    /// we can verify the prepend landed by char-counting.
+    ///
+    /// Memory wrapper layout: `<memory>\n<body>\n</memory>\n\n`
+    /// → 8 + 1 + len(body) + 1 + 9 + 2 = 21 + len(body) chars
+    /// added on top of the user text.
+    #[tokio::test]
+    async fn flow_add_memory_prepends_block_to_user_text() {
+        let state = crate::routes::test_app_state();
+        // body = "ctx" → 3 chars. Wrapper = 21. Total prepend = 24.
+        // Plus "hi" (2) = 26 chars.
+        install_flow(
+            &state,
+            "memory-ctx",
+            simple_node_flow("AddMemory", serde_json::json!({"text": "ctx"})),
+        );
+        let app = crate::routes::build_router(state);
+        let (status, body) = send(app, "hi").await;
+        assert_eq!(status, StatusCode::OK);
+        let reply = body["assistant_text"].as_str().unwrap();
+        assert!(
+            reply.contains("received 26 chars"),
+            "AddMemory must prepend a memory block; expected 26 chars (got: {reply})",
+        );
+    }
+
+    /// SetSkills appends to the skill list; the merged list flows
+    /// into `resolve_skill_prepend`. Sending a request that doesn't
+    /// pre-name any skills + a flow that injects an unknown skill
+    /// must trip the skill-prepend resolver's "unknown skill" 400.
+    /// That proves the merged list reached the resolver.
+    #[tokio::test]
+    async fn flow_set_skills_merges_into_skill_resolver() {
+        let state = crate::routes::test_app_state();
+        install_flow(
+            &state,
+            "inject-skill",
+            simple_node_flow(
+                "SetSkills",
+                serde_json::json!({"skills": ["nonexistent_skill_xyz"]}),
+            ),
+        );
+        let app = crate::routes::build_router(state);
+        let (status, body) = send(app, "hi").await;
+        // resolve_skill_prepend returns 404 for unknown skill names.
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("nonexistent_skill_xyz"),
+            "error must reference the unknown skill name (got: {body})",
+        );
+    }
+
+    /// AddAttachment appends IDs to `persisted_attachments` which
+    /// the stub turn writes into the `user_msg` event payload. The
+    /// list-messages hydration filters unknown IDs (no row in
+    /// state_attachments), so we go straight to the event log and
+    /// decode the user_msg payload to verify the id landed.
+    #[tokio::test]
+    async fn flow_add_attachment_appends_to_user_msg_payload() {
+        use execlaw_core::events::{EventKind, EventLog};
+        use execlaw_core::ids::{ConversationId, EventSeq};
+        let state = crate::routes::test_app_state();
+        install_flow(
+            &state,
+            "att-tag",
+            simple_node_flow(
+                "AddAttachment",
+                serde_json::json!({"attachment_ids": ["att-flow-injected-1"]}),
+            ),
+        );
+        let app = crate::routes::build_router(state.clone());
+        let (status, _body) = send(app, "hi").await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Pull the raw user_msg event payload from the durable log.
+        let log = EventLog::new(&state.db);
+        let cid = ConversationId::from("conv1");
+        let events = log.replay_since(&cid, EventSeq(0)).unwrap();
+        let user_msg = events
+            .iter()
+            .find(|e| e.kind == EventKind::UserMsg)
+            .expect("a user_msg row should have been committed");
+        let payload: crate::chats::types::UserMessagePayload =
+            user_msg.decode_payload().unwrap();
+        assert!(
+            payload.attachment_ids.contains(&"att-flow-injected-1".to_owned()),
+            "flow-added attachment id must land in user_msg.attachment_ids (got: {:?})",
+            payload.attachment_ids,
+        );
+    }
+
+    // SetTools: coverage by `evaluate_harvests_set_tools` (unit test
+    // in flow_middleware) + the chats apply path's direct
+    // `caller_caps.push(tool)` is visible-by-grep. There's no stub
+    // surface that echoes caller_caps to assert against; an end-to-
+    // end SetTools test would need a real tool to call, which sits
+    // beyond Phase B's scope.
 
     #[tokio::test]
     async fn send_message_rejects_empty_text() {

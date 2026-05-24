@@ -31,6 +31,7 @@ use crate::automation_runtime::{
 };
 use crate::state::AppState;
 use execlaw_core::automations::{AutomationStore, NodeKind};
+use execlaw_core::event_envelope::TrustClass;
 use std::collections::HashMap;
 use tracing::warn;
 
@@ -42,17 +43,45 @@ use tracing::warn;
 pub const CHAT_PROMPT_KIND: &str = "chat.prompt";
 
 /// Accumulated mutations the chat handler applies before the turn
-/// runs. Phase A only carries `rewritten_prompt`; B/C extend in
-/// place without changing the call shape on the chat side.
+/// runs. Accumulation rules:
+///   * Lists (`appended_skills`, `added_tools`,
+///     `added_attachment_ids`, `injected_memory`) — additive across
+///     matching flows. Duplicates within a single flow are not
+///     deduplicated here; the chat handler does that when it merges
+///     into the final caller_caps / skill list.
+///   * Scalars (`rewritten_prompt`, `trust_override`) — last-writer-
+///     wins across matching flows. Deterministic ordering
+///     (alphabetical by flow name) means the same flow set always
+///     produces the same outcome.
+///
+/// Phase A shipped `rewritten_prompt` + `dropped`. Phase B
+/// (2026-05-22) adds the remaining five mutator fields.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FlowOutcome {
-    /// New user-message text when one or more `RewritePrompt` nodes
-    /// fired. Last-writer-wins across matching flows (deterministic
-    /// alphabetical-by-name ordering — see [`evaluate`]).
+    /// `RewritePrompt` result. Last-writer-wins.
     pub rewritten_prompt: Option<String>,
+    /// `SetSkills` accumulated — appended onto `req.skill_names`
+    /// before the chat handler resolves the skill prepend.
+    pub appended_skills: Vec<String>,
+    /// `SetTools` accumulated — added to the upcoming turn's
+    /// `caller_caps`. Removal is intentionally not supported (use
+    /// SetTrust to downgrade instead).
+    pub added_tools: Vec<String>,
+    /// `SetTrust` result. Last-writer-wins. `None` means "leave
+    /// the resolved sender trust alone."
+    pub trust_override: Option<TrustClass>,
+    /// `AddAttachment` accumulated. Appended to
+    /// `persisted_attachments`. The chat handler's existing
+    /// attachment-decode step rejects bad IDs at use time.
+    pub added_attachment_ids: Vec<String>,
+    /// `AddMemory` accumulated — each entry is one rendered text
+    /// block. The chat handler concatenates them (one per line)
+    /// inside a `<memory>...</memory>` wrapper that prepends the
+    /// user-message body, same pattern as skill prepends.
+    pub injected_memory: Vec<String>,
     /// `true` when at least one matching flow's execution outcome
     /// was [`ExecOutcome::Skipped`] (a Filter said falsy). The chat
-    /// handler is free to honor or ignore this; Phase A doesn't
+    /// handler is free to honor or ignore this; Phase A/B don't
     /// short-circuit the turn on it — see roadmap.
     pub dropped: bool,
 }
@@ -62,8 +91,46 @@ impl FlowOutcome {
     /// Lets the chat handler skip the apply-mutations step entirely
     /// in the (common) no-flows case.
     pub fn is_noop(&self) -> bool {
-        self.rewritten_prompt.is_none() && !self.dropped
+        self.rewritten_prompt.is_none()
+            && self.appended_skills.is_empty()
+            && self.added_tools.is_empty()
+            && self.trust_override.is_none()
+            && self.added_attachment_ids.is_empty()
+            && self.injected_memory.is_empty()
+            && !self.dropped
     }
+}
+
+/// Map a `TrustClass` (the storage / envelope-friendly enum) onto
+/// the policy crate's flat `TrustLevel` (what `evaluate_turn`
+/// matches against). `ColdContact` collapses to `UnknownPending`
+/// because the policy engine doesn't distinguish them — they're
+/// the same "pending admission" gate from policy's point of view.
+pub fn trust_class_to_policy_level(c: execlaw_core::event_envelope::TrustClass) -> execlaw_policy::trust::TrustLevel {
+    use execlaw_core::event_envelope::TrustClass as C;
+    use execlaw_policy::trust::TrustLevel as L;
+    match c {
+        C::Controller => L::Controller,
+        C::Delegated => L::Delegated,
+        C::KnownTrusted => L::KnownTrusted,
+        C::KnownLimited => L::KnownLimited,
+        C::UnknownPending | C::ColdContact => L::UnknownPending,
+        C::Blocked => L::Blocked,
+    }
+}
+
+/// Render the operator-facing `<memory>...</memory>` block that the
+/// chat handler prepends to the user message when one or more
+/// `AddMemory` flows fire. Empty input → empty string (caller can
+/// concat unconditionally). Each memory entry lands on its own line
+/// inside the block, mirroring how the existing skill-prepend
+/// constructs `<skill name="…">…</skill>` blocks.
+pub fn render_memory_prepend(injected: &[String]) -> String {
+    if injected.is_empty() {
+        return String::new();
+    }
+    let body = injected.join("\n");
+    format!("<memory>\n{body}\n</memory>\n\n")
 }
 
 /// Run all matching `chat.prompt` flows against `event` and return
@@ -149,6 +216,49 @@ pub fn evaluate(state: &AppState, event: &FlowEventInput) -> FlowOutcome {
                 NodeKind::RewritePrompt => {
                     if let Some(text) = trace.output.get("text").and_then(|v| v.as_str()) {
                         outcome.rewritten_prompt = Some(text.to_owned());
+                    }
+                }
+                NodeKind::SetSkills => {
+                    if let Some(arr) = trace.output.get("skills").and_then(|v| v.as_array()) {
+                        for v in arr {
+                            if let Some(s) = v.as_str() {
+                                outcome.appended_skills.push(s.to_owned());
+                            }
+                        }
+                    }
+                }
+                NodeKind::SetTools => {
+                    if let Some(arr) = trace.output.get("tools").and_then(|v| v.as_array()) {
+                        for v in arr {
+                            if let Some(s) = v.as_str() {
+                                outcome.added_tools.push(s.to_owned());
+                            }
+                        }
+                    }
+                }
+                NodeKind::SetTrust => {
+                    if let Some(s) = trace.output.get("trust").and_then(|v| v.as_str())
+                        && let Some(c) = TrustClass::parse(s)
+                    {
+                        outcome.trust_override = Some(c);
+                    }
+                }
+                NodeKind::AddAttachment => {
+                    if let Some(arr) = trace
+                        .output
+                        .get("attachment_ids")
+                        .and_then(|v| v.as_array())
+                    {
+                        for v in arr {
+                            if let Some(s) = v.as_str() {
+                                outcome.added_attachment_ids.push(s.to_owned());
+                            }
+                        }
+                    }
+                }
+                NodeKind::AddMemory => {
+                    if let Some(text) = trace.output.get("text").and_then(|v| v.as_str()) {
+                        outcome.injected_memory.push(text.to_owned());
                     }
                 }
                 _ => {}
@@ -436,6 +546,237 @@ mod tests {
         let outcome = evaluate(&state, &chat_event("hello"));
         // Failed run → no mutation harvested.
         assert!(outcome.is_noop());
+    }
+
+    // ---- Phase B harvest pass tests ----
+
+    #[test]
+    fn evaluate_harvests_set_skills() {
+        let state = fresh_state();
+        insert_flow(
+            &state,
+            "skills",
+            serde_json::json!({
+                "trigger": {"kind": "chat.prompt", "when": null},
+                "nodes": [{
+                    "id": "s",
+                    "kind": "SetSkills",
+                    "config": {"skills": ["calendar", "notes_taker"]}
+                }],
+                "edges": [
+                    {"from": "trigger", "to": "s", "when": null},
+                    {"from": "s", "to": "END", "when": null}
+                ]
+            }),
+        );
+        let outcome = evaluate(&state, &chat_event("hi"));
+        assert_eq!(outcome.appended_skills, vec!["calendar", "notes_taker"]);
+    }
+
+    #[test]
+    fn evaluate_harvests_set_tools() {
+        let state = fresh_state();
+        insert_flow(
+            &state,
+            "tools",
+            serde_json::json!({
+                "trigger": {"kind": "chat.prompt", "when": null},
+                "nodes": [{
+                    "id": "t",
+                    "kind": "SetTools",
+                    "config": {"tools": ["python.execute"]}
+                }],
+                "edges": [
+                    {"from": "trigger", "to": "t", "when": null},
+                    {"from": "t", "to": "END", "when": null}
+                ]
+            }),
+        );
+        let outcome = evaluate(&state, &chat_event("hi"));
+        assert_eq!(outcome.added_tools, vec!["python.execute"]);
+    }
+
+    #[test]
+    fn evaluate_harvests_set_trust() {
+        let state = fresh_state();
+        insert_flow(
+            &state,
+            "trust",
+            serde_json::json!({
+                "trigger": {"kind": "chat.prompt", "when": null},
+                "nodes": [{
+                    "id": "tr",
+                    "kind": "SetTrust",
+                    "config": {"trust": "known_limited"}
+                }],
+                "edges": [
+                    {"from": "trigger", "to": "tr", "when": null},
+                    {"from": "tr", "to": "END", "when": null}
+                ]
+            }),
+        );
+        let outcome = evaluate(&state, &chat_event("hi"));
+        assert_eq!(outcome.trust_override, Some(TrustClass::KnownLimited));
+    }
+
+    #[test]
+    fn evaluate_harvests_add_attachment() {
+        let state = fresh_state();
+        insert_flow(
+            &state,
+            "att",
+            serde_json::json!({
+                "trigger": {"kind": "chat.prompt", "when": null},
+                "nodes": [{
+                    "id": "a",
+                    "kind": "AddAttachment",
+                    "config": {"attachment_ids": ["att-1", "att-2"]}
+                }],
+                "edges": [
+                    {"from": "trigger", "to": "a", "when": null},
+                    {"from": "a", "to": "END", "when": null}
+                ]
+            }),
+        );
+        let outcome = evaluate(&state, &chat_event("hi"));
+        assert_eq!(outcome.added_attachment_ids, vec!["att-1", "att-2"]);
+    }
+
+    #[test]
+    fn evaluate_harvests_add_memory_with_template_render() {
+        let state = fresh_state();
+        insert_flow(
+            &state,
+            "mem",
+            serde_json::json!({
+                "trigger": {"kind": "chat.prompt", "when": null},
+                "nodes": [{
+                    "id": "m",
+                    "kind": "AddMemory",
+                    "config": {"text": "User says: {{event.payload.text}}"}
+                }],
+                "edges": [
+                    {"from": "trigger", "to": "m", "when": null},
+                    {"from": "m", "to": "END", "when": null}
+                ]
+            }),
+        );
+        let outcome = evaluate(&state, &chat_event("hello"));
+        assert_eq!(outcome.injected_memory, vec!["User says: hello"]);
+    }
+
+    #[test]
+    fn evaluate_accumulates_lists_across_multiple_flows() {
+        // Two flows each push to SetSkills + AddMemory. The
+        // accumulator merges (additive); ordering is alphabetical
+        // by flow name.
+        let state = fresh_state();
+        insert_flow(
+            &state,
+            "alpha",
+            serde_json::json!({
+                "trigger": {"kind": "chat.prompt", "when": null},
+                "nodes": [
+                    {"id": "s", "kind": "SetSkills", "config": {"skills": ["a"]}},
+                    {"id": "m", "kind": "AddMemory", "config": {"text": "A-memory"}}
+                ],
+                "edges": [
+                    {"from": "trigger", "to": "s", "when": null},
+                    {"from": "s", "to": "m", "when": null},
+                    {"from": "m", "to": "END", "when": null}
+                ]
+            }),
+        );
+        insert_flow(
+            &state,
+            "beta",
+            serde_json::json!({
+                "trigger": {"kind": "chat.prompt", "when": null},
+                "nodes": [
+                    {"id": "s", "kind": "SetSkills", "config": {"skills": ["b", "c"]}},
+                    {"id": "m", "kind": "AddMemory", "config": {"text": "B-memory"}}
+                ],
+                "edges": [
+                    {"from": "trigger", "to": "s", "when": null},
+                    {"from": "s", "to": "m", "when": null},
+                    {"from": "m", "to": "END", "when": null}
+                ]
+            }),
+        );
+
+        let outcome = evaluate(&state, &chat_event("hi"));
+        assert_eq!(outcome.appended_skills, vec!["a", "b", "c"]);
+        assert_eq!(outcome.injected_memory, vec!["A-memory", "B-memory"]);
+    }
+
+    #[test]
+    fn evaluate_set_trust_last_writer_wins() {
+        let state = fresh_state();
+        // aaa runs first → demotes to KnownLimited.
+        insert_flow(
+            &state,
+            "aaa-first",
+            serde_json::json!({
+                "trigger": {"kind": "chat.prompt", "when": null},
+                "nodes": [{"id": "t", "kind": "SetTrust", "config": {"trust": "known_limited"}}],
+                "edges": [
+                    {"from": "trigger", "to": "t", "when": null},
+                    {"from": "t", "to": "END", "when": null}
+                ]
+            }),
+        );
+        // zzz runs last → overrides to Blocked. Last-writer-wins.
+        insert_flow(
+            &state,
+            "zzz-last",
+            serde_json::json!({
+                "trigger": {"kind": "chat.prompt", "when": null},
+                "nodes": [{"id": "t", "kind": "SetTrust", "config": {"trust": "blocked"}}],
+                "edges": [
+                    {"from": "trigger", "to": "t", "when": null},
+                    {"from": "t", "to": "END", "when": null}
+                ]
+            }),
+        );
+        let outcome = evaluate(&state, &chat_event("hi"));
+        assert_eq!(outcome.trust_override, Some(TrustClass::Blocked));
+    }
+
+    /// Phase B perf gate: a typical 3-mutator flow (SetSkills +
+    /// AddMemory + RewritePrompt). 100 iters under 1s ceiling.
+    #[test]
+    fn evaluate_three_mutator_flow_under_budget() {
+        let state = fresh_state();
+        insert_flow(
+            &state,
+            "three-mutator",
+            serde_json::json!({
+                "trigger": {"kind": "chat.prompt", "when": null},
+                "nodes": [
+                    {"id": "s", "kind": "SetSkills", "config": {"skills": ["calendar"]}},
+                    {"id": "m", "kind": "AddMemory", "config": {"text": "ctx: {{event.payload.text}}"}},
+                    {"id": "rw", "kind": "RewritePrompt", "config": {"expr": "\"[p] \" + event.payload.text"}}
+                ],
+                "edges": [
+                    {"from": "trigger", "to": "s", "when": null},
+                    {"from": "s", "to": "m", "when": null},
+                    {"from": "m", "to": "rw", "when": null},
+                    {"from": "rw", "to": "END", "when": null}
+                ]
+            }),
+        );
+        let evt = chat_event("hi");
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            let outcome = evaluate(&state, &evt);
+            assert!(!outcome.is_noop());
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 2000,
+            "100 three-mutator evaluate() calls took {:?} — budget is <2s",
+            elapsed,
+        );
     }
 
     /// Perf gate: zero flows enabled must complete in well under 1ms

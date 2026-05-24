@@ -55,6 +55,22 @@ const STYLES: Record<string, KindStyle> = {
     // Transform (the existing Rhai-value-expr node) but a distinct
     // hue so authors can pick it out in a glance.
     RewritePrompt: { bg: "rgba(245, 204, 84, 0.18)", border: "#f5cc54", icon: "bi-pencil-square" },
+    // Phase B mutator palette — each gets its own hue so a glance
+    // tells the operator which kind a tile is. Colors picked from
+    // the theme palette family adjacent to RewritePrompt's yellow
+    // without competing with the existing brights (Filter amber,
+    // Transform green, etc.).
+    // sky cyan — additive skills tile
+    SetSkills: { bg: "rgba(125, 211, 252, 0.18)", border: "#7dd3fc", icon: "bi-magic" },
+    // lime — additive tools tile, distinct from CallPlugin's blue
+    SetTools: { bg: "rgba(190, 242, 100, 0.18)", border: "#bef264", icon: "bi-tools" },
+    // rose — scalar trust override carries a "be careful" feel
+    SetTrust: { bg: "rgba(253, 164, 175, 0.18)", border: "#fda4af", icon: "bi-shield-fill-exclamation" },
+    // soft purple — additive attachment IDs, kept close to Branch
+    AddAttachment: { bg: "rgba(196, 181, 253, 0.18)", border: "#c4b5fd", icon: "bi-paperclip" },
+    // warm sand — memory injection, distinct content from
+    // RewritePrompt's pencil
+    AddMemory: { bg: "rgba(252, 211, 77, 0.18)", border: "#fcd34d", icon: "bi-journal-text" },
     // orange — agent identity color, kept distinct from amber Filter
     AskAgent: { bg: "rgba(255, 138, 56, 0.18)", border: "#ff8a38", icon: "bi-robot" },
     // $danger (red) — alarm tile
@@ -217,6 +233,66 @@ export function RewritePromptNode(props: NodeProps) {
     );
 }
 
+export function SetSkillsNode(props: NodeProps) {
+    const data = props.data as unknown as CanvasNodeData;
+    return (
+        <div style={nodeShellStyle("SetSkills", !!data.selected)} data-testid={`node-${props.id}`}>
+            <Handle type="target" position={Position.Top} />
+            <NodeHeader kind="SetSkills" label={data.label} />
+            <NodeDetail detail={data.detail} />
+            <Handle type="source" position={Position.Bottom} />
+        </div>
+    );
+}
+
+export function SetToolsNode(props: NodeProps) {
+    const data = props.data as unknown as CanvasNodeData;
+    return (
+        <div style={nodeShellStyle("SetTools", !!data.selected)} data-testid={`node-${props.id}`}>
+            <Handle type="target" position={Position.Top} />
+            <NodeHeader kind="SetTools" label={data.label} />
+            <NodeDetail detail={data.detail} />
+            <Handle type="source" position={Position.Bottom} />
+        </div>
+    );
+}
+
+export function SetTrustNode(props: NodeProps) {
+    const data = props.data as unknown as CanvasNodeData;
+    return (
+        <div style={nodeShellStyle("SetTrust", !!data.selected)} data-testid={`node-${props.id}`}>
+            <Handle type="target" position={Position.Top} />
+            <NodeHeader kind="SetTrust" label={data.label} />
+            <NodeDetail detail={data.detail} />
+            <Handle type="source" position={Position.Bottom} />
+        </div>
+    );
+}
+
+export function AddAttachmentNode(props: NodeProps) {
+    const data = props.data as unknown as CanvasNodeData;
+    return (
+        <div style={nodeShellStyle("AddAttachment", !!data.selected)} data-testid={`node-${props.id}`}>
+            <Handle type="target" position={Position.Top} />
+            <NodeHeader kind="AddAttachment" label={data.label} />
+            <NodeDetail detail={data.detail} />
+            <Handle type="source" position={Position.Bottom} />
+        </div>
+    );
+}
+
+export function AddMemoryNode(props: NodeProps) {
+    const data = props.data as unknown as CanvasNodeData;
+    return (
+        <div style={nodeShellStyle("AddMemory", !!data.selected)} data-testid={`node-${props.id}`}>
+            <Handle type="target" position={Position.Top} />
+            <NodeHeader kind="AddMemory" label={data.label} />
+            <NodeDetail detail={data.detail} />
+            <Handle type="source" position={Position.Bottom} />
+        </div>
+    );
+}
+
 export function AskAgentNode(props: NodeProps) {
     const data = props.data as unknown as CanvasNodeData;
     return (
@@ -274,6 +350,11 @@ export const NODE_TYPES = {
     Branch: BranchNode,
     Terminal: TerminalNode,
     RewritePrompt: RewritePromptNode,
+    SetSkills: SetSkillsNode,
+    SetTools: SetToolsNode,
+    SetTrust: SetTrustNode,
+    AddAttachment: AddAttachmentNode,
+    AddMemory: AddMemoryNode,
     AskAgent: AskAgentNode,
     Notify: NotifyNode,
     CallPlugin: CallPluginNode,
@@ -286,6 +367,11 @@ export const KIND_ICONS: Record<string, string> = {
     Branch: STYLES.Branch.icon,
     Terminal: STYLES.Terminal.icon,
     RewritePrompt: STYLES.RewritePrompt.icon,
+    SetSkills: STYLES.SetSkills.icon,
+    SetTools: STYLES.SetTools.icon,
+    SetTrust: STYLES.SetTrust.icon,
+    AddAttachment: STYLES.AddAttachment.icon,
+    AddMemory: STYLES.AddMemory.icon,
     AskAgent: STYLES.AskAgent.icon,
     Notify: STYLES.Notify.icon,
     CallPlugin: STYLES.CallPlugin.icon,
@@ -298,6 +384,11 @@ export const KIND_COLORS: Record<string, string> = {
     Branch: STYLES.Branch.border,
     Terminal: STYLES.Terminal.border,
     RewritePrompt: STYLES.RewritePrompt.border,
+    SetSkills: STYLES.SetSkills.border,
+    SetTools: STYLES.SetTools.border,
+    SetTrust: STYLES.SetTrust.border,
+    AddAttachment: STYLES.AddAttachment.border,
+    AddMemory: STYLES.AddMemory.border,
     AskAgent: STYLES.AskAgent.border,
     Notify: STYLES.Notify.border,
     CallPlugin: STYLES.CallPlugin.border,

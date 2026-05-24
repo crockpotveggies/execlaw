@@ -39,6 +39,15 @@ export type NodeKind =
     // rewrites the user-facing prompt the chat turn driver sees.
     // Config: { expr: "<Rhai expression returning a string>" }
     | "RewritePrompt"
+    // Phase B mutators (2026-05-22): pre-turn middleware that
+    // mutates the chat handler's effective inputs before the turn
+    // driver runs. SetSkills/SetTools/AddAttachment/AddMemory are
+    // additive lists; SetTrust is a scalar override.
+    | "SetSkills"     // { skills: ["name", ...] }
+    | "SetTools"      // { tools: ["name", ...] }
+    | "SetTrust"      // { trust: "controller"|"known_high"|... }
+    | "AddAttachment" // { attachment_ids: ["id", ...] }
+    | "AddMemory"     // { text: "string" }
     | "AskAgent"
     | "Notify"
     | "CallPlugin"

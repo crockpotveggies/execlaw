@@ -152,6 +152,22 @@ function bodyFor(n: NodeDef): string | undefined {
         case "Transform":
         case "RewritePrompt":
             return shorten(cfg.expr as string | undefined);
+        case "SetSkills": {
+            const skills = (cfg.skills as string[] | undefined) ?? [];
+            return shorten(`+ ${skills.length} skill${skills.length === 1 ? "" : "s"}: ${skills.join(", ")}`);
+        }
+        case "SetTools": {
+            const tools = (cfg.tools as string[] | undefined) ?? [];
+            return shorten(`+ ${tools.length} tool${tools.length === 1 ? "" : "s"}: ${tools.join(", ")}`);
+        }
+        case "SetTrust":
+            return shorten(`trust = ${(cfg.trust as string | undefined) ?? "?"}`);
+        case "AddAttachment": {
+            const ids = (cfg.attachment_ids as string[] | undefined) ?? [];
+            return shorten(`+ ${ids.length} attachment${ids.length === 1 ? "" : "s"}`);
+        }
+        case "AddMemory":
+            return shorten((cfg.text as string | undefined) ?? "(empty memory)");
         case "AskAgent":
             return shorten(cfg.prompt as string | undefined);
         case "Notify": {
@@ -398,6 +414,16 @@ function defaultConfigFor(kind: NodeKind): unknown {
             // Sensible starter: echo the user's text untouched. The
             // operator overwrites the Rhai with their own logic.
             return { expr: "event.payload.text" };
+        case "SetSkills":
+            return { skills: [] };
+        case "SetTools":
+            return { tools: [] };
+        case "SetTrust":
+            return { trust: "known_limited" };
+        case "AddAttachment":
+            return { attachment_ids: [] };
+        case "AddMemory":
+            return { text: "" };
         case "AskAgent":
             return {
                 prompt: "Decide.",
@@ -747,9 +773,14 @@ const PALETTE_KINDS: NodeKind[] = [
     "Transform",
     "Branch",
     "Terminal",
-    // Phase A of the Flows middleware redesign — pre-turn mutator
-    // that rewrites the user-facing prompt the chat turn sees.
+    // Phase A + B mutators — pre-turn middleware that shapes the
+    // chat handler's inputs before the turn driver runs.
     "RewritePrompt",
+    "SetSkills",
+    "SetTools",
+    "SetTrust",
+    "AddAttachment",
+    "AddMemory",
     "Notify",
     "CallPlugin",
     // AskAgent + SendReply stay in the schema (saved flows
@@ -803,6 +834,16 @@ const PALETTE_TOOLTIPS: Record<NodeKind, string> = {
         "Ends the run with status `success`. Optional — flows without an explicit Terminal also end at implicit graph leaves.",
     RewritePrompt:
         "Pre-turn mutator: runs a Rhai expression that returns a string. The result replaces the user-facing prompt the chat turn driver sees. Use to inject context, normalize phrasing, or add system guidance.",
+    SetSkills:
+        "Pre-turn mutator: appends skill names to the chat turn's applied skills. Merged with the composer's `+` menu picks. The skill prepend resolver fails the turn if a name is unknown — so prefer Filter-gated SetSkills for conditional injection.",
+    SetTools:
+        "Pre-turn mutator: appends tool names to caller_caps. Additive only — to narrow tools, use SetTrust to downgrade the trust class instead.",
+    SetTrust:
+        "Pre-turn mutator: overrides the resolved sender_trust for this turn. Useful for demoting trust on prompt-injection patterns (engages spotlighting + planner/executor split) or promoting trust for vetted senders.",
+    AddAttachment:
+        "Pre-turn mutator: appends attachment IDs to the turn's persisted_attachments. IDs must already exist in state_attachments; missing rows are skipped at hydration without failing the turn.",
+    AddMemory:
+        "Pre-turn mutator: prepends a `<memory>...</memory>` block to the user message. Supports `{{event.payload.x}}` templating. Multiple AddMemory nodes accumulate.",
     AskAgent:
         "Invokes the LLM with a prompt + attachments + exit tools. The agent picks one exit tool to terminate the turn; downstream Branches route on that tool name.",
     Notify:

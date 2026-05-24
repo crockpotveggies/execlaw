@@ -223,6 +223,63 @@ function KindForm({
                     testId="node-panel-rewrite-prompt-expr"
                 />
             );
+        case "SetSkills":
+            return <StringListForm
+                node={node}
+                onChange={onChange}
+                fieldKey="skills"
+                label="Skill names (one per line)"
+                placeholder="calendar&#10;notes_taker"
+                help="Appended to the chat turn's applied skills. Each name must match an entry in state_skills (the skill prepend resolver fails the turn otherwise — gate with Filter to be safe)."
+                testId="node-panel-set-skills"
+            />;
+        case "SetTools":
+            return <StringListForm
+                node={node}
+                onChange={onChange}
+                fieldKey="tools"
+                label="Tool names (one per line)"
+                placeholder="python.execute&#10;web.search"
+                help="Added to caller_caps for this turn. Additive only — use SetTrust to downgrade trust if you want a smaller tool surface."
+                testId="node-panel-set-tools"
+            />;
+        case "SetTrust":
+            return <SetTrustForm node={node} onChange={onChange} />;
+        case "AddAttachment":
+            return <StringListForm
+                node={node}
+                onChange={onChange}
+                fieldKey="attachment_ids"
+                label="Attachment IDs (one per line)"
+                placeholder="att-abc-123&#10;att-def-456"
+                help="Appended to the turn's persisted_attachments. IDs must already exist in state_attachments — missing rows skip silently at hydration."
+                testId="node-panel-add-attachment"
+            />;
+        case "AddMemory":
+            return (
+                <Form.Group className="mb-2">
+                    <Form.Label className="small text-muted mb-1">
+                        Memory text
+                    </Form.Label>
+                    <Form.Control
+                        as="textarea"
+                        rows={4}
+                        value={(cfg.text as string | undefined) ?? ""}
+                        onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
+                            setConfig({ ...cfg, text: e.target.value })
+                        }
+                        placeholder="Operator prefers concise replies. Always default to metric units."
+                        spellCheck={false}
+                        className="small"
+                        data-testid="node-panel-add-memory-text"
+                    />
+                    <div className="small text-muted mt-1">
+                        Prepended to the user message wrapped in
+                        {" "}<code>&lt;memory&gt;...&lt;/memory&gt;</code>.
+                        Supports <code>{`{{event.payload.x}}`}</code> templating.
+                    </div>
+                </Form.Group>
+            );
         case "AskAgent":
             return <AskAgentForm node={node} onChange={onChange} />;
         case "Notify":
@@ -491,6 +548,105 @@ function ExitToolRow({
 
 const SEVERITIES = ["Critical", "Error", "Warning", "Info"] as const;
 type Severity = (typeof SEVERITIES)[number];
+
+/// Phase B mutator helper — line-delimited textarea backed by a
+/// JSON-array config field. Used by SetSkills / SetTools /
+/// AddAttachment (all three share the shape: a single string-array
+/// field with a different key name). Empty lines + whitespace-only
+/// lines are dropped on commit so a trailing newline doesn't break
+/// the validator.
+function StringListForm({
+    node,
+    onChange,
+    fieldKey,
+    label,
+    placeholder,
+    help,
+    testId,
+}: {
+    node: NodeDef;
+    onChange: (updated: NodeDef) => void;
+    fieldKey: string;
+    label: string;
+    placeholder: string;
+    help: string;
+    testId: string;
+}) {
+    const cfg = (node.config ?? {}) as Record<string, unknown>;
+    const items = (cfg[fieldKey] as string[] | undefined) ?? [];
+    return (
+        <Form.Group className="mb-2">
+            <Form.Label className="small text-muted mb-1">{label}</Form.Label>
+            <Form.Control
+                as="textarea"
+                rows={3}
+                value={items.join("\n")}
+                onChange={(e: ChangeEvent<HTMLTextAreaElement>) => {
+                    const next = e.target.value
+                        .split("\n")
+                        .map((s) => s.trim())
+                        .filter((s) => s !== "");
+                    onChange({
+                        ...node,
+                        config: { ...cfg, [fieldKey]: next },
+                    });
+                }}
+                placeholder={placeholder}
+                spellCheck={false}
+                className="font-monospace small"
+                data-testid={`${testId}-textarea`}
+            />
+            <div className="small text-muted mt-1">{help}</div>
+        </Form.Group>
+    );
+}
+
+/// Phase B SetTrust mutator form — dropdown over the canonical
+/// trust classes the policy engine matches on. Saves the
+/// snake_case alias because that's what the SPA's TypeScript
+/// TrustClass union uses (the validator accepts both forms).
+const TRUST_CLASSES: Array<{ value: string; label: string }> = [
+    { value: "controller", label: "controller (full caps, no spotlighting)" },
+    { value: "known_high", label: "known_high (KnownTrusted — full topic access)" },
+    { value: "known_limited", label: "known_limited (engages spotlight + planner/executor)" },
+    { value: "cold_contact", label: "cold_contact (parks for admission)" },
+    { value: "blocked", label: "blocked (drops the turn at the policy gate)" },
+];
+
+function SetTrustForm({
+    node,
+    onChange,
+}: {
+    node: NodeDef;
+    onChange: (updated: NodeDef) => void;
+}) {
+    const cfg = (node.config ?? {}) as Record<string, unknown>;
+    const current = (cfg.trust as string | undefined) ?? "known_limited";
+    return (
+        <Form.Group className="mb-2">
+            <Form.Label className="small text-muted mb-1">Trust class</Form.Label>
+            <Form.Select
+                size="sm"
+                value={current}
+                onChange={(e: ChangeEvent<HTMLSelectElement>) =>
+                    onChange({ ...node, config: { ...cfg, trust: e.target.value } })
+                }
+                data-testid="node-panel-set-trust"
+            >
+                {TRUST_CLASSES.map((t) => (
+                    <option key={t.value} value={t.value}>
+                        {t.label}
+                    </option>
+                ))}
+            </Form.Select>
+            <div className="small text-muted mt-1">
+                Overrides the policy engine's resolved sender_trust for
+                this turn. Last-writer-wins across matching flows
+                (alphabetical by flow name).
+            </div>
+        </Form.Group>
+    );
+}
 
 function NotifyForm({
     node,
