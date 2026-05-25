@@ -187,7 +187,7 @@ pretty_assertions = "1"
 
 # --- benchmarking ---
 # Criterion for microbenchmarks on hot paths (axiom #14).
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [profile.release]
 lto = "thin"
