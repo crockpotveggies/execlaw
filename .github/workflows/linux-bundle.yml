@@ -138,12 +138,12 @@ jobs:
 
       # ----- Provenance attestation -----
       - name: Attest .deb provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: ${{ steps.outputs.outputs.deb }}
 
       - name: Attest plugin ZIP provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: "dist/*.zip"
 

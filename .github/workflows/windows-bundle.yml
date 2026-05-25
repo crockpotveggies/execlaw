@@ -160,12 +160,12 @@ jobs:
       # setup. Runs on every build (workflow_dispatch + tag) so
       # dev-ad-hoc downloads are also verifiable.
       - name: Attest installer provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: ${{ steps.outputs.outputs.exe }}
 
       - name: Attest plugin ZIP provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           # Glob-supported — each ZIP gets its own attestation.
           subject-path: "dist/*.zip"
