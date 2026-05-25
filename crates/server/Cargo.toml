@@ -87,7 +87,7 @@ regex.workspace = true
 #     Replaces the previous `truncate_body` (which fed the subagent
 #     4 KB of mostly-chrome HTML soup, killing extraction quality).
 #     The original `readability` crate is unmaintained as of 2026.
-scraper = "0.26"
+scraper = "0.27"
 dom_smoothie = "0.17"
 
 utoipa.workspace = true
