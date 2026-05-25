@@ -144,7 +144,7 @@ dialoguer = "0.11"
 
 # --- os integration ---
 bollard = "0.18"
-keyring = "3"
+keyring = "4"
 directories = "5"
 
 # --- misc ---
