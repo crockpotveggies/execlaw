@@ -166,7 +166,7 @@ textwrap = "0.16"
 # Pure-Rust (no C deps), pinned to its built-in sandbox features
 # (operations limit, max function call depth) so a misbehaving
 # script can't wedge the host. ~250 KB compiled, no runtime install.
-rhai = { version = "1.21", default-features = false, features = ["std", "sync", "serde"] }
+rhai = { version = "1.25", default-features = false, features = ["std", "sync", "serde"] }
 serde_json_path = "0.7"
 # Pure-sync HTTP client for the script tier. reqwest::blocking
 # spins up its own tokio runtime per request which conflicts with
