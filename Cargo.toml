@@ -76,7 +76,7 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 # ReadDirectoryChangesW. Used by python_sandbox's output watcher to
 # detect when the kernel writes into /work/<convo>/outputs/. We
 # implement our own debounce on top so we control timing.
-notify = "7"
+notify = "8"
 
 # --- storage ---
 # SQLCipher (encrypted SQLite) via bundled build with vendored OpenSSL.
