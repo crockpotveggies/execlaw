@@ -1,9 +1,10 @@
 // Side-panel form behaviour: kind-specific fields, rename validation,
 // AskAgent exit-tools editor.
 
-import { describe, it, expect, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { AutomationNodePanel } from "../settings/AutomationNodePanel";
+import { AuthProvider } from "../auth/AuthContext";
 import type { AutomationDef, NodeDef } from "../api/automations";
 
 const baseDef: AutomationDef = {
@@ -359,5 +360,316 @@ describe("AutomationNodePanel — delete + close", () => {
         );
         fireEvent.click(screen.getByTestId("node-panel-close"));
         expect(onClose).toHaveBeenCalledTimes(1);
+    });
+});
+
+// ---- Phase D (2026-05-22) — SetSkills / SetTools hint chip footer ----
+//
+// The hint footer fetches `/api/admin/skills` (or `/api/admin/tools`)
+// on form mount and renders the registered names as clickable
+// chips. Clicking a chip appends the name to the textarea
+// (deduped). These tests cover render + click + dedupe.
+
+describe("AutomationNodePanel — Phase D SetSkills hint chips", () => {
+    let fetchMock: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+        localStorage.setItem("execlaw.access_token", "tok");
+        localStorage.setItem("execlaw.refresh_token", "tok");
+        fetchMock = vi.fn();
+        vi.stubGlobal("fetch", fetchMock);
+    });
+    afterEach(() => {
+        vi.unstubAllGlobals();
+    });
+
+    function setSkillsDef(initial: string[]): AutomationDef {
+        return {
+            trigger: { kind: "chat.prompt", when: null },
+            nodes: [
+                { id: "s", kind: "SetSkills", config: { skills: initial } },
+            ],
+            edges: [
+                { from: "trigger", to: "s", when: null },
+                { from: "s", to: "END", when: null },
+            ],
+        };
+    }
+
+    function mountSetSkillsPanel(initial: string[], onChange: () => void) {
+        const def = setSkillsDef(initial);
+        return render(
+            <AuthProvider>
+                <AutomationNodePanel
+                    node={def.nodes[0]}
+                    definition={def}
+                    onChange={onChange}
+                    onRename={vi.fn()}
+                    onDelete={vi.fn()}
+                    onClose={vi.fn()}
+                />
+            </AuthProvider>,
+        );
+    }
+
+    it("renders 'Loading…' before the fetch resolves, then chips for active skills", async () => {
+        // Hold the fetch promise open so the loading branch is visible.
+        let resolveFetch: (v: Response) => void = () => {};
+        fetchMock.mockImplementation((url: RequestInfo | URL) => {
+            const s = url.toString();
+            if (s.includes("/api/admin/skills")) {
+                return new Promise<Response>((resolve) => {
+                    resolveFetch = resolve;
+                });
+            }
+            return Promise.resolve(new Response("{}", { status: 200 }));
+        });
+        mountSetSkillsPanel([], vi.fn());
+
+        // Loading state visible.
+        const hints = await screen.findByTestId("node-panel-set-skills-hints");
+        expect(hints.textContent).toContain("Loading");
+
+        // Now resolve with two active + one archived skill — chips
+        // should appear, archived filtered out.
+        resolveFetch(
+            new Response(
+                JSON.stringify({
+                    skills: [
+                        {
+                            name: "calendar",
+                            description: "",
+                            state: "stable",
+                            version: 1,
+                            registration_kind: "authored",
+                            source: "operator",
+                            owning_plugin_id: null,
+                            updated_at: 0,
+                        },
+                        {
+                            name: "notes_taker",
+                            description: "",
+                            state: "trial",
+                            version: 1,
+                            registration_kind: "authored",
+                            source: "operator",
+                            owning_plugin_id: null,
+                            updated_at: 0,
+                        },
+                        // includeArchived: false already filters this
+                        // out at the API call level; the SPA's own
+                        // .filter(state !== "archived") is belt-and-
+                        // braces in case the backend ever drops the
+                        // query-param filter.
+                    ],
+                }),
+                { status: 200 },
+            ),
+        );
+
+        await waitFor(() => {
+            expect(screen.getByTestId("node-panel-set-skills-hint-calendar")).toBeInTheDocument();
+            expect(screen.getByTestId("node-panel-set-skills-hint-notes_taker")).toBeInTheDocument();
+        });
+    });
+
+    it("appends a clicked chip to the skill list via onChange", async () => {
+        fetchMock.mockImplementation((url: RequestInfo | URL) => {
+            const s = url.toString();
+            if (s.includes("/api/admin/skills")) {
+                return Promise.resolve(
+                    new Response(
+                        JSON.stringify({
+                            skills: [
+                                {
+                                    name: "calendar",
+                                    description: "",
+                                    state: "stable",
+                                    version: 1,
+                                    registration_kind: "authored",
+                                    source: "operator",
+                                    owning_plugin_id: null,
+                                    updated_at: 0,
+                                },
+                            ],
+                        }),
+                        { status: 200 },
+                    ),
+                );
+            }
+            return Promise.resolve(new Response("{}", { status: 200 }));
+        });
+
+        const onChange = vi.fn();
+        mountSetSkillsPanel([], onChange);
+
+        const chip = await screen.findByTestId(
+            "node-panel-set-skills-hint-calendar",
+        );
+        fireEvent.click(chip);
+        expect(onChange).toHaveBeenCalledWith(
+            expect.objectContaining({
+                id: "s",
+                kind: "SetSkills",
+                config: { skills: ["calendar"] },
+            }),
+        );
+    });
+
+    it("disables a chip that's already in the list (dedupe guard)", async () => {
+        fetchMock.mockImplementation((url: RequestInfo | URL) => {
+            const s = url.toString();
+            if (s.includes("/api/admin/skills")) {
+                return Promise.resolve(
+                    new Response(
+                        JSON.stringify({
+                            skills: [
+                                {
+                                    name: "calendar",
+                                    description: "",
+                                    state: "stable",
+                                    version: 1,
+                                    registration_kind: "authored",
+                                    source: "operator",
+                                    owning_plugin_id: null,
+                                    updated_at: 0,
+                                },
+                            ],
+                        }),
+                        { status: 200 },
+                    ),
+                );
+            }
+            return Promise.resolve(new Response("{}", { status: 200 }));
+        });
+
+        const onChange = vi.fn();
+        // Initial state already has "calendar" → chip must render
+        // disabled, click must be a no-op.
+        mountSetSkillsPanel(["calendar"], onChange);
+        const dupChip = await screen.findByTestId(
+            "node-panel-set-skills-hint-calendar",
+        );
+        expect((dupChip as HTMLButtonElement).disabled).toBe(true);
+        fireEvent.click(dupChip);
+        expect(onChange).not.toHaveBeenCalled();
+    });
+
+    it("renders a friendly error when the skill list fetch fails", async () => {
+        fetchMock.mockImplementation((url: RequestInfo | URL) => {
+            const s = url.toString();
+            if (s.includes("/api/admin/skills")) {
+                return Promise.reject(new Error("network down"));
+            }
+            return Promise.resolve(new Response("{}", { status: 200 }));
+        });
+        mountSetSkillsPanel([], vi.fn());
+        const err = await screen.findByTestId(
+            "node-panel-set-skills-hints-error",
+        );
+        expect(err.textContent).toMatch(/Couldn't load/);
+        expect(err.textContent).toMatch(/network down/);
+    });
+});
+
+describe("AutomationNodePanel — Phase D SetTools hint chips", () => {
+    let fetchMock: ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+        localStorage.setItem("execlaw.access_token", "tok");
+        localStorage.setItem("execlaw.refresh_token", "tok");
+        fetchMock = vi.fn();
+        vi.stubGlobal("fetch", fetchMock);
+    });
+    afterEach(() => {
+        vi.unstubAllGlobals();
+    });
+
+    it("filters out disabled + removed tools and surfaces only live ones as chips", async () => {
+        fetchMock.mockImplementation((url: RequestInfo | URL) => {
+            const s = url.toString();
+            if (s.includes("/api/admin/tools")) {
+                return Promise.resolve(
+                    new Response(
+                        JSON.stringify({
+                            tools: [
+                                {
+                                    tool_name: "python.execute",
+                                    source: "builtin",
+                                    source_id: null,
+                                    enabled: true,
+                                    allowed_classes: [],
+                                    description: null,
+                                    first_seen_at: 0,
+                                    last_seen_at: 0,
+                                    removed_at: null,
+                                },
+                                {
+                                    tool_name: "legacy.dead",
+                                    source: "plugin",
+                                    source_id: "old",
+                                    enabled: true,
+                                    allowed_classes: [],
+                                    description: null,
+                                    first_seen_at: 0,
+                                    last_seen_at: 0,
+                                    removed_at: 12345, // removed
+                                },
+                                {
+                                    tool_name: "manually.disabled",
+                                    source: "builtin",
+                                    source_id: null,
+                                    enabled: false,
+                                    allowed_classes: [],
+                                    description: null,
+                                    first_seen_at: 0,
+                                    last_seen_at: 0,
+                                    removed_at: null,
+                                },
+                            ],
+                        }),
+                        { status: 200 },
+                    ),
+                );
+            }
+            return Promise.resolve(new Response("{}", { status: 200 }));
+        });
+
+        const def: AutomationDef = {
+            trigger: { kind: "chat.prompt", when: null },
+            nodes: [
+                { id: "t", kind: "SetTools", config: { tools: [] } },
+            ],
+            edges: [
+                { from: "trigger", to: "t", when: null },
+                { from: "t", to: "END", when: null },
+            ],
+        };
+        render(
+            <AuthProvider>
+                <AutomationNodePanel
+                    node={def.nodes[0]}
+                    definition={def}
+                    onChange={vi.fn()}
+                    onRename={vi.fn()}
+                    onDelete={vi.fn()}
+                    onClose={vi.fn()}
+                />
+            </AuthProvider>,
+        );
+
+        // Live tool surfaces as a chip.
+        await waitFor(() => {
+            expect(
+                screen.getByTestId("node-panel-set-tools-hint-python.execute"),
+            ).toBeInTheDocument();
+        });
+        // Removed + disabled tools must NOT render.
+        expect(
+            screen.queryByTestId("node-panel-set-tools-hint-legacy.dead"),
+        ).toBeNull();
+        expect(
+            screen.queryByTestId("node-panel-set-tools-hint-manually.disabled"),
+        ).toBeNull();
     });
 });

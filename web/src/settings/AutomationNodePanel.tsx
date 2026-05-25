@@ -21,7 +21,39 @@ import type {
     TriggerDef,
 } from "../api/automations";
 import { listRegisteredEvents } from "../api/automations";
+import { listSkills, listTools } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
+
+/// Phase D (2026-05-22) — operator-pickable name lists for the
+/// SetSkills / SetTools mutator forms. Returns just the names so
+/// the form's chip strip stays simple; rich metadata stays out of
+/// the panel.
+///
+/// `fetchActiveSkillNames` filters out archived skills (the
+/// resolver rejects archived names with a 400 at turn time) and
+/// returns whatever survives, alphabetically sorted for stable
+/// rendering. Empty result is "no skills installed yet" — the
+/// form's hint footer shows a friendly placeholder.
+async function fetchActiveSkillNames(token: () => string | null): Promise<string[]> {
+    const resp = await listSkills(token, { includeArchived: false });
+    const names = resp.skills
+        .filter((s) => s.state !== "archived")
+        .map((s) => s.name);
+    names.sort();
+    return names;
+}
+
+/// `fetchEnabledToolNames` filters out disabled tools (calling a
+/// disabled tool fails at dispatch time) and tools removed from
+/// the registry. Alphabetical for stable rendering.
+async function fetchEnabledToolNames(token: () => string | null): Promise<string[]> {
+    const resp = await listTools(token);
+    const names = resp.tools
+        .filter((t) => t.enabled && t.removed_at === null)
+        .map((t) => t.tool_name);
+    names.sort();
+    return names;
+}
 
 interface Props {
     /** The node being edited. `null` closes the panel. */
@@ -232,6 +264,8 @@ function KindForm({
                 placeholder="calendar&#10;notes_taker"
                 help="Appended to the chat turn's applied skills. Each name must match an entry in state_skills (the skill prepend resolver fails the turn otherwise — gate with Filter to be safe)."
                 testId="node-panel-set-skills"
+                hintFetcher={fetchActiveSkillNames}
+                hintLabel="Installed skills (click to append)"
             />;
         case "SetTools":
             return <StringListForm
@@ -242,6 +276,8 @@ function KindForm({
                 placeholder="python.execute&#10;web.search"
                 help="Added to caller_caps for this turn. Additive only — use SetTrust to downgrade trust if you want a smaller tool surface."
                 testId="node-panel-set-tools"
+                hintFetcher={fetchEnabledToolNames}
+                hintLabel="Registered tools (click to append)"
             />;
         case "SetTrust":
             return <SetTrustForm node={node} onChange={onChange} />;
@@ -555,6 +591,15 @@ type Severity = (typeof SEVERITIES)[number];
 /// field with a different key name). Empty lines + whitespace-only
 /// lines are dropped on commit so a trailing newline doesn't break
 /// the validator.
+///
+/// Phase D (2026-05-22) extension: optional `hintFetcher` produces
+/// a `string[]` of operator-pickable names rendered as clickable
+/// chips below the textarea. Click a chip → append to the list
+/// (deduped against entries already present). Used by SetSkills +
+/// SetTools to surface the registered skill / tool catalog the
+/// validator will check at execute time. Loading + error states
+/// render explicitly so a slow / down admin endpoint doesn't
+/// silently strand the operator.
 function StringListForm({
     node,
     onChange,
@@ -563,6 +608,8 @@ function StringListForm({
     placeholder,
     help,
     testId,
+    hintFetcher,
+    hintLabel,
 }: {
     node: NodeDef;
     onChange: (updated: NodeDef) => void;
@@ -571,9 +618,49 @@ function StringListForm({
     placeholder: string;
     help: string;
     testId: string;
+    /** Optional. When set, renders a "Available:" hint chip strip
+     *  below the textarea. Called once on mount with the current
+     *  auth token. */
+    hintFetcher?: (token: () => string | null) => Promise<string[]>;
+    /** Plain-English label preceding the hint chips, e.g.
+     *  "Installed skills" / "Registered tools". Required when
+     *  `hintFetcher` is set. */
+    hintLabel?: string;
 }) {
     const cfg = (node.config ?? {}) as Record<string, unknown>;
     const items = (cfg[fieldKey] as string[] | undefined) ?? [];
+
+    // Hint chip state — only used when hintFetcher is set.
+    const auth = useAuth();
+    const [hints, setHints] = useState<string[] | null>(null);
+    const [hintErr, setHintErr] = useState<string | null>(null);
+    useEffect(() => {
+        if (!hintFetcher) return;
+        let cancelled = false;
+        hintFetcher(auth.getAccessToken)
+            .then((names) => {
+                if (!cancelled) setHints(names);
+            })
+            .catch((e: Error) => {
+                if (!cancelled) setHintErr(e.message);
+            });
+        return () => {
+            cancelled = true;
+        };
+        // Effect runs once on mount; auth + hintFetcher are stable
+        // for the lifetime of the panel. eslint-disable-next-line
+        // react-hooks/exhaustive-deps
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    const appendName = (name: string) => {
+        if (items.includes(name)) return;
+        onChange({
+            ...node,
+            config: { ...cfg, [fieldKey]: [...items, name] },
+        });
+    };
+
     return (
         <Form.Group className="mb-2">
             <Form.Label className="small text-muted mb-1">{label}</Form.Label>
@@ -597,6 +684,64 @@ function StringListForm({
                 data-testid={`${testId}-textarea`}
             />
             <div className="small text-muted mt-1">{help}</div>
+            {hintFetcher && (
+                <div
+                    className="mt-2"
+                    data-testid={`${testId}-hints`}
+                >
+                    <div className="small text-muted mb-1">
+                        <i className="bi bi-lightbulb me-1" aria-hidden />
+                        {hintLabel ?? "Available"}
+                    </div>
+                    {hints === null && !hintErr && (
+                        <div className="small text-muted">Loading…</div>
+                    )}
+                    {hintErr && (
+                        <div
+                            className="small text-warning"
+                            data-testid={`${testId}-hints-error`}
+                        >
+                            Couldn't load list ({hintErr}). You can still type
+                            names manually above.
+                        </div>
+                    )}
+                    {hints !== null && hints.length === 0 && !hintErr && (
+                        <div className="small text-muted">
+                            (none registered yet)
+                        </div>
+                    )}
+                    {hints !== null && hints.length > 0 && (
+                        <div className="d-flex flex-wrap gap-1">
+                            {hints.map((name) => {
+                                const already = items.includes(name);
+                                return (
+                                    <Button
+                                        key={name}
+                                        variant={
+                                            already
+                                                ? "outline-secondary"
+                                                : "outline-info"
+                                        }
+                                        size="sm"
+                                        className="font-monospace"
+                                        style={{ fontSize: 11 }}
+                                        onClick={() => appendName(name)}
+                                        disabled={already}
+                                        title={
+                                            already
+                                                ? "Already in list"
+                                                : "Click to append"
+                                        }
+                                        data-testid={`${testId}-hint-${name}`}
+                                    >
+                                        {name}
+                                    </Button>
+                                );
+                            })}
+                        </div>
+                    )}
+                </div>
+            )}
         </Form.Group>
     );
 }
