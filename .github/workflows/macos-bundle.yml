@@ -157,12 +157,12 @@ jobs:
       # + tag) so dev-ad-hoc downloads are also verifiable.
       - name: Attest DMG provenance
         if: steps.outputs.outputs.dmg != ''
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: ${{ steps.outputs.outputs.dmg }}
 
       - name: Attest plugin ZIP provenance
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           # Glob-supported — each ZIP gets its own attestation.
           subject-path: "dist/*.zip"
