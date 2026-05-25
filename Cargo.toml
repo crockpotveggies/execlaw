@@ -145,7 +145,7 @@ dialoguer = "0.11"
 # --- os integration ---
 bollard = "0.18"
 keyring = "3"
-directories = "5"
+directories = "6"
 
 # --- misc ---
 once_cell = "1"
