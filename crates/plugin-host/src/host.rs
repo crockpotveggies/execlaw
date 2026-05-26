@@ -1649,7 +1649,14 @@ fn import_m6_registry(
         EventRegistry, RegisteredEventKind, RegisteredReplyHandler,
     };
 
-    if manifest.bus_events.is_empty() && manifest.reply_handlers.is_empty() {
+    // Short-circuit only when there's NOTHING to import. Phase E
+    // (2026-05-22) added `[[default_automations]]` import to this
+    // function; a tool-only plugin (no bus_events, no reply_handlers)
+    // can still ship a default flow, so the guard must include it.
+    if manifest.bus_events.is_empty()
+        && manifest.reply_handlers.is_empty()
+        && manifest.default_automations.is_empty()
+    {
         return;
     }
 
@@ -1733,14 +1740,108 @@ fn import_m6_registry(
         }
     }
 
-    // 2026-05-22 — M6 rip-out: the `[[default_automations]]` importer
-    // is retired. Plugin manifests can still declare the section
-    // (parser-accepted as inert data) but installation no longer
-    // creates rows in state_automations. The middleware redesign
-    // will reintroduce a related but differently-shaped seed path.
-    let _ = &manifest.default_automations;
-    let _ = stage_path;
-    let _ = _plugin_version;
+    // 2026-05-22 — Phase E of the Flows middleware redesign. Each
+    // plugin can ship one or more default flows (chat.prompt-
+    // triggered, channel-narrowed via Filter Rhai). The importer
+    // reads each `[[default_automations]]` entry, loads the
+    // referenced JSON from the plugin's staged root, validates +
+    // upserts into `state_automations` with `source =
+    // "plugin:<id>"` so the delete endpoint refuses to remove
+    // them. Per-row idempotency: skip when a row with the
+    // same name already exists (preserves operator edits;
+    // operator_modified flag is the deeper guard).
+    if !manifest.default_automations.is_empty() {
+        use execlaw_core::automations::{AutomationDef, AutomationStore, AutomationUpsert};
+        let store = AutomationStore::new(db);
+        let existing_names: Vec<String> = store
+            .list_all()
+            .map(|rows| rows.into_iter().map(|r| r.name).collect())
+            .unwrap_or_default();
+        for d in &manifest.default_automations {
+            if existing_names.iter().any(|n| n == &d.name) {
+                tracing::debug!(
+                    plugin_id,
+                    name = %d.name,
+                    "Phase E: default flow already in state_automations (skipping; preserves operator edits)"
+                );
+                continue;
+            }
+            let flow_path = stage_path.join(&d.flow_path);
+            let raw = match std::fs::read_to_string(&flow_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        plugin_id,
+                        name = %d.name,
+                        path = %flow_path.display(),
+                        error = %e,
+                        "Phase E: default flow file missing (skipping)"
+                    );
+                    continue;
+                }
+            };
+            let def: AutomationDef = match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        plugin_id,
+                        name = %d.name,
+                        error = %e,
+                        "Phase E: default flow JSON is invalid (skipping)"
+                    );
+                    continue;
+                }
+            };
+            let now = chrono::Utc::now().timestamp_millis();
+            let upsert = AutomationUpsert {
+                id: None,
+                name: d.name.clone(),
+                enabled: d.enabled,
+                definition: def,
+            };
+            match store.upsert(&upsert, now) {
+                Ok(row) => {
+                    // Stamp provenance via direct SQL — AutomationUpsert
+                    // doesn't expose the source column to operator-
+                    // driven writes. The delete endpoint reads `source
+                    // != 'operator'` to refuse deletion + the SPA hides
+                    // the delete button on rows the plugin ships.
+                    let source = format!("plugin:{plugin_id}");
+                    let version = _plugin_version.to_owned();
+                    if let Err(e) = db.with_conn(|c| {
+                        c.execute(
+                            "UPDATE state_automations \
+                             SET source = ?1, source_version = ?2 \
+                             WHERE id = ?3",
+                            rusqlite::params![source, version, row.id],
+                        )?;
+                        Ok(())
+                    }) {
+                        warn!(
+                            plugin_id,
+                            name = %d.name,
+                            error = %e,
+                            "Phase E: failed to stamp source on default flow (row still installed)"
+                        );
+                    }
+                    tracing::info!(
+                        plugin_id,
+                        name = %d.name,
+                        enabled = d.enabled,
+                        "Phase E: imported default flow"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        plugin_id,
+                        name = %d.name,
+                        error = %e,
+                        "Phase E: default flow upsert failed (install continued)"
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn resolve_executable(stage: &Path, declared: &str) -> String {
@@ -2309,6 +2410,284 @@ source = "main.rhai"
             })
             .unwrap();
         assert_eq!(archived, 2);
+    }
+
+    // ===== Phase E (Flows middleware) — default-flow importer =====
+    //
+    // The importer (host.rs ~L1746) is the bridge between a plugin's
+    // `[[default_automations]]` manifest entries and the
+    // `state_automations` table. These tests pin the contract:
+    //
+    //   1. A staged plugin shipping ONE default flow lands ONE row
+    //      in state_automations with source = "plugin:<id>".
+    //   2. Re-installing the same plugin name is idempotent — the
+    //      importer skips when a row with the same name already
+    //      exists, preserving operator edits.
+    //   3. A staged plugin shipping a flow whose JSON file is
+    //      missing logs a warning and continues install (the rest
+    //      of the plugin still installs cleanly).
+
+    /// Build a stage dir for a plugin that ships exactly one
+    /// `[[default_automations]]` entry pointing at
+    /// `flows/<flow_filename>`. Returns the TempDir guard and the
+    /// stage path.
+    fn stage_plugin_with_default_flow(
+        plugin_id: &str,
+        flow_name: &str,
+        flow_filename: &str,
+        flow_json: &str,
+    ) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join(format!("{plugin_id}-0.1.0"));
+        std::fs::create_dir_all(stage.join("flows")).unwrap();
+        let manifest = format!(
+            r#"
+[plugin]
+id = "{plugin_id}"
+name = "Flow Test"
+version = "0.1.0"
+description = "test"
+author = "a"
+license = "x"
+
+[[default_automations]]
+name = "{flow_name}"
+flow_path = "flows/{flow_filename}"
+enabled = true
+description = "test default flow"
+
+[runtime]
+tier = "script"
+source = "main.rhai"
+"#
+        );
+        std::fs::write(stage.join("plugin.toml"), manifest).unwrap();
+        std::fs::write(
+            stage.join("main.rhai"),
+            "fn tool_call(name, args, oauth) { #{} }\n",
+        )
+        .unwrap();
+        std::fs::write(stage.join(format!("flows/{flow_filename}")), flow_json).unwrap();
+        (dir, stage)
+    }
+
+    /// Minimal valid AddMemory flow JSON the validator accepts —
+    /// trigger.kind = chat.prompt, one AddMemory node, edge to END.
+    fn minimal_addmemory_flow_json(channel: &str, hint: &str) -> String {
+        format!(
+            r#"{{
+              "trigger": {{
+                "kind": "chat.prompt",
+                "when": "event.payload.channel == \"{channel}\""
+              }},
+              "nodes": [
+                {{
+                  "id": "ctx",
+                  "kind": "AddMemory",
+                  "config": {{"text": "{hint}"}}
+                }}
+              ],
+              "edges": [
+                {{"from": "trigger", "to": "ctx", "when": null}},
+                {{"from": "ctx", "to": "END", "when": null}}
+              ]
+            }}"#
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn install_imports_default_flow_with_plugin_source_stamp() {
+        let db = fresh_db();
+        let registry = HookRegistry::new();
+        let stage_root = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(db.clone(), registry, stage_root.path().to_path_buf());
+
+        let flow_json = minimal_addmemory_flow_json("signal", "test memory hint");
+        let (_keep, stage) = stage_plugin_with_default_flow(
+            "signal",
+            "Signal channel guidance",
+            "default.json",
+            &flow_json,
+        );
+        host.install(&stage).await.unwrap();
+
+        // One row landed under the operator-facing name, with the
+        // provenance stamp the delete endpoint reads.
+        let rows: Vec<(String, String, Option<String>, i64)> = db
+            .with_conn(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT name, source, source_version, enabled \
+                     FROM state_automations \
+                     WHERE source = ?1",
+                )?;
+                let out = stmt
+                    .query_map(params!["plugin:signal"], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, i64>(3)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(out)
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1, "exactly one default flow row landed");
+        let (name, source, source_version, enabled) = &rows[0];
+        assert_eq!(name, "Signal channel guidance");
+        assert_eq!(source, "plugin:signal");
+        assert_eq!(source_version.as_deref(), Some("0.1.0"));
+        assert_eq!(*enabled, 1, "manifest declared enabled = true");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reinstall_skips_existing_default_flow_to_preserve_operator_edits() {
+        let db = fresh_db();
+        let registry = HookRegistry::new();
+        let stage_root = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(db.clone(), registry, stage_root.path().to_path_buf());
+
+        // First install lands the row.
+        let flow_v1 = minimal_addmemory_flow_json("signal", "v1 hint");
+        let (_keep1, stage1) = stage_plugin_with_default_flow(
+            "signal",
+            "Signal channel guidance",
+            "default.json",
+            &flow_v1,
+        );
+        host.install(&stage1).await.unwrap();
+
+        // Simulate an operator editing the row + the row carrying an
+        // operator_modified marker (the SPA sets this on save).
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE state_automations SET operator_modified = 1 \
+                 WHERE name = 'Signal channel guidance'",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        // Re-install (plugin upgrade) with a DIFFERENT flow body.
+        // The importer is name-keyed: same name → skip, don't clobber
+        // the operator's edit. We bump the version on the stage so
+        // `upgrade()` accepts it (it requires a newer semver).
+        let flow_v2 = minimal_addmemory_flow_json("signal", "v2 hint REPLACED");
+        let dir2 = tempfile::tempdir().unwrap();
+        let stage2 = dir2.path().join("signal-0.2.0");
+        std::fs::create_dir_all(stage2.join("flows")).unwrap();
+        let manifest_v2 = r#"
+[plugin]
+id = "signal"
+name = "Flow Test"
+version = "0.2.0"
+description = "test"
+author = "a"
+license = "x"
+
+[[default_automations]]
+name = "Signal channel guidance"
+flow_path = "flows/default.json"
+enabled = true
+description = "test default flow"
+
+[runtime]
+tier = "script"
+source = "main.rhai"
+"#;
+        std::fs::write(stage2.join("plugin.toml"), manifest_v2).unwrap();
+        std::fs::write(
+            stage2.join("main.rhai"),
+            "fn tool_call(name, args, oauth) { #{} }\n",
+        )
+        .unwrap();
+        std::fs::write(stage2.join("flows/default.json"), &flow_v2).unwrap();
+        host.upgrade(&stage2).await.unwrap();
+
+        // Still exactly one row + operator_modified preserved + body
+        // unchanged (v1, not v2).
+        let (count, op_mod, definition): (i64, i64, String) = db
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*), MAX(operator_modified), MAX(definition) \
+                     FROM state_automations WHERE source = 'plugin:signal'",
+                    [],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    },
+                )?)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(op_mod, 1);
+        assert!(
+            definition.contains("v1 hint"),
+            "operator-edited body must survive re-install (got: {definition})"
+        );
+        assert!(
+            !definition.contains("REPLACED"),
+            "v2 must NOT clobber the operator's v1 edit"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn install_continues_when_default_flow_file_is_missing() {
+        let db = fresh_db();
+        let registry = HookRegistry::new();
+        let stage_root = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(db.clone(), registry, stage_root.path().to_path_buf());
+
+        // Stage a plugin that declares a default_automation but
+        // doesn't ship the flow file. The importer must WARN-log and
+        // continue — install still succeeds, just with zero flow rows.
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("ghost-0.1.0");
+        std::fs::create_dir_all(stage.join("flows")).unwrap();
+        let manifest = r#"
+[plugin]
+id = "ghost"
+name = "Ghost"
+version = "0.1.0"
+description = "test"
+author = "a"
+license = "x"
+
+[[default_automations]]
+name = "Phantom flow"
+flow_path = "flows/does-not-exist.json"
+enabled = true
+description = "References a file we never shipped."
+
+[runtime]
+tier = "script"
+source = "main.rhai"
+"#;
+        std::fs::write(stage.join("plugin.toml"), manifest).unwrap();
+        std::fs::write(
+            stage.join("main.rhai"),
+            "fn tool_call(name, args, oauth) { #{} }\n",
+        )
+        .unwrap();
+        // Note: NO flows/does-not-exist.json — that's the point.
+
+        host.install(&stage).await.expect("install must not fail on missing flow file");
+
+        let count: i64 = db
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM state_automations WHERE source = 'plugin:ghost'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "no flow row when the JSON file is missing");
     }
 
     /// Phase D.2 — `handle_plugin_notification` is the host's

@@ -1,7 +1,7 @@
 [plugin]
 id = "google-apps"
 name = "Google Apps"
-version = "0.3.0"
+version = "0.3.1"
 description = "Consolidated Google plugin — Gmail, Calendar, Contacts, Tasks, and Drive in one OAuth grant. Replaces the separate google-calendar + google-contacts plugins. Individual modules can be toggled on/off without re-running the consent flow."
 author = "execlaw"
 license = "Apache-2.0"
@@ -361,4 +361,25 @@ max_attachment_size_bytes = 26214400
 max_attachments_per_message = 25
 max_text_length = 102400
 allowed_mime_prefixes = ["image/", "application/pdf", "text/", "application/"]
+
+# ===== Phase E (Flows middleware) — default flow ====================
+#
+# Ships one chat.prompt flow (any channel) gated by a keyword
+# match on the user's prompt — fires only when the message
+# mentions Gmail / Calendar / Drive / Docs / Sheets / Tasks
+# vocabulary. When it fires, an AddMemory node injects a hint
+# telling the agent to PREFER the `gmail.*` / `calendar.*` /
+# `drive.*` / `docs.*` / `sheets.*` tools over manual workflows
+# or refusals. Gating is on the trigger→ctx edge — when no
+# keyword matches, the flow returns Skipped and adds zero latency
+# to the chat turn. The importer in plugin-host stamps
+# `source = "plugin:google-apps"` so the operator can disable
+# it via the Enabled toggle but cannot delete it. Operator edits
+# are preserved on re-install because the importer is name-keyed.
+[[default_automations]]
+name = "Google Workspace tool hint"
+flow_path = "flows/default.json"
+enabled = true
+description = "Pre-turn middleware: when the user mentions Gmail / Calendar / Drive / Docs / Sheets vocabulary, inject a hint telling the agent to call the installed gmail.* / calendar.* / drive.* / docs.* / sheets.* tools rather than refuse or improvise."
+
 

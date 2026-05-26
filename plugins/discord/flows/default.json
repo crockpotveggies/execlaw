@@ -1,0 +1,19 @@
+{
+  "trigger": {
+    "kind": "chat.prompt",
+    "when": "event.payload.channel == \"discord\""
+  },
+  "nodes": [
+    {
+      "id": "ctx",
+      "kind": "AddMemory",
+      "config": {
+        "text": "Channel: Discord. Reply guidance: casual but clear. Discord renders full Markdown — code blocks with language tags (```rust ... ```) for code, inline `code` for symbols, **bold** for emphasis, and short bullet lists are fine. Keep replies under ~2000 characters per message (Discord's per-message cap); for longer answers, attach a file rather than chaining messages. Match the channel's tone — terse and meme-aware in social channels, more thorough in technical ones."
+      }
+    }
+  ],
+  "edges": [
+    {"from": "trigger", "to": "ctx", "when": null},
+    {"from": "ctx", "to": "END", "when": null}
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "trigger": {
+    "kind": "chat.prompt",
+    "when": "event.payload.channel == \"slack\""
+  },
+  "nodes": [
+    {
+      "id": "ctx",
+      "kind": "AddMemory",
+      "config": {
+        "text": "Channel: Slack (team workspace). Reply guidance: professional and concise — Slack is a workplace tool, not a casual chat. Slack uses mrkdwn (a near-Markdown variant): *bold*, _italic_, ~strike~, `code`, ```block code```, and `> quote` work; standard Markdown headings (#) and bullet syntax (-) do NOT — use plain numbered lines or hyphens at the start of a line for lists. Keep replies focused: lead with the answer, then supporting detail. Threaded replies stay short; channel-wide messages can be more thorough. Avoid emoji unless the surrounding conversation uses them."
+      }
+    }
+  ],
+  "edges": [
+    {"from": "trigger", "to": "ctx", "when": null},
+    {"from": "ctx", "to": "END", "when": null}
+  ]
+}

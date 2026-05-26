@@ -1,0 +1,23 @@
+{
+  "trigger": {
+    "kind": "chat.prompt",
+    "when": null
+  },
+  "nodes": [
+    {
+      "id": "ctx",
+      "kind": "AddMemory",
+      "config": {
+        "text": "Open-Meteo weather tools are installed (no API key required, free for non-commercial use). When the user asks about weather, forecast, rain, temperature, wind, snow, humidity, air quality, marine/wave conditions, flood risk, or historical climate at any location, call the relevant `open_meteo.*` tool — geocode first to resolve a place name to coordinates, then forecast / historical / marine / air_quality as appropriate. Don't guess weather values; the tool is fast and accurate."
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "trigger",
+      "to": "ctx",
+      "when": "let t = event.payload.text.to_lower(); t.contains(\"weather\") || t.contains(\"forecast\") || t.contains(\"temperature\") || t.contains(\"rain\") || t.contains(\"snow\") || t.contains(\"wind\") || t.contains(\"humidity\") || t.contains(\"climate\") || t.contains(\"sunny\") || t.contains(\"cloudy\") || t.contains(\"storm\") || t.contains(\"hot\") || t.contains(\"cold\") || t.contains(\"degrees\") || t.contains(\"celsius\") || t.contains(\"fahrenheit\") || t.contains(\"air quality\") || t.contains(\"uv index\")"
+    },
+    {"from": "ctx", "to": "END", "when": null}
+  ]
+}

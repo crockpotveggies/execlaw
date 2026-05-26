@@ -1,0 +1,23 @@
+{
+  "trigger": {
+    "kind": "chat.prompt",
+    "when": null
+  },
+  "nodes": [
+    {
+      "id": "ctx",
+      "kind": "AddMemory",
+      "config": {
+        "text": "Google Workspace tools are installed. When the user's request involves their Gmail (read/search/send/draft/reply/labels), Calendar (list events/create/RSVP/free-busy), Drive (list/search/read/upload files), Docs (create/read/edit), Sheets (read ranges/append rows), or Tasks/Contacts, call the matching `gmail.*` / `calendar.*` / `drive.*` / `docs.*` / `sheets.*` tool rather than asking the user to do it manually or refusing for lack of access. The user has already connected their Google account via OAuth — no need to ask for credentials."
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "trigger",
+      "to": "ctx",
+      "when": "let t = event.payload.text.to_lower(); t.contains(\"gmail\") || t.contains(\"email\") || t.contains(\"calendar\") || t.contains(\"meeting\") || t.contains(\"schedule\") || t.contains(\"drive\") || t.contains(\"docs\") || t.contains(\"document\") || t.contains(\"sheet\") || t.contains(\"spreadsheet\") || t.contains(\"inbox\") || t.contains(\"event\") || t.contains(\"invite\")"
+    },
+    {"from": "ctx", "to": "END", "when": null}
+  ]
+}

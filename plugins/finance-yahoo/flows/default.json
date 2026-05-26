@@ -1,0 +1,23 @@
+{
+  "trigger": {
+    "kind": "chat.prompt",
+    "when": null
+  },
+  "nodes": [
+    {
+      "id": "ctx",
+      "kind": "AddMemory",
+      "config": {
+        "text": "Yahoo Finance tools are installed. When the user asks about a stock price, ticker, index (S&P 500, NASDAQ, Dow), cryptocurrency, FX rate, market news, earnings, dividends, or historical price candles, call `yahoo_finance.quote` / `index_quote` / `crypto_quote` / `fx_quote` / `historical_candles` / `market_news` / `quote_summary` instead of guessing or quoting stale numbers from your training data. Quotes are delayed 15 minutes (standard Yahoo policy) — always show the data's timestamp so the user knows."
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "trigger",
+      "to": "ctx",
+      "when": "let t = event.payload.text.to_lower(); t.contains(\"stock\") || t.contains(\"ticker\") || t.contains(\"price\") || t.contains(\"market\") || t.contains(\"shares\") || t.contains(\"earnings\") || t.contains(\"dividend\") || t.contains(\"nasdaq\") || t.contains(\"nyse\") || t.contains(\"s&p\") || t.contains(\"dow\") || t.contains(\"crypto\") || t.contains(\"bitcoin\") || t.contains(\"ethereum\") || t.contains(\"forex\") || t.contains(\"exchange rate\") || t.contains(\"portfolio\") || t.contains(\"$\")"
+    },
+    {"from": "ctx", "to": "END", "when": null}
+  ]
+}

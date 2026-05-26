@@ -1,7 +1,7 @@
 [plugin]
 id = "discord"
 name = "Discord"
-version = "0.2.0"
+version = "0.2.1"
 description = "Discord transport via the official Bot Gateway WebSocket. Sidecar-free — the plugin maintains the long-lived gateway connection itself, sends application-layer heartbeats via ws_set_keepalive, and posts outbound via the REST API. Single bot token spans every guild the bot is invited to; multi-guild is automatic from GUILD_CREATE dispatches. v0.1 does NOT implement slash commands / interactions (deferred to v0.2 via [[webhook_routes]] + Ed25519 verification)."
 author = "execlaw"
 license = "Apache-2.0"
@@ -125,3 +125,18 @@ fingerprint_prefix = "plugin.discord"
 [runtime]
 tier = "script"
 source = "main.rhai"
+
+# ===== Phase E (Flows middleware) — default flow ====================
+#
+# Ships one chat.prompt flow narrowed to `event.payload.channel ==
+# "discord"`. Injects channel-aware reply guidance (full Markdown
+# OK, code blocks with language tags, 2000-char per-message cap).
+# The importer in plugin-host stamps `source = "plugin:discord"`
+# so the operator can disable it via the Enabled toggle but cannot
+# delete it. Operator edits are preserved on re-install because
+# the importer is name-keyed.
+[[default_automations]]
+name = "Discord channel guidance"
+flow_path = "flows/default.json"
+enabled = true
+description = "Pre-turn middleware: when a chat.prompt arrives via the Discord channel, inject reply guidance (full Markdown OK, code blocks with language tags, ~2000-char per-message cap)."

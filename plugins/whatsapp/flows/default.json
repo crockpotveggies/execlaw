@@ -1,0 +1,19 @@
+{
+  "trigger": {
+    "kind": "chat.prompt",
+    "when": "event.payload.channel == \"whatsapp\""
+  },
+  "nodes": [
+    {
+      "id": "ctx",
+      "kind": "AddMemory",
+      "config": {
+        "text": "Channel: WhatsApp (mobile chat). Reply guidance: keep messages short — one or two sentences for casual exchanges, one short paragraph max for substantive answers. WhatsApp renders a tiny subset of formatting (*bold*, _italic_, ~strike~, ```mono```) but no bullet lists, no headings, and no tables — prefer flowing prose. If you must enumerate, write a short inline list (\"X, Y, and Z\"). Long-form research belongs in an attached PDF, not in the message body."
+      }
+    }
+  ],
+  "edges": [
+    {"from": "trigger", "to": "ctx", "when": null},
+    {"from": "ctx", "to": "END", "when": null}
+  ]
+}

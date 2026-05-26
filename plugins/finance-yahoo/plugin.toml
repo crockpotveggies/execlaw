@@ -1,7 +1,7 @@
 [plugin]
 id = "finance-yahoo"
 name = "Yahoo Finance"
-version = "0.2.1"
+version = "0.2.2"
 # 0.2.1 (2026-05-16) — descriptions + tool-result _hint trimmed
 # hard. v0.2.0's verbose two-shape contract bloated the per-turn
 # tool catalog enough to push Qwen3.6-AWQ (with 100 tools loaded)
@@ -144,3 +144,24 @@ entry = "ui/panel.js"
 [runtime]
 tier = "script"
 source = "main.rhai"
+
+# ===== Phase E (Flows middleware) — default flow ====================
+#
+# Ships one chat.prompt flow (any channel) gated by a keyword
+# match on the user's prompt — fires only when the message
+# mentions stocks / tickers / markets / crypto / FX vocabulary.
+# When it fires, an AddMemory node injects a hint telling the
+# agent to call `yahoo_finance.quote` / `historical_candles` /
+# `market_news` rather than quote stale training-data numbers.
+# Gating is on the trigger→ctx edge — when no keyword matches,
+# the flow returns Skipped and adds zero latency to the chat
+# turn. The importer in plugin-host stamps
+# `source = "plugin:finance-yahoo"` so the operator can disable
+# it via the Enabled toggle but cannot delete it. Operator edits
+# are preserved on re-install because the importer is name-keyed.
+[[default_automations]]
+name = "Yahoo Finance tool hint"
+flow_path = "flows/default.json"
+enabled = true
+description = "Pre-turn middleware: when the user asks about a stock / ticker / index / crypto / FX rate / market news, inject a hint telling the agent to call the installed yahoo_finance.* tools rather than quote stale training data."
+

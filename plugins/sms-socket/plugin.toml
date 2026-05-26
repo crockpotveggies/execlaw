@@ -1,7 +1,7 @@
 [plugin]
 id = "sms-socket"
 name = "SMS Socket"
-version = "0.2.0"
+version = "0.2.1"
 description = "SMS / MMS via the Android SMS Socket app's local WebSocket gateway. Sidecar-free — opens a WebSocket directly to the gateway URL on the operator's LAN with `Authorization: Bearer <api_key>`. Mirrors the Signal/WhatsApp tool surface (send_message, reply, list_groups n/a, send_with_attachments, fetch_attachment, set_typing). The gateway lives on the operator's Android phone running https://github.com/crockpotveggies/sms-socket-app."
 author = "execlaw"
 license = "Apache-2.0"
@@ -106,3 +106,19 @@ entry = "ui/panel.js"
 [runtime]
 tier = "script"
 source = "main.rhai"
+
+# ===== Phase E (Flows middleware) — default flow ====================
+#
+# Ships one chat.prompt flow narrowed to `event.payload.channel ==
+# "sms"` (the channel string the SMS-Socket gateway publishes, not
+# the plugin id "sms-socket" — they differ here). Injects channel-
+# aware reply guidance (extreme brevity, plain ASCII, single-SMS
+# fit). The importer in plugin-host stamps `source =
+# "plugin:sms-socket"` so the operator can disable it via the
+# Enabled toggle but cannot delete it. Operator edits are
+# preserved on re-install because the importer is name-keyed.
+[[default_automations]]
+name = "SMS channel guidance"
+flow_path = "flows/default.json"
+enabled = true
+description = "Pre-turn middleware: when a chat.prompt arrives via SMS, inject reply guidance (extreme brevity, plain ASCII, single-segment fit)."
