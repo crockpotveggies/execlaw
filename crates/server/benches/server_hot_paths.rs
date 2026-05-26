@@ -879,6 +879,201 @@ fn bench_flow_middleware(c: &mut Criterion) {
         });
     });
 
+    // Phase E perf gate (2026-05-25): the user reported "a small but
+    // noticeable delay" on a plain "hi" prompt after the 9 plugin
+    // [[default_automations]] flows shipped on top of the 1 existing
+    // default web flow. This bench mirrors that reality:
+    //
+    //   * 10 enabled flows on `chat.prompt`.
+    //   * Mix of channel-narrowed (trigger.when checks
+    //     event.payload.channel) and keyword-gated (trigger.when=null
+    //     but edge.when does string.contains on event.payload.text).
+    //   * Event: channel="web", text="hi" — so MOST flows should
+    //     evaluate trigger.when or edge.when to false and skip cheap.
+    //
+    // The hypothesis under test: `automation_runtime::make_engine()`
+    // is called inside every `eval_bool` / `eval_value`, so 10 flows
+    // pay 10+ `Engine::new()` allocations per turn. If true, this
+    // bench should regress dramatically vs the zero-flows baseline.
+    let state_ten = test_app_state();
+    let ten_flows: Vec<(String, serde_json::Value)> = vec![
+        // 5 channel-narrowed flows (trigger.when filters by channel).
+        // Each targets a non-web channel, so trigger_matches() returns
+        // false on a web prompt — one Rhai eval each, no node executes.
+        (
+            "signal-only".into(),
+            serde_json::json!({
+                "trigger": {
+                    "kind": "chat.prompt",
+                    "when": "event.payload.channel == \"signal\""
+                },
+                "nodes": [{"id": "rw", "kind": "RewritePrompt",
+                    "config": {"expr": "\"[sig] \" + event.payload.text"}}],
+                "edges": [
+                    {"from": "trigger", "to": "rw", "when": null},
+                    {"from": "rw", "to": "END", "when": null}
+                ]
+            }),
+        ),
+        (
+            "whatsapp-only".into(),
+            serde_json::json!({
+                "trigger": {
+                    "kind": "chat.prompt",
+                    "when": "event.payload.channel == \"whatsapp\""
+                },
+                "nodes": [{"id": "rw", "kind": "RewritePrompt",
+                    "config": {"expr": "\"[wa] \" + event.payload.text"}}],
+                "edges": [
+                    {"from": "trigger", "to": "rw", "when": null},
+                    {"from": "rw", "to": "END", "when": null}
+                ]
+            }),
+        ),
+        (
+            "calendar-only".into(),
+            serde_json::json!({
+                "trigger": {
+                    "kind": "chat.prompt",
+                    "when": "event.payload.channel == \"calendar\""
+                },
+                "nodes": [{"id": "rw", "kind": "RewritePrompt",
+                    "config": {"expr": "\"[cal] \" + event.payload.text"}}],
+                "edges": [
+                    {"from": "trigger", "to": "rw", "when": null},
+                    {"from": "rw", "to": "END", "when": null}
+                ]
+            }),
+        ),
+        (
+            "voice-only".into(),
+            serde_json::json!({
+                "trigger": {
+                    "kind": "chat.prompt",
+                    "when": "event.payload.channel == \"voice\""
+                },
+                "nodes": [{"id": "rw", "kind": "RewritePrompt",
+                    "config": {"expr": "\"[v] \" + event.payload.text"}}],
+                "edges": [
+                    {"from": "trigger", "to": "rw", "when": null},
+                    {"from": "rw", "to": "END", "when": null}
+                ]
+            }),
+        ),
+        (
+            "matrix-only".into(),
+            serde_json::json!({
+                "trigger": {
+                    "kind": "chat.prompt",
+                    "when": "event.payload.channel == \"matrix\""
+                },
+                "nodes": [{"id": "rw", "kind": "RewritePrompt",
+                    "config": {"expr": "\"[mx] \" + event.payload.text"}}],
+                "edges": [
+                    {"from": "trigger", "to": "rw", "when": null},
+                    {"from": "rw", "to": "END", "when": null}
+                ]
+            }),
+        ),
+        // 4 keyword-gated flows (trigger.when=null so the matcher
+        // ALWAYS picks them up; the edge.when on the trigger→node
+        // edge does the string.contains gate which is false on "hi").
+        // These force the executor to actually walk the graph one
+        // hop, paying an `eval_bool` for the edge.when check.
+        (
+            "remind-keyword".into(),
+            serde_json::json!({
+                "trigger": {"kind": "chat.prompt", "when": null},
+                "nodes": [{"id": "rw", "kind": "RewritePrompt",
+                    "config": {"expr": "\"[remind] \" + event.payload.text"}}],
+                "edges": [
+                    {"from": "trigger", "to": "rw",
+                     "when": "event.payload.text.contains(\"remind\")"},
+                    {"from": "rw", "to": "END", "when": null}
+                ]
+            }),
+        ),
+        (
+            "calendar-keyword".into(),
+            serde_json::json!({
+                "trigger": {"kind": "chat.prompt", "when": null},
+                "nodes": [{"id": "rw", "kind": "RewritePrompt",
+                    "config": {"expr": "\"[cal] \" + event.payload.text"}}],
+                "edges": [
+                    {"from": "trigger", "to": "rw",
+                     "when": "event.payload.text.contains(\"calendar\")"},
+                    {"from": "rw", "to": "END", "when": null}
+                ]
+            }),
+        ),
+        (
+            "weather-keyword".into(),
+            serde_json::json!({
+                "trigger": {"kind": "chat.prompt", "when": null},
+                "nodes": [{"id": "rw", "kind": "RewritePrompt",
+                    "config": {"expr": "\"[wx] \" + event.payload.text"}}],
+                "edges": [
+                    {"from": "trigger", "to": "rw",
+                     "when": "event.payload.text.contains(\"weather\")"},
+                    {"from": "rw", "to": "END", "when": null}
+                ]
+            }),
+        ),
+        (
+            "search-keyword".into(),
+            serde_json::json!({
+                "trigger": {"kind": "chat.prompt", "when": null},
+                "nodes": [{"id": "rw", "kind": "RewritePrompt",
+                    "config": {"expr": "\"[search] \" + event.payload.text"}}],
+                "edges": [
+                    {"from": "trigger", "to": "rw",
+                     "when": "event.payload.text.contains(\"search\")"},
+                    {"from": "rw", "to": "END", "when": null}
+                ]
+            }),
+        ),
+        // 1 always-fires flow (the existing default web flow). This
+        // one actually executes the RewritePrompt node (eval_value
+        // for the expr).
+        (
+            "web-default".into(),
+            serde_json::json!({
+                "trigger": {"kind": "chat.prompt", "when": null},
+                "nodes": [{"id": "rw", "kind": "RewritePrompt",
+                    "config": {"expr": "event.payload.text"}}],
+                "edges": [
+                    {"from": "trigger", "to": "rw", "when": null},
+                    {"from": "rw", "to": "END", "when": null}
+                ]
+            }),
+        ),
+    ];
+    for (name, def_json) in &ten_flows {
+        let def: execlaw_core::automations::AutomationDef =
+            serde_json::from_value(def_json.clone()).unwrap();
+        AutomationStore::new(&state_ten.db)
+            .upsert(
+                &AutomationUpsert {
+                    id: None,
+                    name: name.clone(),
+                    enabled: true,
+                    definition: def,
+                },
+                1000,
+            )
+            .unwrap();
+    }
+
+    c.bench_function(
+        "flow_middleware/evaluate_ten_default_flows_on_web_hi",
+        |b| {
+            b.iter(|| {
+                let outcome = evaluate(black_box(&state_ten), black_box(&evt));
+                black_box(outcome);
+            });
+        },
+    );
+
     // Silence unused-import warnings on the helper imports above when
     // run with `--no-run`.
     let _ = (Database::open, DbConfig::in_memory_unencrypted, MigrationRunner::new);

@@ -954,15 +954,37 @@ const RHAI_MAX_STRING_LEN: usize = 65_536;
 const RHAI_MAX_ARRAY_LEN: usize = 10_000;
 const RHAI_MAX_MAP_LEN: usize = 10_000;
 
-fn make_engine() -> Engine {
-    let mut engine = Engine::new();
-    engine.set_max_operations(RHAI_MAX_OPS);
-    engine.set_max_call_levels(RHAI_MAX_CALL_DEPTH);
-    engine.set_max_expr_depths(RHAI_MAX_EXPR_DEPTH, RHAI_MAX_EXPR_DEPTH);
-    engine.set_max_string_size(RHAI_MAX_STRING_LEN);
-    engine.set_max_array_size(RHAI_MAX_ARRAY_LEN);
-    engine.set_max_map_size(RHAI_MAX_MAP_LEN);
-    engine
+// 2026-05-25 — Phase E shipped 9 default plugin flows on top of the
+// existing 1 web default; every chat turn now fires the matcher
+// against ~10 enabled chat.prompt flows. Profiling caught a
+// >300x regression vs. the zero-flow baseline (3.8µs → 1.15ms per
+// `flow_middleware::evaluate` call on a "hi" prompt). The dominant
+// cost was `Engine::new()` running ~14 times per turn — once per
+// `eval_bool` / `eval_value`. The engine's configuration is
+// stateless across evals (every call configured it identically),
+// so a single shared engine is correct: Rhai 1.21 with the `sync`
+// feature ships an `Engine: Send + Sync` and `eval_expression_*`
+// takes `&self`, so the global engine is safe to share across
+// every chat-turn worker thread.
+//
+// Cache the configured engine in a `OnceLock` so the parser tables,
+// function registry, and type registry are built exactly once for
+// the lifetime of the process. The sandbox-cap values are
+// compile-time constants so the init closure has no runtime
+// dependencies.
+static SHARED_ENGINE: std::sync::OnceLock<Engine> = std::sync::OnceLock::new();
+
+fn shared_engine() -> &'static Engine {
+    SHARED_ENGINE.get_or_init(|| {
+        let mut engine = Engine::new();
+        engine.set_max_operations(RHAI_MAX_OPS);
+        engine.set_max_call_levels(RHAI_MAX_CALL_DEPTH);
+        engine.set_max_expr_depths(RHAI_MAX_EXPR_DEPTH, RHAI_MAX_EXPR_DEPTH);
+        engine.set_max_string_size(RHAI_MAX_STRING_LEN);
+        engine.set_max_array_size(RHAI_MAX_ARRAY_LEN);
+        engine.set_max_map_size(RHAI_MAX_MAP_LEN);
+        engine
+    })
 }
 
 fn build_scope_with_event(event_ctx: &serde_json::Value) -> Scope<'static> {
@@ -1051,8 +1073,7 @@ fn dynamic_to_json(d: Dynamic) -> serde_json::Value {
 }
 
 fn eval_bool(expr: &str, scope: &mut Scope<'static>) -> Result<bool, String> {
-    let engine = make_engine();
-    engine
+    shared_engine()
         .eval_expression_with_scope::<Dynamic>(scope, expr)
         .map_err(|e| e.to_string())
         .and_then(|d| {
@@ -1062,8 +1083,7 @@ fn eval_bool(expr: &str, scope: &mut Scope<'static>) -> Result<bool, String> {
 }
 
 fn eval_value(expr: &str, scope: &mut Scope<'static>) -> Result<serde_json::Value, String> {
-    let engine = make_engine();
-    let dyn_val = engine
+    let dyn_val = shared_engine()
         .eval_expression_with_scope::<Dynamic>(scope, expr)
         .map_err(|e| e.to_string())?;
     Ok(dynamic_to_json(dyn_val))
