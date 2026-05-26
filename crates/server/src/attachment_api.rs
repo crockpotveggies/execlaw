@@ -55,6 +55,26 @@ pub struct ServerAttachmentApi {
     /// `~/.execlaw/plugin_artifacts/`. The `send` method works
     /// regardless of this field.
     artifacts_root: Option<PathBuf>,
+    /// 2026-05-25 — filesystem root where
+    /// `create_conversation_attachment` writes its content-addressed
+    /// blob files. Mirrors `artifacts_root` but points at the blobs
+    /// dir used by the web composer's upload path
+    /// (`<data_dir>/blobs/`). `None` disables the method (returns
+    /// ApiError::Storage). Must be the SAME directory the SPA's
+    /// composer writes to, otherwise the python sandbox hydrator's
+    /// resolved `path` field would point at a missing file.
+    ///
+    /// Cache-invalidation note: we deliberately don't fire a
+    /// callback to invalidate the python sandbox's hydration cache
+    /// here — the hydrator's MAX(received_at) check (in
+    /// `python_sandbox::service::hydrate_if_needed`) self-heals on
+    /// any new attachment, regardless of which path wrote it (web
+    /// composer, Signal inbound, web_fetch as_attachment, …).
+    /// One cheap COUNT-style query per `python.execute` call is
+    /// the price for not having to maintain cross-module invalidation
+    /// plumbing that any future attachment-writing code would need
+    /// to remember to call.
+    blobs_root: Option<PathBuf>,
 }
 
 impl ServerAttachmentApi {
@@ -66,6 +86,7 @@ impl ServerAttachmentApi {
             transports: None,
             plugin_host: None,
             artifacts_root: None,
+            blobs_root: None,
         }
     }
 
@@ -93,6 +114,16 @@ impl ServerAttachmentApi {
     /// a script-tier `host_render_chart` would.
     pub fn with_artifacts_root(mut self, root: PathBuf) -> Self {
         self.artifacts_root = Some(root);
+        self
+    }
+
+    /// Enable `create_conversation_attachment` by pinning the
+    /// content-addressed blob directory the web composer writes to
+    /// (`<data_dir>/blobs/`). Same directory the SPA composer's
+    /// inline-upload path uses, so the python sandbox hydrator finds
+    /// the bytes at the resolved `state_attachments.path`.
+    pub fn with_blobs_root(mut self, root: PathBuf) -> Self {
+        self.blobs_root = Some(root);
         self
     }
 }
@@ -274,6 +305,109 @@ impl AttachmentApi for ServerAttachmentApi {
             attachment_id: created.attachment_id,
             sha256: created.sha256,
             size_bytes: created.size_bytes,
+        })
+    }
+
+    async fn create_conversation_attachment(
+        &self,
+        filename: &str,
+        mime_type: &str,
+        bytes: Vec<u8>,
+    ) -> Result<CreatedArtifactView, ApiError> {
+        // 2026-05-25 — first caller is `web_fetch(as_attachment:
+        // true)`. Writes the bytes to `<blobs_root>/<sha256>` (the
+        // same content-addressed dir the web composer writes to) and
+        // inserts a state_attachments row tied to the caller's
+        // conversation. The python sandbox's hydrator
+        // (`hydrate_uploads`) picks the row up on the next
+        // `python.execute` call and drops the file at
+        // `/work/<convo>/uploads/<filename>` so the kernel can
+        // `pd.read_csv('/work/uploads/<filename>')` etc.
+        //
+        // Refuses cleanly when `blobs_root` wasn't configured (test
+        // fixtures that don't opt in). Same defense pattern as
+        // `create_artifact` — silent fallback to the developer's
+        // real `~/.execlaw/blobs/` would be terrible.
+        let blobs_root = match &self.blobs_root {
+            Some(r) => r.clone(),
+            None => {
+                return Err(ApiError::Storage(
+                    "create_conversation_attachment called but ServerAttachmentApi has no \
+                     blobs_root configured. Production wires this via `with_blobs_root` in \
+                     tool_dispatch."
+                        .into(),
+                ));
+            }
+        };
+        // Sanity-check the filename — `hydrate_uploads`'s
+        // `is_safe_filename` rejects path separators / `..` /
+        // empty, and so should we so a malformed name fails fast
+        // at the write rather than at the hydration retry.
+        let trimmed = filename.trim();
+        if trimmed.is_empty()
+            || trimmed.contains('/')
+            || trimmed.contains('\\')
+            || trimmed.contains("..")
+        {
+            return Err(ApiError::Validation(format!(
+                "create_conversation_attachment: filename {filename:?} contains path \
+                 separators or `..`; pick a basename like \"penguins.csv\""
+            )));
+        }
+        let mime_owned = mime_type.to_owned();
+        let filename_owned = trimmed.to_owned();
+        let conv_id = self.caller_conversation_id.clone();
+        let db = self.db.clone();
+        let created = tokio::task::spawn_blocking(move || -> Result<(String, String, u64), execlaw_core::DbError> {
+            use execlaw_core::attachments::{AttachmentRow, AttachmentStore};
+            use execlaw_core::ids::AttachmentId;
+            use sha2::{Digest, Sha256};
+
+            // Content-addressed blob write: hash → path → write if missing.
+            std::fs::create_dir_all(&blobs_root).map_err(|e| {
+                execlaw_core::DbError::Migration(format!(
+                    "create_conversation_attachment: mkdir {}: {e}",
+                    blobs_root.display()
+                ))
+            })?;
+            let mut h = Sha256::new();
+            h.update(&bytes);
+            let sha = format!("{:x}", h.finalize());
+            let blob_path = blobs_root.join(&sha);
+            let size_bytes = bytes.len() as u64;
+            if !blob_path.exists() {
+                std::fs::write(&blob_path, &bytes).map_err(|e| {
+                    execlaw_core::DbError::Migration(format!(
+                        "create_conversation_attachment: write {}: {e}",
+                        blob_path.display()
+                    ))
+                })?;
+            }
+            let att_id = AttachmentId::new();
+            let row = AttachmentRow {
+                id: att_id.clone(),
+                conversation_id: conv_id,
+                mime_type: mime_owned,
+                path: blob_path.to_string_lossy().into_owned(),
+                sha256: sha.clone(),
+                received_at: chrono::Utc::now().timestamp(),
+                filename: Some(filename_owned),
+            };
+            AttachmentStore::new(&db).insert(&row)?;
+            Ok((att_id.as_str().to_owned(), sha, size_bytes))
+        })
+        .await
+        .map_err(|e| ApiError::Storage(format!("attachment write join: {e}")))?
+        .map_err(|e| ApiError::Storage(format!("attachment write: {e}")))?;
+        // No invalidation callback: the python sandbox's hydrator
+        // self-heals via a MAX(received_at) check on each execute,
+        // so any new attachment from any code path is picked up
+        // automatically. See `python_sandbox::service::
+        // hydrate_if_needed`.
+        Ok(CreatedArtifactView {
+            attachment_id: created.0,
+            sha256: created.1,
+            size_bytes: created.2,
         })
     }
 
@@ -738,6 +872,134 @@ mod tests {
                 assert_eq!(attachment_id.as_deref(), Some(att_id.as_str()));
             }
             other => panic!("expected CardClosed, got {other:?}"),
+        }
+    }
+
+    // ===== create_conversation_attachment (Slice F, 2026-05-25) =====
+    //
+    // The Slice-F path adds a conversation-scoped attachment writer
+    // so `web_fetch(as_attachment: true)` can land remote-fetched
+    // bytes in a row the python sandbox hydrator picks up. Tests
+    // here pin the contract:
+    //   1. Without blobs_root wired → clean Storage error.
+    //   2. With blobs_root wired → row appears in state_attachments
+    //      with the caller's conversation_id, bytes are on disk at
+    //      <blobs_root>/<sha256>, view metadata matches the bytes.
+    //   3. Identical bytes from two calls share one on-disk file
+    //      (content-addressed) but get distinct attachment ids.
+    //   4. Filenames with path separators / `..` are rejected
+    //      before the disk write.
+
+    #[tokio::test]
+    async fn create_conversation_attachment_errors_when_blobs_root_unset() {
+        let db = fresh_db();
+        let cid = seed_conv(&db, "c-no-blobs");
+        let api =
+            ServerAttachmentApi::new(db, EventBus::new(), cid);
+        let err = api
+            .create_conversation_attachment("penguins.csv", "text/csv", b"a,b\n1,2\n".to_vec())
+            .await
+            .unwrap_err();
+        match err {
+            ApiError::Storage(msg) => {
+                assert!(msg.contains("blobs_root"), "unexpected msg: {msg}");
+            }
+            other => panic!("expected Storage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_conversation_attachment_writes_row_and_blob_for_caller_conversation() {
+        let db = fresh_db();
+        let cid = seed_conv(&db, "c-fetch-bytes");
+        let blobs = TempDir::new().unwrap();
+        let api =
+            ServerAttachmentApi::new(db.clone(), EventBus::new(), cid.clone())
+                .with_blobs_root(blobs.path().to_path_buf());
+
+        let payload = b"species,count\nAdelie,152\nGentoo,124\nChinstrap,68\n";
+        let view = api
+            .create_conversation_attachment("penguins.csv", "text/csv", payload.to_vec())
+            .await
+            .unwrap();
+
+        // View metadata: sha + size match the bytes.
+        assert_eq!(view.size_bytes, payload.len() as u64);
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(payload);
+        let expected_sha = format!("{:x}", h.finalize());
+        assert_eq!(view.sha256, expected_sha);
+        assert!(!view.attachment_id.is_empty());
+
+        // The blob landed at <blobs_root>/<sha256>.
+        let blob_path = blobs.path().join(&expected_sha);
+        assert!(blob_path.is_file(), "expected blob at {blob_path:?}");
+        assert_eq!(std::fs::read(&blob_path).unwrap(), payload);
+
+        // The row appears in state_attachments scoped to the caller.
+        let rows = AttachmentStore::new(&db).list_for_conversation(&cid).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].mime_type, "text/csv");
+        assert_eq!(rows[0].filename.as_deref(), Some("penguins.csv"));
+        assert_eq!(rows[0].sha256, expected_sha);
+        assert_eq!(rows[0].path, blob_path.to_string_lossy());
+    }
+
+    #[tokio::test]
+    async fn create_conversation_attachment_dedupes_identical_bytes_on_disk() {
+        // Content-addressed: two calls with the same payload share
+        // one on-disk file but get distinct attachment ids (so the
+        // SPA can render two distinct chips, transports can address
+        // either one, etc.).
+        let db = fresh_db();
+        let cid = seed_conv(&db, "c-dedupe");
+        let blobs = TempDir::new().unwrap();
+        let api =
+            ServerAttachmentApi::new(db.clone(), EventBus::new(), cid.clone())
+                .with_blobs_root(blobs.path().to_path_buf());
+
+        let payload = b"shared bytes";
+        let v1 = api
+            .create_conversation_attachment("a.csv", "text/csv", payload.to_vec())
+            .await
+            .unwrap();
+        let v2 = api
+            .create_conversation_attachment("b.csv", "text/csv", payload.to_vec())
+            .await
+            .unwrap();
+        assert_ne!(v1.attachment_id, v2.attachment_id);
+        assert_eq!(v1.sha256, v2.sha256);
+        // One on-disk file.
+        let entries: Vec<_> = std::fs::read_dir(blobs.path()).unwrap().collect();
+        assert_eq!(entries.len(), 1);
+        // Two state_attachments rows.
+        let rows = AttachmentStore::new(&db).list_for_conversation(&cid).unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn create_conversation_attachment_rejects_unsafe_filename() {
+        // Path separators / `..` would let an attacker escape the
+        // uploads dir during hydration. The hydration layer's
+        // is_safe_filename catches it; the writer rejects fast.
+        let db = fresh_db();
+        let cid = seed_conv(&db, "c-traversal");
+        let blobs = TempDir::new().unwrap();
+        let api =
+            ServerAttachmentApi::new(db, EventBus::new(), cid)
+                .with_blobs_root(blobs.path().to_path_buf());
+        for bad in ["", "../escape.csv", "a/b.csv", "..", "..\\b.csv"] {
+            let err = api
+                .create_conversation_attachment(bad, "text/csv", b"x".to_vec())
+                .await
+                .unwrap_err();
+            match err {
+                ApiError::Validation(msg) => {
+                    assert!(msg.contains("path separators") || msg.contains(".."));
+                }
+                other => panic!("expected Validation for {bad:?}, got {other:?}"),
+            }
         }
     }
 }

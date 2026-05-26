@@ -111,6 +111,14 @@ pub struct ChainedToolDispatch<B: BuiltinTools> {
     /// hands the registry to ServerAttachmentApi which walks
     /// bindings without naming Signal directly.
     pub host_transports: Option<crate::transport_registry::HostTransportRegistry>,
+    /// 2026-05-25 — content-addressed blob directory
+    /// (`<data_dir>/blobs/`) for `web_fetch(as_attachment: true)`
+    /// → `AttachmentApi::create_conversation_attachment` writes.
+    /// MUST be the same dir the SPA's composer + transport-inbound
+    /// path uses, otherwise the python sandbox hydrator's resolved
+    /// `path` field would point at a missing file. `None` disables
+    /// the `as_attachment` path (returns ApiError::Storage).
+    pub blobs_root: Option<std::path::PathBuf>,
 }
 
 impl<B: BuiltinTools> ChainedToolDispatch<B> {
@@ -133,6 +141,7 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
             signal_transport_resolver: None,
             signal_self_number: None,
             host_transports: None,
+            blobs_root: None,
         }
     }
 
@@ -161,6 +170,7 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
             signal_transport_resolver: None,
             signal_self_number: None,
             host_transports: None,
+            blobs_root: None,
         }
     }
 
@@ -248,6 +258,15 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
         registry: crate::transport_registry::HostTransportRegistry,
     ) -> Self {
         self.host_transports = Some(registry);
+        self
+    }
+
+    /// 2026-05-25 — wire the content-addressed blob directory
+    /// (`<data_dir>/blobs/`) used by `web_fetch(as_attachment: true)`
+    /// → `AttachmentApi::create_conversation_attachment`. Production
+    /// passes `state.db_config.path.parent().unwrap_or(".").join("blobs")`.
+    pub fn with_blobs_root(mut self, root: std::path::PathBuf) -> Self {
+        self.blobs_root = Some(root);
         self
     }
 
@@ -444,16 +463,25 @@ impl<B: BuiltinTools> ChainedToolDispatch<B> {
                 // affected `send_attachment`'s transport fan-out.
                 // Wire the plugin host so the bridge can actually
                 // dispatch the channel-side delivery tool.
-                ctx.attachments = Some(Arc::new(
-                    crate::attachment_api::ServerAttachmentApi::new(
-                        self.host.db().clone(),
-                        events.clone(),
-                        ctx.conversation_id.clone(),
-                    )
-                    .with_transports(self.host_transports.clone())
-                    .with_plugin_host(self.host.clone())
-                    .with_artifacts_root(artifacts_root),
-                ));
+                let mut server_attachment = crate::attachment_api::ServerAttachmentApi::new(
+                    self.host.db().clone(),
+                    events.clone(),
+                    ctx.conversation_id.clone(),
+                )
+                .with_transports(self.host_transports.clone())
+                .with_plugin_host(self.host.clone())
+                .with_artifacts_root(artifacts_root);
+                // 2026-05-25 — opt the attachment API into
+                // `create_conversation_attachment` when the
+                // dispatcher was wired with a blobs_root. The
+                // `web_fetch(as_attachment: true)` path needs it;
+                // tests / fixtures that don't pass blobs_root get
+                // a clean error from the method instead of writing
+                // under the developer's real ~/.execlaw/blobs/.
+                if let Some(root) = self.blobs_root.clone() {
+                    server_attachment = server_attachment.with_blobs_root(root);
+                }
+                ctx.attachments = Some(Arc::new(server_attachment));
             }
             // No bus → capability stays dormant. The tool body's
             // own `ctx.attachments.is_none()` denial fires.

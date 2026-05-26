@@ -659,6 +659,34 @@ pub struct WebFetchResponse {
     pub truncated: bool,
 }
 
+/// Result of a `WebFetchApi::get_bytes` — the raw response bytes
+/// (no UTF-8 decode) capped at the implementation's size limit +
+/// the resolved final URL + content-type. Used by callers that want
+/// to persist the body as an attachment (`web_fetch` with
+/// `as_attachment: true`, the deep-research bytes fetcher, etc.)
+/// rather than splice the body into a model tool_result.
+///
+/// `get_bytes` deliberately does NOT enforce the textual-content-type
+/// allowlist that `get` enforces — the whole point is that this path
+/// is for binary downloads (CSV, parquet, PNG, PDF, xlsx). The SSRF
+/// guard + size cap + timeout all still apply.
+///
+/// 2026-05-25 — added so the Python sandbox flow (`web_fetch` →
+/// attachment row → `hydrate_uploads` → `pd.read_csv('/work/uploads/foo')`)
+/// can ingest remote datasets the sandbox itself can't reach
+/// (`--network none`).
+#[derive(Debug, Clone)]
+pub struct WebFetchBytes {
+    pub final_url: String,
+    pub status: u16,
+    pub content_type: Option<String>,
+    /// Raw response bytes, capped at the implementation's
+    /// `max_bytes` (default 1 MiB).
+    pub body: Vec<u8>,
+    /// `true` when the body was truncated at the size cap.
+    pub truncated: bool,
+}
+
 /// One search result returned by [`WebSearchApi::search`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SearchResult {
@@ -1009,6 +1037,39 @@ pub trait AttachmentApi: Send + Sync {
         width: u32,
         height: u32,
     ) -> Result<(), ApiError>;
+
+    /// 2026-05-25 — persist `bytes` as a conversation-scoped
+    /// attachment (a `state_attachments` row, NOT a
+    /// `state_artifacts` row like `create_artifact` writes). The
+    /// distinction matters because the python sandbox's hydrator
+    /// (`hydrate_uploads`) walks `state_attachments` for the active
+    /// conversation — artifacts written via `create_artifact` are
+    /// plugin-scoped, not conversation-scoped, and would not be
+    /// hydrated into `/work/<convo>/uploads/` for the kernel to read.
+    ///
+    /// First caller: `web_fetch(as_attachment: true)`. Lets an agent
+    /// pull a remote dataset (CSV / parquet / xlsx) into the sandbox
+    /// despite the sandbox running `--network none`.
+    ///
+    /// Returns the same `CreatedArtifactView` shape as
+    /// `create_artifact` for symmetry. The `attachment_id` references
+    /// a `state_attachments` row whose `conversation_id` is the
+    /// caller's active conversation.
+    ///
+    /// Default impl returns `ApiError::Storage` — implementations
+    /// that don't expose conversation-attachment writes (test
+    /// fixtures, future read-only impls) don't have to opt in.
+    async fn create_conversation_attachment(
+        &self,
+        _filename: &str,
+        _mime_type: &str,
+        _bytes: Vec<u8>,
+    ) -> Result<CreatedArtifactView, ApiError> {
+        Err(ApiError::Storage(
+            "create_conversation_attachment not supported by this AttachmentApi implementation"
+                .into(),
+        ))
+    }
 }
 
 /// Returned by [`AttachmentApi::create_artifact`]. The
@@ -1038,6 +1099,33 @@ pub trait WebFetchApi: Send + Sync {
     ///     flagged in the response)
     ///   * 30s timeout
     async fn get(&self, url: &str) -> Result<WebFetchResponse, ApiError>;
+
+    /// Sibling of [`Self::get`] that returns the raw response bytes
+    /// without UTF-8 decoding and without the textual-content-type
+    /// allowlist. Used by `web_fetch(as_attachment: true)` and other
+    /// callers that need to land the body as a persisted attachment.
+    ///
+    /// Same SSRF guard, same redirect re-validation, same size cap
+    /// (`max_bytes`), same timeout. The only relaxation is the
+    /// content-type allowlist — binary types (image/png,
+    /// application/pdf, application/octet-stream, etc.) are returned
+    /// instead of rejected. The size cap is the load-bearing
+    /// defense at this point: a malicious server still can't OOM
+    /// the host by claiming a giant `Content-Length`.
+    ///
+    /// Default impl punts to `get` and re-encodes the body so existing
+    /// stub / mock implementations don't have to implement two
+    /// methods. Production impls should override for binary support.
+    async fn get_bytes(&self, url: &str) -> Result<WebFetchBytes, ApiError> {
+        let resp = self.get(url).await?;
+        Ok(WebFetchBytes {
+            final_url: resp.final_url,
+            status: resp.status,
+            content_type: resp.content_type,
+            body: resp.body.into_bytes(),
+            truncated: resp.truncated,
+        })
+    }
 }
 
 /// Outbound transport / bridge API.

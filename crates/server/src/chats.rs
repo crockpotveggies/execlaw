@@ -1992,7 +1992,22 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
             state.research_supervisor.as_ref().map(|s| s.wake.clone()),
         )
         .with_signal_transport_opt::<()>(None, None)
-        .with_host_transports(state.host_transports.clone()),
+        .with_host_transports(state.host_transports.clone())
+        // 2026-05-25 — wire the blob dir so
+        // `web_fetch(as_attachment: true)` →
+        // `AttachmentApi::create_conversation_attachment` can land
+        // remote-fetched bytes as a conversation attachment that the
+        // python sandbox hydrator picks up on the next execute.
+        // Same `<data_dir>/blobs/` the web composer writes to.
+        .with_blobs_root(
+            state
+                .db_config
+                .path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("blobs"),
+        ),
     );
 
     // Step 3.5 — lazy-spawn the runner if it's not registered yet.
@@ -2484,7 +2499,22 @@ async fn run_tool_capable_turn(
             state.research_supervisor.as_ref().map(|s| s.wake.clone()),
         )
         .with_signal_transport_opt::<()>(None, None)
-        .with_host_transports(state.host_transports.clone()),
+        .with_host_transports(state.host_transports.clone())
+        // 2026-05-25 — wire the blob dir so
+        // `web_fetch(as_attachment: true)` →
+        // `AttachmentApi::create_conversation_attachment` can land
+        // remote-fetched bytes as a conversation attachment that the
+        // python sandbox hydrator picks up on the next execute.
+        // Same `<data_dir>/blobs/` the web composer writes to.
+        .with_blobs_root(
+            state
+                .db_config
+                .path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("blobs"),
+        ),
     );
     let exec = TurnExecutor::new((*inference).clone(), dispatch);
     // Phase 11.A — wire a phase observer that fans the runner's
