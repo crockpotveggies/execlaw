@@ -938,6 +938,10 @@ pub fn test_app_state() -> AppState {
         // page can pre-populate this via `state.inference_metrics
         // .observe(...)` and snapshot.
         inference_metrics: crate::inference_metrics::InferenceMetrics::new(),
+        // Per-turn personality-chunk cache. Empty at construction;
+        // first compose call warms the default chunk and seeds the
+        // override-cid set from the DB.
+        personality_cache: Arc::new(crate::personality_cache::PersonalityCache::new()),
     }
 }
 

@@ -165,6 +165,9 @@ fn build_app(stage_root: std::path::PathBuf) -> (axum::Router, AppState) {
         reuse_update: execlaw_skills::ReuseUpdateSink::noop(),
         data_dir: std::env::temp_dir().join(format!("execlaw-test-{}", uuid::Uuid::new_v4())),
         inference_metrics: execlaw_server::inference_metrics::InferenceMetrics::new(),
+        personality_cache: std::sync::Arc::new(
+            execlaw_server::personality_cache::PersonalityCache::new(),
+        ),
     };
     (execlaw_server::routes::build_router(state.clone()), state)
 }

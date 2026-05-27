@@ -180,6 +180,9 @@ fn build_app(stage_root: PathBuf) -> (axum::Router, AppState) {
 
         data_dir: std::env::temp_dir().join(format!("execlaw-test-{}", uuid::Uuid::new_v4())),
         inference_metrics: execlaw_server::inference_metrics::InferenceMetrics::new(),
+        personality_cache: std::sync::Arc::new(
+            execlaw_server::personality_cache::PersonalityCache::new(),
+        ),
     };
     // Wire host capabilities into the script engine â€” without this
     // the Rhai script's vault_get / vault_put / sidecar_url all

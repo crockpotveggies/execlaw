@@ -226,6 +226,13 @@ pub struct AppState {
     /// continue to call the inference client directly without
     /// observation — adding them is the M5 incremental rollout.
     pub inference_metrics: InferenceMetrics,
+    /// Per-turn personality-chunk cache. Avoids two indexed SQLite
+    /// reads on every chat turn by caching the composed default
+    /// chunk + a set of conversation ids known to have an override.
+    /// Invalidated from the personality upsert/delete handlers.
+    /// Always present (cheap default constructor); see
+    /// [`crate::personality_cache`] for the design notes.
+    pub personality_cache: Arc<crate::personality_cache::PersonalityCache>,
 }
 
 impl std::fmt::Debug for AppState {

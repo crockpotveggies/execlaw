@@ -41,7 +41,10 @@ pub(crate) mod types;
 // resolving them at `crate::chats::X`. The persisted-payload
 // structs stay crate-private; they're the chats module's contract
 // with the event log, not part of the public surface.
-pub use prompt::{GroupTurnContext, build_turn_context_prose, resolve_group_turn_context};
+pub use prompt::{
+    GroupTurnContext, assemble_system_prompt, build_turn_context_prose,
+    resolve_group_turn_context,
+};
 pub use types::{
     IncognitoTurnMessage, InlineAttachmentRequest, ListQuery, MessageAttachmentView, MessageView,
     MessagesListResponse, PatchThreadRequest, PatchThreadResponse, SendMessageRequest,
@@ -56,7 +59,7 @@ pub(crate) use attachments::{
     extract_attachment_ids, extract_channel_origin, extract_text, fetch_data_ref,
     hydrate_message_attachments, persist_inbound_attachments,
 };
-pub(crate) use prompt::{assemble_system_prompt, build_tool_routing_prose, humanise_tool_call};
+pub(crate) use prompt::{build_tool_routing_prose, humanise_tool_call};
 // 2026-05-16 — small utilities split out into `chats/helpers.rs`.
 // `ensure_conversation_for` and `apply_auto_display_name` are
 // consumed by `crate::generic_inbound`; `rewrite_url_for_container`
@@ -920,7 +923,7 @@ async fn run_real_turn(
         turn_context.push_str(&block);
     }
     let composed_system = assemble_system_prompt(
-        &state.db,
+        state,
         Some(cid.as_str()),
         &state.config.system_prompt,
         "",
@@ -1848,7 +1851,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         turn_context.push_str(&block);
     }
     let composed_system = assemble_system_prompt(
-        &state.db,
+        state,
         Some(cid.as_str()),
         &state.config.system_prompt,
         &routing_prose,
@@ -2581,7 +2584,7 @@ async fn run_tool_capable_turn(
     // message — system+tools stay byte-identical across turns,
     // prefix cache amortises, follow-up turns drop to <1 s prefill.
     let composed_system_prompt = assemble_system_prompt(
-        &state.db,
+        state,
         Some(cid.as_str()),
         &state.config.system_prompt,
         &routing_prose,
@@ -6337,7 +6340,7 @@ mod tests {
         // can refine the routing hints without contradicting them.
         let state = test_app_state();
         let prompt = super::assemble_system_prompt(
-            &state.db,
+            &state,
             None,
             "STATIC BASE GOES HERE",
             "ROUTING PROSE GOES HERE",
@@ -6357,7 +6360,7 @@ mod tests {
         // (time, sender, trust) sit closest to the user message.
         let state = test_app_state();
         let prompt =
-            super::assemble_system_prompt(&state.db, None, "BASE", "ROUTING", "TURN_CONTEXT_HERE");
+            super::assemble_system_prompt(&state, None, "BASE", "ROUTING", "TURN_CONTEXT_HERE");
         let routing_at = prompt.find("ROUTING").unwrap();
         let ctx_at = prompt.find("TURN_CONTEXT_HERE").unwrap();
         assert!(
@@ -6818,7 +6821,7 @@ mod tests {
         // produces an Identity section.
         let state = test_app_state();
         let prompt = super::assemble_system_prompt(
-            &state.db,
+            &state,
             None, // no per-conversation override
             "You are a helpful agent. Refuse unsafe requests.",
             "",
@@ -6880,7 +6883,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        let prompt = super::assemble_system_prompt(&state.db, None, "STATIC ONLY", "", "");
+        let prompt = super::assemble_system_prompt(&state, None, "STATIC ONLY", "", "");
         assert_eq!(prompt, "STATIC ONLY");
     }
 
@@ -6912,8 +6915,8 @@ mod tests {
             )
             .unwrap();
 
-        let pirate = super::assemble_system_prompt(&state.db, Some("conv-pirate"), "BASE", "", "");
-        let plain = super::assemble_system_prompt(&state.db, None, "BASE", "", "");
+        let pirate = super::assemble_system_prompt(&state, Some("conv-pirate"), "BASE", "", "");
+        let plain = super::assemble_system_prompt(&state, None, "BASE", "", "");
         assert!(pirate.contains("# Tone\nPirate"));
         assert!(!plain.contains("Pirate"));
     }

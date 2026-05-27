@@ -1079,6 +1079,118 @@ fn bench_flow_middleware(c: &mut Criterion) {
     let _ = (Database::open, DbConfig::in_memory_unencrypted, MigrationRunner::new);
 }
 
+// ---------------------------------------------------------------------------
+// Personality cache (Phase E audit closure, 2026-05-26).
+//
+// Background: `assemble_system_prompt` was doing two indexed SQLite
+// reads under the synchronous Database mutex on every chat turn —
+// once for the default personality row, once for the optional
+// per-conversation override. The default row only changes when an
+// operator edits Settings → Personality (rare) and 99% of
+// conversations have no override, so we cache the composed default
+// chunk + a HashSet of cids known to have an override. See
+// [`execlaw_server::personality_cache::PersonalityCache`].
+//
+// Budgets:
+//   * cold (first call) → dominated by the SQLite default fetch
+//     + the personality-prompt render (~few hundred µs).
+//   * warm, no override → cache hit on default chunk, no DB read.
+//     Sub-µs target — basically a String clone + a RwLock read.
+//   * warm, with override → one SQLite override fetch + full
+//     compose. Similar to cold but persists across calls.
+// ---------------------------------------------------------------------------
+
+fn bench_assemble_system_prompt(c: &mut Criterion) {
+    use execlaw_server::chats::assemble_system_prompt;
+    use execlaw_server::routes::test_app_state;
+
+    let state = test_app_state();
+    // Pre-seed an override for the warm-with-override case so its
+    // cid is in the cache's override set after the first call.
+    let store =
+        execlaw_core::personality::PersonalityStore::new(&state.db);
+    let mut over_fields = std::collections::HashSet::new();
+    over_fields.insert(execlaw_core::personality::PersonalityField::Tone);
+    store
+        .upsert(
+            &execlaw_core::personality::PersonalityUpsert {
+                scope_kind:
+                    execlaw_core::personality::PersonalityScopeKind::Conversation,
+                scope_ref: "conv-bench-override".into(),
+                display_name: "".into(),
+                role: "".into(),
+                tone: "Pirate".into(),
+                communication_style: "".into(),
+                initiative: "".into(),
+                about_agent: "".into(),
+                about_controller: "".into(),
+                custom_instructions: "".into(),
+                voice_id: None,
+                override_fields: over_fields,
+            },
+            100,
+        )
+        .unwrap();
+
+    // Cold path: invalidate the cache before every iteration so each
+    // call pays the SQLite default-fetch + render cost. This is the
+    // boot-time / post-edit cost — represents the worst case but
+    // runs at most once per default edit.
+    c.bench_function("personality/assemble_system_prompt/cold_no_override", |b| {
+        b.iter(|| {
+            state.personality_cache.invalidate_default();
+            let out = assemble_system_prompt(
+                black_box(&state),
+                black_box(None),
+                black_box("STATIC BASE"),
+                black_box(""),
+                black_box(""),
+            );
+            black_box(out);
+        })
+    });
+
+    // Warm path, no override: 99% of real-world turns. Cache hit
+    // on the default chunk; no SQLite read should occur.
+    // First call warms the cache + lazy-seeds the override set.
+    let _ = assemble_system_prompt(&state, None, "STATIC BASE", "", "");
+    c.bench_function(
+        "personality/assemble_system_prompt/warm_no_override",
+        |b| {
+            b.iter(|| {
+                let out = assemble_system_prompt(
+                    black_box(&state),
+                    black_box(Some("conv-no-override-here")),
+                    black_box("STATIC BASE"),
+                    black_box(""),
+                    black_box(""),
+                );
+                black_box(out);
+            })
+        },
+    );
+
+    // Warm path WITH a per-conversation override: the rare case.
+    // Cache hit short-circuits to a full compose against the DB
+    // (one override-fetch + merge + render). Establishes the
+    // ceiling for "is the override path itself acceptable?"
+    c.bench_function(
+        "personality/assemble_system_prompt/warm_with_override",
+        |b| {
+            b.iter(|| {
+                let out = assemble_system_prompt(
+                    black_box(&state),
+                    black_box(Some("conv-bench-override")),
+                    black_box("STATIC BASE"),
+                    black_box(""),
+                    black_box(""),
+                );
+                black_box(out);
+            })
+        },
+    );
+}
+
 criterion_group!(
     benches,
     bench_jwt_access,
@@ -1097,5 +1209,6 @@ criterion_group!(
     bench_group_addressing_name_in_text,
     bench_build_turn_context_prose,
     bench_flow_middleware,
+    bench_assemble_system_prompt,
 );
 criterion_main!(benches);

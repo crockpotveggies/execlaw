@@ -1896,6 +1896,12 @@ async fn cmd_serve(bind: Option<String>, db_path: PathBuf, no_encrypt: bool) -> 
         // M5 — per-consumer inference observability; chat/research
         // wrap their LLM calls with `metrics.observe(consumer, fut)`.
         inference_metrics,
+        // Per-turn personality-chunk cache. Empty at boot; first
+        // chat turn warms the default chunk and seeds the
+        // override-cid set from the DB.
+        personality_cache: std::sync::Arc::new(
+            execlaw_server::personality_cache::PersonalityCache::new(),
+        ),
     };
 
     // Phase B (channel-plugin surface): wire the host-capabilities
