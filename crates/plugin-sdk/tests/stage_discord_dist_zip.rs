@@ -18,13 +18,13 @@ fn dist_discord_zip_stages_cleanly() {
         .unwrap()
         .parent()
         .unwrap();
-    let zip_path = workspace_root.join("dist").join("discord-0.2.1.zip");
+    let zip_path = workspace_root.join("dist").join("discord-0.2.2.zip");
     if !zip_path.exists() {
         // Allow CI / fresh clones to skip. The zip is rebuilt
         // by the operator's packaging step before publishing —
         // not regenerated automatically on every `cargo build`.
         eprintln!(
-            "dist/discord-0.2.1.zip not present at {}; skipping",
+            "dist/discord-0.2.2.zip not present at {}; skipping",
             zip_path.display()
         );
         return;
@@ -33,7 +33,7 @@ fn dist_discord_zip_stages_cleanly() {
     let staged = stage_zip(BufReader::new(f)).expect("stage_zip must accept the dist zip");
 
     assert_eq!(staged.manifest.plugin.id, "discord");
-    assert_eq!(staged.manifest.plugin.version, "0.2.1");
+    assert_eq!(staged.manifest.plugin.version, "0.2.2");
 
     // Script-tier: every tool lives in main.rhai, none host-implemented.
     assert!(

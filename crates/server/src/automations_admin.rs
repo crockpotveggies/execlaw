@@ -79,6 +79,16 @@ pub fn router() -> Router<AppState> {
             "/api/admin/automations/default-flows",
             get(list_default_flows),
         )
+        // Slice G (2026-05-26) — operator-facing branching hints
+        // collected from every installed plugin's
+        // `[[branch_suggestions]]` section. The SPA's three
+        // Rhai-expression pickers (Branch form, edge.when,
+        // trigger.when) fetch the same payload + filter
+        // client-side by the current flow's trigger.event_kind.
+        .route(
+            "/api/admin/automations/branch-suggestions",
+            get(list_branch_suggestions),
+        )
 }
 
 // --- M6 registry inspection handlers --------------------------------
@@ -158,6 +168,112 @@ async fn list_default_flows(
             message: format!("{e}"),
         })?;
     Ok(Json(rows))
+}
+
+// --- Slice G: plugin-suggested branch dimensions ---------------------
+//
+// Each installed plugin's manifest can declare one or more
+// `[[branch_suggestions]]` entries hinting at natural Rhai split
+// dimensions for an event_kind. The endpoint walks every installed
+// plugin row, parses the persisted manifest TOML, collects the
+// suggestions, and tags each with the source plugin id + version so
+// the SPA can badge the dropdown entries ("From slack 0.3.3 ...").
+//
+// Cost: one `state_plugins` SELECT + N TOML re-parses. For the
+// dozen-or-so plugins a typical install carries, this completes in
+// well under 5 ms. Not cached — the manifest set changes on every
+// install/upgrade and a cache invalidation hook would add plumbing
+// without a meaningful win at the call rate (the SPA fetches once
+// per flow-edit session).
+
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct BranchSuggestionDto {
+    /// Trigger / event kind this suggestion is meaningful for.
+    /// SPA filters by matching the flow's `trigger.kind`.
+    pub event_kind: String,
+    /// Optional secondary gate — the SPA suppresses the
+    /// suggestion when the flow's existing trigger.when does NOT
+    /// contain this expression as a substring (string heuristic;
+    /// it's a UX gate, not a runtime check).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub when_active: Option<String>,
+    /// Operator-facing dropdown label.
+    pub display_name: String,
+    /// One-line hint under the label.
+    pub description: String,
+    /// Rhai expression with `{placeholder}` chips the operator
+    /// fills in.
+    pub template: String,
+    /// Default value per `{placeholder}` so the suggestion lands
+    /// as a working expression.
+    pub defaults: std::collections::BTreeMap<String, String>,
+    /// Source plugin id (`"slack"`, `"whatsapp"`, ...). The SPA
+    /// shows this as a badge in the dropdown so the operator
+    /// knows which plugin's payload shape they're branching on.
+    pub source_plugin_id: String,
+    /// Source plugin version. Helps an operator debug stale
+    /// suggestions after an upgrade.
+    pub source_plugin_version: String,
+}
+
+#[axum::debug_handler]
+async fn list_branch_suggestions(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<BranchSuggestionDto>>, ApiError> {
+    let rows = state.plugin_host.list_rows().map_err(|e| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "plugin_list_failed",
+        message: format!("{e}"),
+    })?;
+
+    let mut out: Vec<BranchSuggestionDto> = Vec::new();
+    for row in rows {
+        // Skip disabled plugins — their suggestions would be
+        // confusing (operator can't reach the events these
+        // suggestions discriminate on while the plugin is off).
+        // Re-appear on re-enable, no SPA refresh needed beyond
+        // the next fetch.
+        if !row.enabled {
+            continue;
+        }
+        let manifest = match execlaw_plugin_sdk::PluginManifest::parse(&row.manifest_toml) {
+            Ok(m) => m,
+            Err(e) => {
+                // Shouldn't happen — install path already parsed
+                // this manifest. Log + skip rather than fail the
+                // whole list (one bad plugin shouldn't blank the
+                // dropdown).
+                tracing::warn!(
+                    plugin_id = %row.plugin_id,
+                    error = %e,
+                    "branch-suggestions: persisted manifest re-parse failed; skipping plugin"
+                );
+                continue;
+            }
+        };
+        for s in manifest.branch_suggestions {
+            out.push(BranchSuggestionDto {
+                event_kind: s.event_kind,
+                when_active: s.when_active,
+                display_name: s.display_name,
+                description: s.description,
+                template: s.template,
+                defaults: s.defaults,
+                source_plugin_id: row.plugin_id.clone(),
+                source_plugin_version: row.version.clone(),
+            });
+        }
+    }
+    // Deterministic ordering so the SPA dropdown isn't jumpy
+    // between fetches. Sort by plugin id then display name; two
+    // suggestions from one plugin retain their manifest-file order
+    // within that group.
+    out.sort_by(|a, b| {
+        a.source_plugin_id
+            .cmp(&b.source_plugin_id)
+            .then_with(|| a.display_name.cmp(&b.display_name))
+    });
+    Ok(Json(out))
 }
 
 // ---------------------------------------------------------------------------

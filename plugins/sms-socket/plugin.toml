@@ -1,7 +1,7 @@
 [plugin]
 id = "sms-socket"
 name = "SMS Socket"
-version = "0.2.1"
+version = "0.2.2"
 description = "SMS / MMS via the Android SMS Socket app's local WebSocket gateway. Sidecar-free — opens a WebSocket directly to the gateway URL on the operator's LAN with `Authorization: Bearer <api_key>`. Mirrors the Signal/WhatsApp tool surface (send_message, reply, list_groups n/a, send_with_attachments, fetch_attachment, set_typing). The gateway lives on the operator's Android phone running https://github.com/crockpotveggies/sms-socket-app."
 author = "execlaw"
 license = "Apache-2.0"
@@ -122,3 +122,26 @@ name = "SMS channel guidance"
 flow_path = "flows/default.json"
 enabled = true
 description = "Pre-turn middleware: when a chat.prompt arrives via SMS, inject reply guidance (extreme brevity, plain ASCII, single-segment fit)."
+
+# ===== Slice G (2026-05-26): branch-author suggestions ==============
+#
+# SMS has no groups (per the [transport].supports_groups = false up
+# top). The natural branching dimensions are sender identity (specific
+# E.164 number) and message keywords. group_name is always null on
+# SMS — we deliberately don't expose a group-name suggestion here so
+# the dropdown stays honest about what works.
+[[branch_suggestions]]
+event_kind   = "chat.prompt"
+when_active  = 'event.payload.channel == "sms"'
+display_name = "By sender principal id"
+description  = "Branch on a specific sender. SMS senders show up as Principal ids derived from their E.164 phone."
+template     = 'event.payload.sender_principal_id == "{principal_id}"'
+defaults     = { principal_id = "pri_sms_+15555550100" }
+
+[[branch_suggestions]]
+event_kind   = "chat.prompt"
+when_active  = 'event.payload.channel == "sms"'
+display_name = "By keyword in message text"
+description  = "Useful for keyword-style command flows (e.g. 'STOP', 'YES', 'reorder')."
+template     = 'event.payload.text.to_lower().contains("{keyword}")'
+defaults     = { keyword = "stop" }

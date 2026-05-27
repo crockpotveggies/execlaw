@@ -14,15 +14,52 @@ import Button from "react-bootstrap/Button";
 import Form from "react-bootstrap/Form";
 import type {
     AutomationDef,
+    BranchSuggestion,
     EdgeDef,
     ExitToolDef,
     NodeDef,
     RegisteredEventKind,
     TriggerDef,
 } from "../api/automations";
-import { listRegisteredEvents } from "../api/automations";
+import {
+    filterBranchSuggestions,
+    listBranchSuggestions,
+    listRegisteredEvents,
+    renderBranchSuggestion,
+} from "../api/automations";
 import { listSkills, listTools } from "../api/endpoints";
 import { useAuth } from "../auth/AuthContext";
+
+/**
+ * Slice G (2026-05-26) — fetch plugin-contributed branch suggestions
+ * once per panel-mount. The endpoint walks every installed plugin's
+ * `[[branch_suggestions]]` manifest section and returns the union
+ * (typically a dozen-ish entries — light enough to skip caching).
+ *
+ * Returns `[]` until the fetch resolves, and on auth/network failure
+ * — the picker is purely additive UX, so a missing fetch silently
+ * falls back to the kind-specific built-in suggestions.
+ */
+function useBranchSuggestions(): BranchSuggestion[] {
+    const auth = useAuth();
+    const [out, setOut] = useState<BranchSuggestion[]>([]);
+    useEffect(() => {
+        let cancelled = false;
+        listBranchSuggestions(auth.getAccessToken)
+            .then((list) => {
+                if (!cancelled) setOut(list);
+            })
+            .catch(() => {
+                // Best-effort: surfacing a fetch error in the panel
+                // would scare operators away from a useful flow-edit
+                // session. Stale-fallback to built-in suggestions only.
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [auth.getAccessToken]);
+    return out;
+}
 
 /// Phase D (2026-05-22) — operator-pickable name lists for the
 /// SetSkills / SetTools mutator forms. Returns just the names so
@@ -1482,10 +1519,94 @@ export function TriggerPanel({
                 </div>
             </Form.Group>
 
+            <TriggerPanelPluginSuggestions
+                trigger={trigger}
+                onPick={(rendered) =>
+                    onChange({
+                        ...trigger,
+                        when: rendered,
+                    })
+                }
+            />
+
             <div className="small text-muted mt-2">
                 The trigger and the End sentinel are structural — every
                 flow has exactly one of each. Drag operator nodes from
                 the palette and wire them between trigger and End.
+            </div>
+        </div>
+    );
+}
+
+/**
+ * Slice G (2026-05-26) — plugin-contributed suggestions for the
+ * trigger.when picker. Filters by the active trigger.kind. The
+ * `when_active` heuristic is dropped here because the trigger has
+ * no "upstream context" — the operator is AUTHORING the narrow, so
+ * every suggestion for the current kind is relevant. Each pick
+ * replaces the entire `when` field (operators can compose multiple
+ * narrows by hand if they want; we don't AND them silently).
+ */
+function TriggerPanelPluginSuggestions({
+    trigger,
+    onPick,
+}: {
+    trigger: TriggerDef;
+    onPick: (rendered: string) => void;
+}) {
+    const pluginSuggestions = useBranchSuggestions();
+    const filtered = useMemo<BranchSuggestion[]>(() => {
+        // For trigger.when the activeContext is the existing
+        // trigger.when text — lets operators iteratively narrow
+        // (slack → then by channel name).
+        return filterBranchSuggestions(
+            pluginSuggestions,
+            trigger.kind,
+            trigger.when ?? "",
+        );
+    }, [pluginSuggestions, trigger.kind, trigger.when]);
+    if (filtered.length === 0) return null;
+    return (
+        <div
+            className="mb-2"
+            data-testid="trigger-panel-plugin-suggestions"
+        >
+            <div className="small text-muted mb-1">
+                <i className="bi bi-puzzle me-1" aria-hidden />
+                Suggested filters from installed plugins
+            </div>
+            <div className="d-flex flex-column gap-1">
+                {filtered.map((s, i) => {
+                    const rendered = renderBranchSuggestion(s);
+                    return (
+                        <Button
+                            key={`${s.source_plugin_id}-${i}`}
+                            variant="outline-secondary"
+                            size="sm"
+                            className="text-start"
+                            style={{ fontSize: 12 }}
+                            onClick={() => onPick(rendered)}
+                            data-testid={`trigger-panel-plugin-suggestion-${i}`}
+                            title={s.description}
+                        >
+                            <div>
+                                <span className="me-2">{s.display_name}</span>
+                                <span
+                                    className="badge text-bg-secondary"
+                                    style={{ fontSize: 10 }}
+                                >
+                                    {s.source_plugin_id}
+                                </span>
+                            </div>
+                            <div
+                                className="font-monospace text-muted"
+                                style={{ fontSize: 11 }}
+                            >
+                                {rendered}
+                            </div>
+                        </Button>
+                    );
+                })}
             </div>
         </div>
     );
@@ -1566,6 +1687,23 @@ export function EdgePanel({
         }
         return [];
     }, [definition, edge.from]);
+
+    // Slice G (2026-05-26) — plugin-contributed branch suggestions
+    // filtered to the flow's active trigger kind + the channel-narrow
+    // context (trigger.when). The when_active gate is a string-
+    // contains heuristic so a slack-narrowed flow only sees slack
+    // suggestions, etc.
+    const pluginSuggestions = useBranchSuggestions();
+    const filteredPluginSuggestions = useMemo<BranchSuggestion[]>(() => {
+        return filterBranchSuggestions(
+            pluginSuggestions,
+            definition.trigger.kind,
+            // For edges, the context that decides "is this slack-
+            // narrowed?" is the flow's trigger.when. An edge inside
+            // a slack-narrowed flow inherits the channel constraint.
+            definition.trigger.when ?? "",
+        );
+    }, [pluginSuggestions, definition.trigger.kind, definition.trigger.when]);
     return (
         <div
             className="execlaw-automation-edge-panel border rounded shadow-sm"
@@ -1668,6 +1806,56 @@ export function EdgePanel({
                                 {s}
                             </Button>
                         ))}
+                    </div>
+                </div>
+            )}
+
+            {filteredPluginSuggestions.length > 0 && (
+                <div
+                    className="mb-2"
+                    data-testid="edge-panel-plugin-suggestions"
+                >
+                    <div className="small text-muted mb-1">
+                        <i className="bi bi-puzzle me-1" aria-hidden />
+                        Suggested splits from installed plugins
+                    </div>
+                    <div className="d-flex flex-column gap-1">
+                        {filteredPluginSuggestions.map((s, i) => {
+                            const rendered = renderBranchSuggestion(s);
+                            return (
+                                <Button
+                                    key={`${s.source_plugin_id}-${i}`}
+                                    variant="outline-secondary"
+                                    size="sm"
+                                    className="text-start"
+                                    style={{ fontSize: 12 }}
+                                    onClick={() => {
+                                        setDraft(rendered);
+                                        onWhenChange(edgeId, rendered);
+                                    }}
+                                    data-testid={`edge-panel-plugin-suggestion-${i}`}
+                                    title={s.description}
+                                >
+                                    <div>
+                                        <span className="me-2">
+                                            {s.display_name}
+                                        </span>
+                                        <span
+                                            className="badge text-bg-secondary"
+                                            style={{ fontSize: 10 }}
+                                        >
+                                            {s.source_plugin_id}
+                                        </span>
+                                    </div>
+                                    <div
+                                        className="font-monospace text-muted"
+                                        style={{ fontSize: 11 }}
+                                    >
+                                        {rendered}
+                                    </div>
+                                </Button>
+                            );
+                        })}
                     </div>
                 </div>
             )}

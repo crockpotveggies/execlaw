@@ -172,6 +172,9 @@ pub async fn send_message(
             // own value once they're wired through generic_inbound.
             "web",
             &Vec::<String>::new(),
+            // No group context on the web composer path — every
+            // web prompt is operator-typed in a DM-like surface.
+            None,
         );
         crate::flow_middleware::evaluate(&state, &flow_event)
     };
@@ -3303,12 +3306,24 @@ pub async fn dispatch_external_turn(
     // Failure mode + perf budget identical to send_message: any
     // middleware error logs WARN and the turn proceeds unmutated.
     let flow_outcome = {
+        // Slice G — surface group context to the flow's Rhai
+        // scope so plugin-suggested branches (Signal group,
+        // WhatsApp group, Slack channel) have a stable
+        // `event.payload.channel_meta.*` to read.
+        let channel_meta = group_context.as_ref().map(|g| {
+            crate::flow_middleware::ChannelMeta {
+                is_group: true,
+                group_name: g.group_name.clone(),
+                member_count: Some(g.member_count),
+            }
+        });
         let flow_event = crate::flow_middleware::build_chat_prompt_event(
             cid.as_str(),
             text,
             Some(principal.id.as_str()),
             inbound_channel_origin.unwrap_or("unknown"),
             &attachment_ids,
+            channel_meta,
         );
         crate::flow_middleware::evaluate(state, &flow_event)
     };

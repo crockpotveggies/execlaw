@@ -17,7 +17,7 @@ name = "Slack"
 #        conversations.info (channels) or users.info (DMs) on
 #        first inbound; result is cached in vault under
 #        `channel_labels`.
-version = "0.3.3"
+version = "0.3.4"
 description = "Slack transport via Socket Mode (no public URL needed). Multi-workspace from day 1: each workspace contributes its own bot+app token pair and runs its own Socket Mode connection. Mirrors the Signal/WhatsApp tool surface but is sidecar-free — pure-Rhai over the host's http_post + ws_subscribe + ws_send bindings."
 author = "execlaw"
 license = "Apache-2.0"
@@ -157,4 +157,40 @@ name = "Slack channel guidance"
 flow_path = "flows/default.json"
 enabled = true
 description = "Pre-turn middleware: when a chat.prompt arrives via the Slack channel, inject reply guidance (professional tone, Slack mrkdwn formatting only)."
+
+# ===== Slice G (2026-05-26): branch-author suggestions ==============
+#
+# Hints the SPA's flow editor offers when an operator is authoring a
+# Branch / edge.when / trigger.when expression downstream of a
+# Slack-narrowed chat.prompt trigger. Each suggestion appears in the
+# "Suggested splits" dropdown with the template pre-filled; the
+# operator fills the {placeholder} chip with the actual channel
+# name / DM user id / keyword they want to gate on.
+#
+# Slack-specific dimensions that make operational sense:
+#   - by channel display name (#engineering vs #general)
+#   - by DM vs channel (1:1 vs public room)
+#   - by "bot was mentioned" — already a strong trigger signal
+[[branch_suggestions]]
+event_kind   = "chat.prompt"
+when_active  = 'event.payload.channel == "slack"'
+display_name = "By Slack channel name"
+description  = "Different agent behavior per #channel. Channel name surfaces as the conversation's group_name on inbound."
+template     = 'event.payload.channel_meta.group_name == "{channel_name}"'
+defaults     = { channel_name = "general" }
+
+[[branch_suggestions]]
+event_kind   = "chat.prompt"
+when_active  = 'event.payload.channel == "slack"'
+display_name = "DM vs channel"
+description  = "Branch DMs (1:1) from public-channel traffic. DMs carry is_group=false; channels (any) carry is_group=true."
+template     = 'event.payload.channel_meta.is_group'
+
+[[branch_suggestions]]
+event_kind   = "chat.prompt"
+when_active  = 'event.payload.channel == "slack"'
+display_name = "By keyword in message text"
+description  = "Quick keyword routing — useful for surfacing 'urgent' messages on a higher-trust flow."
+template     = 'event.payload.text.to_lower().contains("{keyword}")'
+defaults     = { keyword = "urgent" }
 

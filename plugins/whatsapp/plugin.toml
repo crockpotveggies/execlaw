@@ -1,7 +1,7 @@
 [plugin]
 id = "whatsapp"
 name = "WhatsApp"
-version = "0.2.1"
+version = "0.2.2"
 description = "WhatsApp Multi-Device transport via wuzapi (whatsmeow-backed). Mirrors the Signal plugin shape: 6 agent-callable tools (send_message, reply, list_groups, create_group, add_group_members, leave_group) + 3 host-internal convention tools (set_typing, send_with_attachments, fetch_attachment), inbound WS consumer, QR-pairing admin flow."
 author = "execlaw"
 license = "Apache-2.0"
@@ -237,4 +237,33 @@ name = "WhatsApp channel guidance"
 flow_path = "flows/default.json"
 enabled = true
 description = "Pre-turn middleware: when a chat.prompt arrives via the WhatsApp channel, inject reply guidance (concise, plain text, WhatsApp's tiny markdown subset only)."
+
+# ===== Slice G (2026-05-26): branch-author suggestions ==============
+#
+# WhatsApp groups are the primary branching dimension — family chats,
+# project teams, friend circles all behave very differently and most
+# operators want different agent voice + tool palette per group.
+# DMs are the natural "1:1" baseline.
+[[branch_suggestions]]
+event_kind   = "chat.prompt"
+when_active  = 'event.payload.channel == "whatsapp"'
+display_name = "By WhatsApp group name"
+description  = "Different agent behavior per group (Family Chat / Work / etc.). Group name is the WA group title."
+template     = 'event.payload.channel_meta.group_name == "{group_name}"'
+defaults     = { group_name = "Family Chat" }
+
+[[branch_suggestions]]
+event_kind   = "chat.prompt"
+when_active  = 'event.payload.channel == "whatsapp"'
+display_name = "Group vs DM"
+description  = "Branch 1:1 DMs from group traffic. DMs have is_group=false; any WA group sets is_group=true."
+template     = 'event.payload.channel_meta.is_group'
+
+[[branch_suggestions]]
+event_kind   = "chat.prompt"
+when_active  = 'event.payload.channel == "whatsapp"'
+display_name = "By keyword in message text"
+description  = "Quick keyword routing on inbound text — useful for handing 'urgent' or 'help' to a higher-trust flow."
+template     = 'event.payload.text.to_lower().contains("{keyword}")'
+defaults     = { keyword = "urgent" }
 

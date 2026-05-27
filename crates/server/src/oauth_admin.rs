@@ -864,6 +864,7 @@ mod tests {
             bus_events: vec![],
             reply_handlers: vec![],
             default_automations: vec![],
+            branch_suggestions: vec![],
         };
         state
             .plugin_host

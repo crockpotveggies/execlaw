@@ -465,6 +465,99 @@ export async function listDefaultFlows(
     );
 }
 
+/**
+ * Slice G (2026-05-26) — operator-facing branch-author hints
+ * collected from every installed plugin's `[[branch_suggestions]]`
+ * section. The Branch / edge.when / trigger.when pickers fetch this
+ * once per flow-edit session and filter client-side by the active
+ * flow's trigger.kind.
+ *
+ * Shape mirrors the Rust DTO `BranchSuggestionDto` 1:1.
+ */
+export interface BranchSuggestion {
+    /** Trigger / event kind this suggestion is meaningful for. */
+    event_kind: string;
+    /**
+     * Optional secondary gate — the SPA hides the suggestion when
+     * the flow's existing `trigger.when` doesn't contain this
+     * expression as a substring. Loose heuristic, not a runtime
+     * check; keeps slack-specific suggestions out of whatsapp-
+     * narrowed flows and vice versa.
+     */
+    when_active?: string;
+    /** Operator-facing dropdown label. */
+    display_name: string;
+    /** One-line hint under the label. */
+    description: string;
+    /** Rhai expression with `{placeholder}` chips. */
+    template: string;
+    /** Default value per placeholder; key matches the `{name}` in template. */
+    defaults: Record<string, string>;
+    /** Plugin that contributed this suggestion (badge in the dropdown). */
+    source_plugin_id: string;
+    /** Plugin version (helps with stale-suggestion debugging). */
+    source_plugin_version: string;
+}
+
+export async function listBranchSuggestions(
+    tokenAccessor: () => string | null,
+): Promise<BranchSuggestion[]> {
+    return apiFetch<BranchSuggestion[]>(
+        `${BASE}/branch-suggestions`,
+        {},
+        tokenAccessor,
+    );
+}
+
+/**
+ * Resolve a branch-suggestion template to a concrete Rhai expression
+ * by substituting `{placeholder}` chips with the supplied values
+ * (falling back to the suggestion's defaults for keys the caller
+ * didn't override). Pure helper — no network. Use from picker forms
+ * so the rendered expression stays consistent across the three
+ * surfaces (Branch, edge.when, trigger.when).
+ */
+export function renderBranchSuggestion(
+    suggestion: BranchSuggestion,
+    overrides: Record<string, string> = {},
+): string {
+    let out = suggestion.template;
+    const merged = { ...suggestion.defaults, ...overrides };
+    for (const [key, value] of Object.entries(merged)) {
+        // Match `{key}` literally; Rhai expressions never contain
+        // braces in non-placeholder positions for our templates,
+        // so a global replace is safe.
+        out = out.split(`{${key}}`).join(value);
+    }
+    return out;
+}
+
+/**
+ * Filter a suggestion list to those relevant to the current flow.
+ * Match rule:
+ *   1. `event_kind` must equal the flow's trigger kind.
+ *   2. If `when_active` is set, the flow's current trigger.when
+ *      (or other upstream context the caller threads in) must
+ *      contain `when_active` as a substring. Loose match — the
+ *      goal is "operator narrowed to slack already, only show
+ *      slack-shaped suggestions," not exact-equal.
+ */
+export function filterBranchSuggestions(
+    suggestions: BranchSuggestion[],
+    activeEventKind: string,
+    activeContext: string,
+): BranchSuggestion[] {
+    return suggestions.filter((s) => {
+        if (s.event_kind !== activeEventKind) {
+            return false;
+        }
+        if (s.when_active && !activeContext.includes(s.when_active)) {
+            return false;
+        }
+        return true;
+    });
+}
+
 /** POST /api/web/prompt — M6 web-prompt entrypoint (shadow mode). */
 export interface SubmitPromptRequest {
     text: string;

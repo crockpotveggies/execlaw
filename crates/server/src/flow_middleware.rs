@@ -269,6 +269,35 @@ pub fn evaluate(state: &AppState, event: &FlowEventInput) -> FlowOutcome {
     outcome
 }
 
+/// Optional channel-meta block carried on `chat.prompt.payload.
+/// channel_meta`. Operator flows reach for these fields when
+/// branching by group ("different agent behavior in Family Chat
+/// vs Work Chat") or by DM-vs-group context. `None` on the web
+/// path (no group / channel concept); `Some` when an inbound
+/// transport bridges a group-context message.
+///
+/// 2026-05-26 (Slice G) — introduced so the plugin-suggested
+/// branches feature (see `BranchSuggestionDecl`) can target
+/// concrete payload paths like `event.payload.channel_meta.is_group`
+/// without each suggestion having to spelunk the envelope.
+#[derive(Debug, Clone, Default)]
+pub struct ChannelMeta {
+    /// `true` when the turn arrived from a group thread (Signal
+    /// group, WhatsApp group, Slack channel, Discord channel).
+    /// `false` for DMs / 1-on-1 conversations. Always defined —
+    /// the absence of any group context defaults to `false`.
+    pub is_group: bool,
+    /// Operator-facing group name when the transport surfaces one
+    /// (Signal does, Slack channels expose the channel name,
+    /// WhatsApp groups expose the WA group title). `None` when
+    /// the transport doesn't carry a label, even if `is_group` is
+    /// true.
+    pub group_name: Option<String>,
+    /// Number of participants in the principal group (including
+    /// the Controller). `None` outside group context.
+    pub member_count: Option<usize>,
+}
+
 /// Builder for the `chat.prompt` event input. Hot path — the chat
 /// handler constructs one of these per turn. Keep allocations
 /// tight: only the fields the matcher + Rhai scope actually read.
@@ -277,12 +306,18 @@ pub fn evaluate(state: &AppState, event: &FlowEventInput) -> FlowOutcome {
 /// transport-bridge annotation (the SPA's composer is the
 /// canonical example). Plugin transports (Signal, WhatsApp) set
 /// it from `inbound_channel_origin`.
+///
+/// `channel_meta` carries group/DM context when an inbound
+/// transport bridges a group thread — see [`ChannelMeta`]. The
+/// web path passes `None`; the channel-inbound path passes
+/// `Some(...)` built from `GroupTurnContext`.
 pub fn build_chat_prompt_event(
     conversation_id: &str,
     user_text: &str,
     sender_principal_id: Option<&str>,
     channel: &str,
     attachment_ids: &[String],
+    channel_meta: Option<ChannelMeta>,
 ) -> FlowEventInput {
     use execlaw_core::event_envelope::{EventEnvelope, OriginRef, SenderIdentity, TrustClass};
 
@@ -300,6 +335,13 @@ pub fn build_chat_prompt_event(
         correlation_id: format!("chat-{}", uuid::Uuid::new_v4()),
         parent_event_id: None,
     };
+    // Always emit `channel_meta` as a stable object so flow
+    // authors (and plugin-suggested branches) can write
+    // `event.payload.channel_meta.is_group` without a null
+    // guard. The web path defaults every field to "no group
+    // context" rather than emitting None — keeps the Rhai
+    // expressions short.
+    let meta = channel_meta.unwrap_or_default();
     FlowEventInput {
         id: format!("chat-prompt-{}", uuid::Uuid::new_v4()),
         kind: CHAT_PROMPT_KIND.to_owned(),
@@ -311,6 +353,11 @@ pub fn build_chat_prompt_event(
             "sender_principal_id": sender_principal_id,
             "channel": channel,
             "attachment_ids": attachment_ids,
+            "channel_meta": {
+                "is_group": meta.is_group,
+                "group_name": meta.group_name,
+                "member_count": meta.member_count,
+            },
         }),
         internal: false,
         envelope,
@@ -353,7 +400,7 @@ mod tests {
     }
 
     fn chat_event(text: &str) -> FlowEventInput {
-        build_chat_prompt_event("conv-test", text, Some("op"), "web", &[])
+        build_chat_prompt_event("conv-test", text, Some("op"), "web", &[], None)
     }
 
     #[test]
@@ -455,7 +502,7 @@ mod tests {
         assert!(web_outcome.is_noop());
 
         // WhatsApp event — flow fires.
-        let wa_event = build_chat_prompt_event("conv-test", "hello", Some("op"), "whatsapp", &[]);
+        let wa_event = build_chat_prompt_event("conv-test", "hello", Some("op"), "whatsapp", &[], None);
         let wa_outcome = evaluate(&state, &wa_event);
         assert_eq!(wa_outcome.rewritten_prompt.as_deref(), Some("[wa] hello"));
     }

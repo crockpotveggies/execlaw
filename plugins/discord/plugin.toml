@@ -1,7 +1,7 @@
 [plugin]
 id = "discord"
 name = "Discord"
-version = "0.2.1"
+version = "0.2.2"
 description = "Discord transport via the official Bot Gateway WebSocket. Sidecar-free — the plugin maintains the long-lived gateway connection itself, sends application-layer heartbeats via ws_set_keepalive, and posts outbound via the REST API. Single bot token spans every guild the bot is invited to; multi-guild is automatic from GUILD_CREATE dispatches. v0.1 does NOT implement slash commands / interactions (deferred to v0.2 via [[webhook_routes]] + Ed25519 verification)."
 author = "execlaw"
 license = "Apache-2.0"
@@ -140,3 +140,33 @@ name = "Discord channel guidance"
 flow_path = "flows/default.json"
 enabled = true
 description = "Pre-turn middleware: when a chat.prompt arrives via the Discord channel, inject reply guidance (full Markdown OK, code blocks with language tags, ~2000-char per-message cap)."
+
+# ===== Slice G (2026-05-26): branch-author suggestions ==============
+#
+# Discord has a two-level hierarchy (guild → channel) plus DMs. For
+# v1 we expose the channel-level branch (the most operationally
+# useful — different channels need different agent behavior) and
+# DM-vs-channel. Per-guild branching is a v2 once channel_meta
+# surfaces the guild id.
+[[branch_suggestions]]
+event_kind   = "chat.prompt"
+when_active  = 'event.payload.channel == "discord"'
+display_name = "By Discord channel name"
+description  = "Different behavior per Discord channel. Channel name surfaces as the conversation's group_name on inbound."
+template     = 'event.payload.channel_meta.group_name == "{channel_name}"'
+defaults     = { channel_name = "general" }
+
+[[branch_suggestions]]
+event_kind   = "chat.prompt"
+when_active  = 'event.payload.channel == "discord"'
+display_name = "DM vs channel"
+description  = "Branch DMs (1:1) from any guild channel. DMs have is_group=false."
+template     = 'event.payload.channel_meta.is_group'
+
+[[branch_suggestions]]
+event_kind   = "chat.prompt"
+when_active  = 'event.payload.channel == "discord"'
+display_name = "By keyword in message text"
+description  = "Quick keyword routing on inbound text."
+template     = 'event.payload.text.to_lower().contains("{keyword}")'
+defaults     = { keyword = "help" }

@@ -1,7 +1,7 @@
 [plugin]
 id = "google-apps"
 name = "Google Apps"
-version = "0.3.1"
+version = "0.3.2"
 description = "Consolidated Google plugin — Gmail, Calendar, Contacts, Tasks, and Drive in one OAuth grant. Replaces the separate google-calendar + google-contacts plugins. Individual modules can be toggled on/off without re-running the consent flow."
 author = "execlaw"
 license = "Apache-2.0"
@@ -381,5 +381,29 @@ name = "Google Workspace tool hint"
 flow_path = "flows/default.json"
 enabled = true
 description = "Pre-turn middleware: when the user mentions Gmail / Calendar / Drive / Docs / Sheets vocabulary, inject a hint telling the agent to call the installed gmail.* / calendar.* / drive.* / docs.* / sheets.* tools rather than refuse or improvise."
+
+# ===== Slice G (2026-05-26): branch-author suggestions ==============
+#
+# google-apps is a tool plugin — it doesn't bring its own channel. The
+# suggestions surface on ANY chat.prompt trigger (no when_active
+# narrowing) because an operator could care about Gmail / Calendar
+# vocabulary on web, Slack, Signal — wherever the chat lands.
+[[branch_suggestions]]
+event_kind   = "chat.prompt"
+display_name = "Mentions Gmail / inbox / email"
+description  = "Useful for routing email-flavored requests to a flow that pre-loads gmail.* tools or a 'mail' skill."
+template     = 'event.payload.text.to_lower().contains("gmail") || event.payload.text.to_lower().contains("email") || event.payload.text.to_lower().contains("inbox")'
+
+[[branch_suggestions]]
+event_kind   = "chat.prompt"
+display_name = "Mentions Calendar / meeting / schedule"
+description  = "Routes scheduling-flavored requests to a calendar-aware flow."
+template     = 'event.payload.text.to_lower().contains("calendar") || event.payload.text.to_lower().contains("meeting") || event.payload.text.to_lower().contains("schedule")'
+
+[[branch_suggestions]]
+event_kind   = "chat.prompt"
+display_name = "Mentions Docs / Sheets / Drive"
+description  = "Routes file-flavored requests to a flow that surfaces docs.* / sheets.* / drive.* tools."
+template     = 'event.payload.text.to_lower().contains("docs") || event.payload.text.to_lower().contains("sheet") || event.payload.text.to_lower().contains("drive") || event.payload.text.to_lower().contains("document")'
 
 

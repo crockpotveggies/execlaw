@@ -108,6 +108,29 @@ pub struct PluginManifest {
     /// upgrade.
     #[serde(default)]
     pub default_automations: Vec<DefaultAutomationDecl>,
+
+    /// 2026-05-26 (Slice G) — operator-facing branching hints the
+    /// SPA's flow editor offers when the operator is authoring a
+    /// `Branch` node, an `edge.when` predicate, or a `trigger.when`
+    /// filter. Each entry suggests one Rhai split dimension that
+    /// makes sense for an event of `event_kind`, with a template
+    /// the operator can drop in and customize.
+    ///
+    /// Plugins are best-positioned to suggest these because they own
+    /// the payload shape: only the slack plugin knows that
+    /// `event.payload.slack.channel_name` exists; only the whatsapp
+    /// plugin knows that `event.payload.is_group` is the right
+    /// DM-vs-group switch. Surfacing this in the manifest closes
+    /// the discoverability gap that makes operators grep `main.rhai`
+    /// to find out what fields they can branch on.
+    ///
+    /// Aggregated across all installed plugins by the
+    /// `/api/admin/automations/branch-suggestions` endpoint and
+    /// consumed by the SPA's three Rhai-expression pickers (Branch
+    /// form, edge.when, trigger.when). Pure UX hints — does NOT
+    /// affect the executor's runtime behavior.
+    #[serde(default)]
+    pub branch_suggestions: Vec<BranchSuggestionDecl>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -702,6 +725,90 @@ pub struct DefaultAutomationDecl {
 
 fn default_true() -> bool {
     true
+}
+
+/// 2026-05-26 (Slice G) — one branching dimension the plugin
+/// suggests to the operator when authoring a flow that triggers on
+/// `event_kind`. The SPA's Branch / edge.when / trigger.when forms
+/// fetch the aggregated list of suggestions from
+/// `GET /api/admin/automations/branch-suggestions` and present them
+/// as a "Suggested splits" dropdown the operator can drop in.
+///
+/// Why a manifest declaration rather than a hardcoded SPA table:
+/// the slack/whatsapp/signal plugins each have payload shapes the
+/// host doesn't know in detail. Letting the plugin author surface
+/// the right Rhai field paths keeps the SPA generic and lets new
+/// transport plugins ship branching UX without an SPA change.
+///
+/// Example shapes — see `plugins/slack/plugin.toml` etc. for the
+/// real entries shipped in v1.
+///
+/// ```toml
+/// [[branch_suggestions]]
+/// event_kind   = "chat.prompt"
+/// when_active  = 'event.payload.channel == "slack"'
+/// display_name = "By Slack channel name"
+/// description  = "Different agent behavior per #channel."
+/// template     = 'event.payload.slack.channel_name == "{channel_name}"'
+/// defaults     = { channel_name = "general" }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BranchSuggestionDecl {
+    /// Which trigger / event kind this suggestion is meaningful for.
+    /// The SPA filters suggestions to only show those whose
+    /// `event_kind` matches the active flow's trigger. Plugins can
+    /// target their OWN event kinds (e.g. `signal.message.received`)
+    /// AND core kinds the host owns (`chat.prompt`); the registry
+    /// doesn't gate which kind a suggestion can target.
+    pub event_kind: String,
+
+    /// Optional secondary filter — a Rhai-expression-shaped string
+    /// the SPA evaluates against the flow's existing trigger.when /
+    /// upstream filters to decide whether to surface this
+    /// suggestion. E.g. a slack channel-name suggestion declares
+    /// `when_active = 'event.payload.channel == "slack"'` so it
+    /// only appears in slack-narrowed flows, not in flows that
+    /// match every channel.
+    ///
+    /// `None` means "always relevant for `event_kind`."
+    ///
+    /// **Not** evaluated at runtime — purely a UX gate. The SPA's
+    /// suggestion-filter logic is a string-contains heuristic
+    /// against the operator's current upstream expressions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when_active: Option<String>,
+
+    /// Operator-facing label shown in the picker dropdown. Short
+    /// noun phrase: "By Slack channel name", "By WhatsApp group",
+    /// "By Gmail label". Under ~40 chars renders cleanly.
+    pub display_name: String,
+
+    /// One-line operator-facing explanation. Shown as a hint below
+    /// the suggestion when the operator hovers / focuses it.
+    /// Empty = no hint.
+    #[serde(default)]
+    pub description: String,
+
+    /// The Rhai expression template the operator drops in. Curly-
+    /// brace placeholders (`{name}`) become editable chips in the
+    /// SPA form so the operator fills in the actual value (the
+    /// channel id, group jid, label name, etc.) without retyping
+    /// the surrounding Rhai.
+    ///
+    /// Free-form: a suggestion can offer simple equality
+    /// (`event.payload.x == "{val}"`), a function call
+    /// (`event.payload.text.to_lower().contains("{kw}")`), or a
+    /// compound expression — whatever Rhai supports.
+    pub template: String,
+
+    /// Default values for the `{placeholder}` chips in `template`.
+    /// Keys MUST match the placeholder names. Lets the suggestion
+    /// land as a working expression even before the operator
+    /// edits it — they can run it as-is for the most common case
+    /// and tweak from there. Empty map = no defaults; the
+    /// placeholders stay empty until the operator fills them.
+    #[serde(default)]
+    pub defaults: BTreeMap<String, String>,
 }
 
 /// How the plugin's code actually runs.
@@ -1338,7 +1445,7 @@ mod tests {
         let m = PluginManifest::parse(SIGNAL_MANIFEST)
             .expect("plugins/signal/plugin.toml must parse cleanly");
         assert_eq!(m.plugin.id, "signal");
-        assert_eq!(m.plugin.version, "0.5.1");
+        assert_eq!(m.plugin.version, "0.5.2");
         // The transport icon must propagate from manifest → SDK so
         // the SPA's sidebar can render a Signal-shaped marker on
         // bridged threads. The SPA's ChannelIcon has a brand-SVG
@@ -1451,7 +1558,7 @@ mod tests {
         let m = PluginManifest::parse(DISCORD_MANIFEST)
             .expect("plugins/discord/plugin.toml must parse cleanly");
         assert_eq!(m.plugin.id, "discord");
-        assert_eq!(m.plugin.version, "0.2.1");
+        assert_eq!(m.plugin.version, "0.2.2");
 
         let transport = m.transport.as_ref().expect("[transport] must be present");
         assert_eq!(transport.transport_id, "discord");
@@ -1525,7 +1632,7 @@ mod tests {
         let m = PluginManifest::parse(GOOGLE_APPS_MANIFEST)
             .expect("plugins/google-apps/plugin.toml must parse cleanly");
         assert_eq!(m.plugin.id, "google-apps");
-        assert_eq!(m.plugin.version, "0.3.1");
+        assert_eq!(m.plugin.version, "0.3.2");
 
         // Identity provider survives the consolidation — same shape
         // as google-contacts had.
@@ -1807,6 +1914,83 @@ mod tests {
         assert!(!h.supports_attachments);
         assert!(!h.supports_markdown);
         assert!(h.max_attachment_size_bytes.is_none());
+    }
+
+    #[test]
+    fn parses_branch_suggestions() {
+        // Three suggestions covering the v1 shape:
+        //   (1) Slack channel-name split with a default value.
+        //   (2) WhatsApp DM-vs-group boolean (no placeholders, no defaults).
+        //   (3) Open-ended Rhai expression with two placeholders + defaults.
+        // Together they exercise: when_active gating, empty defaults,
+        // multiple placeholders, multiple suggestions in one manifest.
+        let s = r#"
+            [plugin]
+            id = "slack"
+            name = "Slack"
+            version = "0.4.0"
+
+            [[branch_suggestions]]
+            event_kind   = "chat.prompt"
+            when_active  = 'event.payload.channel == "slack"'
+            display_name = "By Slack channel name"
+            description  = "Different agent behavior per #channel."
+            template     = 'event.payload.slack.channel_name == "{channel_name}"'
+            defaults     = { channel_name = "general" }
+
+            [[branch_suggestions]]
+            event_kind   = "chat.prompt"
+            when_active  = 'event.payload.channel == "whatsapp"'
+            display_name = "Group vs DM"
+            template     = 'event.payload.is_group'
+
+            [[branch_suggestions]]
+            event_kind   = "chat.prompt"
+            display_name = "By keyword in message text"
+            description  = "Quick keyword routing — useful for handing 'urgent' to a higher-trust flow."
+            template     = 'event.payload.text.to_lower().contains("{keyword}") && {min_priority}'
+            defaults     = { keyword = "urgent", min_priority = "true" }
+        "#;
+        let m = PluginManifest::parse(s).unwrap();
+        assert_eq!(m.branch_suggestions.len(), 3);
+
+        let slack = &m.branch_suggestions[0];
+        assert_eq!(slack.event_kind, "chat.prompt");
+        assert_eq!(
+            slack.when_active.as_deref(),
+            Some(r#"event.payload.channel == "slack""#)
+        );
+        assert_eq!(slack.display_name, "By Slack channel name");
+        assert_eq!(slack.defaults.get("channel_name").map(|s| s.as_str()), Some("general"));
+
+        // Empty when_active + empty defaults are valid (a pure
+        // boolean-payload-field suggestion).
+        let wa = &m.branch_suggestions[1];
+        assert!(wa.defaults.is_empty());
+        assert!(wa.when_active.is_some());
+        assert_eq!(wa.template, "event.payload.is_group");
+
+        // Multi-placeholder template with multiple defaults.
+        let kw = &m.branch_suggestions[2];
+        assert_eq!(kw.defaults.len(), 2);
+        assert!(kw.template.contains("{keyword}"));
+        assert!(kw.template.contains("{min_priority}"));
+        // No when_active → suggestion is universally relevant for chat.prompt.
+        assert!(kw.when_active.is_none());
+    }
+
+    #[test]
+    fn branch_suggestions_default_to_empty_when_omitted() {
+        // Plugins that don't ship suggestions parse cleanly — the
+        // field is purely additive.
+        let s = r#"
+            [plugin]
+            id = "no-suggestions"
+            name = "X"
+            version = "0.1.0"
+        "#;
+        let m = PluginManifest::parse(s).unwrap();
+        assert!(m.branch_suggestions.is_empty());
     }
 
     #[test]

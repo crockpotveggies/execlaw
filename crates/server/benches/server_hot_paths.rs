@@ -797,7 +797,7 @@ fn bench_flow_middleware(c: &mut Criterion) {
     use execlaw_server::routes::test_app_state;
 
     let state_empty = test_app_state();
-    let evt = build_chat_prompt_event("conv-bench", "hello world", Some("op"), "web", &[]);
+    let evt = build_chat_prompt_event("conv-bench", "hello world", Some("op"), "web", &[], None);
 
     c.bench_function("flow_middleware/evaluate_zero_flows", |b| {
         b.iter(|| {
