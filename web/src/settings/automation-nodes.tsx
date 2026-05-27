@@ -39,6 +39,10 @@ interface KindStyle {
 const STYLES: Record<string, KindStyle> = {
     // $accent (controller blue)
     Trigger: { bg: "rgba(68, 147, 248, 0.18)", border: "#4493f8", icon: "bi-lightning-charge-fill" },
+    // muted dark gray — the End sentinel reads as "structure", not
+    // a content node. Distinct from Terminal so the operator can
+    // tell them apart at a glance.
+    End: { bg: "rgba(125, 133, 144, 0.10)", border: "#7d8590", icon: "bi-flag-fill" },
     // $warning (amber)
     Filter: { bg: "rgba(210, 153, 34, 0.18)", border: "#d29922", icon: "bi-funnel" },
     // $success (green)
@@ -47,12 +51,35 @@ const STYLES: Record<string, KindStyle> = {
     Branch: { bg: "rgba(163, 113, 247, 0.18)", border: "#a371f7", icon: "bi-signpost-split" },
     // $text-muted
     Terminal: { bg: "rgba(125, 133, 144, 0.18)", border: "#7d8590", icon: "bi-stop-circle" },
+    // soft yellow — pre-turn prompt mutator, visually adjacent to
+    // Transform (the existing Rhai-value-expr node) but a distinct
+    // hue so authors can pick it out in a glance.
+    RewritePrompt: { bg: "rgba(245, 204, 84, 0.18)", border: "#f5cc54", icon: "bi-pencil-square" },
+    // Phase B mutator palette — each gets its own hue so a glance
+    // tells the operator which kind a tile is. Colors picked from
+    // the theme palette family adjacent to RewritePrompt's yellow
+    // without competing with the existing brights (Filter amber,
+    // Transform green, etc.).
+    // sky cyan — additive skills tile
+    SetSkills: { bg: "rgba(125, 211, 252, 0.18)", border: "#7dd3fc", icon: "bi-magic" },
+    // lime — additive tools tile, distinct from CallPlugin's blue
+    SetTools: { bg: "rgba(190, 242, 100, 0.18)", border: "#bef264", icon: "bi-tools" },
+    // rose — scalar trust override carries a "be careful" feel
+    SetTrust: { bg: "rgba(253, 164, 175, 0.18)", border: "#fda4af", icon: "bi-shield-fill-exclamation" },
+    // soft purple — additive attachment IDs, kept close to Branch
+    AddAttachment: { bg: "rgba(196, 181, 253, 0.18)", border: "#c4b5fd", icon: "bi-paperclip" },
+    // warm sand — memory injection, distinct content from
+    // RewritePrompt's pencil
+    AddMemory: { bg: "rgba(252, 211, 77, 0.18)", border: "#fcd34d", icon: "bi-journal-text" },
     // orange — agent identity color, kept distinct from amber Filter
     AskAgent: { bg: "rgba(255, 138, 56, 0.18)", border: "#ff8a38", icon: "bi-robot" },
     // $danger (red) — alarm tile
     Notify: { bg: "rgba(248, 81, 73, 0.18)", border: "#f85149", icon: "bi-bell-fill" },
     // $info (lighter blue) — sits beside Trigger without conflicting
     CallPlugin: { bg: "rgba(88, 166, 255, 0.18)", border: "#58a6ff", icon: "bi-puzzle" },
+    // teal — distinct outbound-reply identity, sits between Transform's
+    // green and Trigger's blue without overlapping either
+    SendReply: { bg: "rgba(45, 212, 191, 0.18)", border: "#2dd4bf", icon: "bi-reply-fill" },
 };
 
 function nodeShellStyle(
@@ -119,10 +146,29 @@ function NodeDetail({ detail }: { detail?: string }) {
 export function TriggerNode(props: NodeProps) {
     const data = props.data as unknown as CanvasNodeData;
     return (
-        <div style={nodeShellStyle("Trigger", !!data.selected)}>
+        <div
+            style={nodeShellStyle("Trigger", !!props.selected)}
+            data-testid="node-trigger"
+        >
             <NodeHeader kind="Trigger" label={data.label} />
-            <NodeDetail detail={data.detail} />
+            <NodeDetail detail={data.detail ?? "Click to edit kind & filter"} />
             <Handle type="source" position={Position.Bottom} />
+        </div>
+    );
+}
+
+/// The flow's synthetic terminal sentinel. Like the Trigger it's
+/// not in `def.nodes` — operators can't delete or rename it; they
+/// route their final node's outgoing edge into the End sentinel and
+/// the runtime treats that as the flow's success terminus.
+export function EndNode(props: NodeProps) {
+    const data = props.data as unknown as CanvasNodeData;
+    return (
+        <div style={nodeShellStyle("End", !!data.selected)}>
+            <Handle type="target" position={Position.Top} />
+            <NodeHeader kind="End" label={data.label} />
+            <NodeDetail detail={data.detail} />
+            {/* No source handle — the flow stops here. */}
         </div>
     );
 }
@@ -175,6 +221,78 @@ export function TerminalNode(props: NodeProps) {
     );
 }
 
+export function RewritePromptNode(props: NodeProps) {
+    const data = props.data as unknown as CanvasNodeData;
+    return (
+        <div style={nodeShellStyle("RewritePrompt", !!data.selected)} data-testid={`node-${props.id}`}>
+            <Handle type="target" position={Position.Top} />
+            <NodeHeader kind="RewritePrompt" label={data.label} />
+            <NodeDetail detail={data.detail} />
+            <Handle type="source" position={Position.Bottom} />
+        </div>
+    );
+}
+
+export function SetSkillsNode(props: NodeProps) {
+    const data = props.data as unknown as CanvasNodeData;
+    return (
+        <div style={nodeShellStyle("SetSkills", !!data.selected)} data-testid={`node-${props.id}`}>
+            <Handle type="target" position={Position.Top} />
+            <NodeHeader kind="SetSkills" label={data.label} />
+            <NodeDetail detail={data.detail} />
+            <Handle type="source" position={Position.Bottom} />
+        </div>
+    );
+}
+
+export function SetToolsNode(props: NodeProps) {
+    const data = props.data as unknown as CanvasNodeData;
+    return (
+        <div style={nodeShellStyle("SetTools", !!data.selected)} data-testid={`node-${props.id}`}>
+            <Handle type="target" position={Position.Top} />
+            <NodeHeader kind="SetTools" label={data.label} />
+            <NodeDetail detail={data.detail} />
+            <Handle type="source" position={Position.Bottom} />
+        </div>
+    );
+}
+
+export function SetTrustNode(props: NodeProps) {
+    const data = props.data as unknown as CanvasNodeData;
+    return (
+        <div style={nodeShellStyle("SetTrust", !!data.selected)} data-testid={`node-${props.id}`}>
+            <Handle type="target" position={Position.Top} />
+            <NodeHeader kind="SetTrust" label={data.label} />
+            <NodeDetail detail={data.detail} />
+            <Handle type="source" position={Position.Bottom} />
+        </div>
+    );
+}
+
+export function AddAttachmentNode(props: NodeProps) {
+    const data = props.data as unknown as CanvasNodeData;
+    return (
+        <div style={nodeShellStyle("AddAttachment", !!data.selected)} data-testid={`node-${props.id}`}>
+            <Handle type="target" position={Position.Top} />
+            <NodeHeader kind="AddAttachment" label={data.label} />
+            <NodeDetail detail={data.detail} />
+            <Handle type="source" position={Position.Bottom} />
+        </div>
+    );
+}
+
+export function AddMemoryNode(props: NodeProps) {
+    const data = props.data as unknown as CanvasNodeData;
+    return (
+        <div style={nodeShellStyle("AddMemory", !!data.selected)} data-testid={`node-${props.id}`}>
+            <Handle type="target" position={Position.Top} />
+            <NodeHeader kind="AddMemory" label={data.label} />
+            <NodeDetail detail={data.detail} />
+            <Handle type="source" position={Position.Bottom} />
+        </div>
+    );
+}
+
 export function AskAgentNode(props: NodeProps) {
     const data = props.data as unknown as CanvasNodeData;
     return (
@@ -211,16 +329,36 @@ export function CallPluginNode(props: NodeProps) {
     );
 }
 
+export function SendReplyNode(props: NodeProps) {
+    const data = props.data as unknown as CanvasNodeData;
+    return (
+        <div style={nodeShellStyle("SendReply", !!data.selected)} data-testid={`node-${props.id}`}>
+            <Handle type="target" position={Position.Top} />
+            <NodeHeader kind="SendReply" label={data.label} />
+            <NodeDetail detail={data.detail ?? "Reply via envelope.origin"} />
+            <Handle type="source" position={Position.Bottom} />
+        </div>
+    );
+}
+
 /** Map ReactFlow `type` string → React component for `nodeTypes`. */
 export const NODE_TYPES = {
     Trigger: TriggerNode,
+    End: EndNode,
     Filter: FilterNode,
     Transform: TransformNode,
     Branch: BranchNode,
     Terminal: TerminalNode,
+    RewritePrompt: RewritePromptNode,
+    SetSkills: SetSkillsNode,
+    SetTools: SetToolsNode,
+    SetTrust: SetTrustNode,
+    AddAttachment: AddAttachmentNode,
+    AddMemory: AddMemoryNode,
     AskAgent: AskAgentNode,
     Notify: NotifyNode,
     CallPlugin: CallPluginNode,
+    SendReply: SendReplyNode,
 } as const;
 
 export const KIND_ICONS: Record<string, string> = {
@@ -228,9 +366,16 @@ export const KIND_ICONS: Record<string, string> = {
     Transform: STYLES.Transform.icon,
     Branch: STYLES.Branch.icon,
     Terminal: STYLES.Terminal.icon,
+    RewritePrompt: STYLES.RewritePrompt.icon,
+    SetSkills: STYLES.SetSkills.icon,
+    SetTools: STYLES.SetTools.icon,
+    SetTrust: STYLES.SetTrust.icon,
+    AddAttachment: STYLES.AddAttachment.icon,
+    AddMemory: STYLES.AddMemory.icon,
     AskAgent: STYLES.AskAgent.icon,
     Notify: STYLES.Notify.icon,
     CallPlugin: STYLES.CallPlugin.icon,
+    SendReply: STYLES.SendReply.icon,
 };
 
 export const KIND_COLORS: Record<string, string> = {
@@ -238,7 +383,14 @@ export const KIND_COLORS: Record<string, string> = {
     Transform: STYLES.Transform.border,
     Branch: STYLES.Branch.border,
     Terminal: STYLES.Terminal.border,
+    RewritePrompt: STYLES.RewritePrompt.border,
+    SetSkills: STYLES.SetSkills.border,
+    SetTools: STYLES.SetTools.border,
+    SetTrust: STYLES.SetTrust.border,
+    AddAttachment: STYLES.AddAttachment.border,
+    AddMemory: STYLES.AddMemory.border,
     AskAgent: STYLES.AskAgent.border,
     Notify: STYLES.Notify.border,
     CallPlugin: STYLES.CallPlugin.border,
+    SendReply: STYLES.SendReply.border,
 };

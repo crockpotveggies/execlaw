@@ -1,4 +1,4 @@
-//! Integration tests for host-enforced webhook authentication.
+﻿//! Integration tests for host-enforced webhook authentication.
 //!
 //! Covers the security regression from the 2026-05 audit: webhook
 //! POSTs were being persisted to the automation bus BEFORE the
@@ -11,13 +11,12 @@
 //!   1. Wire-level: 401 vs 200 on the HTTP response.
 //!   2. Durable: the `state_bus_events` table is or isn't populated.
 //!
-//! These are the regression tests the audit specifically asked for —
+//! These are the regression tests the audit specifically asked for â€”
 //! "add tests proving invalid webhook tokens do not create bus
 //! events or automation runs."
 
 use axum::body::{self, Body};
 use axum::http::{Method, Request, StatusCode, header};
-use execlaw_core::automation_bus::{BusEventKind, BusEventStore};
 use execlaw_core::db::{Database, DbConfig};
 use execlaw_core::migrations::MigrationRunner;
 use execlaw_core::vault_row::VaultRowStore;
@@ -74,7 +73,7 @@ tier = "script"
 source = "main.rhai"
 "#;
 
-/// Legacy plugin — no `auth` field. Asserts the dispatcher preserves
+/// Legacy plugin â€” no `auth` field. Asserts the dispatcher preserves
 /// today's behavior (handler validates) for backward compatibility.
 const MANIFEST_LEGACY: &str = r#"
 [plugin]
@@ -95,7 +94,7 @@ source = "main.rhai"
 
 const SCRIPT: &str = r#"
 fn on_event(args) {
-    // Handler doesn't re-check auth — the test is asserting the
+    // Handler doesn't re-check auth â€” the test is asserting the
     // host's check. A 200 from this means the host let us through.
     #{ "ok": true }
 }
@@ -164,14 +163,11 @@ fn build_app(stage_root: std::path::PathBuf) -> (axum::Router, AppState) {
         host_transports: execlaw_server::transport_registry::HostTransportRegistry::new(),
         skill_capture: execlaw_skills::AutoCaptureSink::noop(),
         reuse_update: execlaw_skills::ReuseUpdateSink::noop(),
-        automation_bus: execlaw_server::automation_bus::AutomationBus::stub(db),
-        automation_agent_pool: execlaw_server::automation_agent::AutomationsAgentPool::new(
-            std::sync::Arc::new(execlaw_server::automation_agent::StubAgentInvoker::err(
-                "test pool: no LLM",
-            )),
-        ),
         data_dir: std::env::temp_dir().join(format!("execlaw-test-{}", uuid::Uuid::new_v4())),
         inference_metrics: execlaw_server::inference_metrics::InferenceMetrics::new(),
+        personality_cache: std::sync::Arc::new(
+            execlaw_server::personality_cache::PersonalityCache::new(),
+        ),
     };
     (execlaw_server::routes::build_router(state.clone()), state)
 }
@@ -231,14 +227,8 @@ async fn post_webhook(
     (status, body_bytes.to_vec())
 }
 
-fn count_webhook_events(state: &AppState) -> usize {
-    BusEventStore::new(&state.db)
-        .list_recent_for_kind(BusEventKind::WebhookReceived, 100)
-        .unwrap()
-        .len()
-}
 
-/// Critical: missing token → 401, NO bus event, NO handler call.
+/// Critical: missing token â†’ 401, NO bus event, NO handler call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn query_token_missing_rejects_with_no_bus_event() {
     let tmp = tempfile::tempdir().unwrap();
@@ -249,14 +239,9 @@ async fn query_token_missing_rejects_with_no_bus_event() {
     let (status, _body) =
         post_webhook(app, "/api/webhooks/wh-test/event", &[], br#"{"hello":1}"#).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(
-        count_webhook_events(&state),
-        0,
-        "missing token must NOT create a bus event"
-    );
 }
 
-/// Critical: wrong token → 401, NO bus event.
+/// Critical: wrong token â†’ 401, NO bus event.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn query_token_mismatch_rejects_with_no_bus_event() {
     let tmp = tempfile::tempdir().unwrap();
@@ -272,22 +257,17 @@ async fn query_token_mismatch_rejects_with_no_bus_event() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(
-        count_webhook_events(&state),
-        0,
-        "wrong token must NOT create a bus event"
-    );
 }
 
-/// Critical: vault row absent → 401, NO bus event, even if caller
+/// Critical: vault row absent â†’ 401, NO bus event, even if caller
 /// supplied an empty `?token=`. A missing secret is not "no auth
-/// required" — it's a misconfigured plugin and must fail closed.
+/// required" â€” it's a misconfigured plugin and must fail closed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn query_token_with_missing_vault_row_rejects() {
     let tmp = tempfile::tempdir().unwrap();
-    let (app, state) = build_app(tmp.path().to_path_buf());
+    let (app, _state) = build_app(tmp.path().to_path_buf());
     install_plugin(app.clone(), MANIFEST_QUERY_TOKEN).await;
-    // NOTE: deliberately not calling seed_secret — the vault row
+    // NOTE: deliberately not calling seed_secret â€” the vault row
     // is missing.
 
     let (status, _body) = post_webhook(
@@ -298,10 +278,9 @@ async fn query_token_with_missing_vault_row_rejects() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(count_webhook_events(&state), 0);
 }
 
-/// Happy path: correct token → 200 from handler AND a bus event.
+/// Happy path: correct token â†’ 200 from handler AND a bus event.
 /// Bus event payload must NOT contain the literal secret (the
 /// `token` query key is redacted).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -320,28 +299,13 @@ async fn query_token_valid_accepts_and_redacts_payload() {
         String::from_utf8_lossy(&resp_body)
     );
 
-    let events = BusEventStore::new(&state.db)
-        .list_recent_for_kind(BusEventKind::WebhookReceived, 10)
-        .unwrap();
-    assert_eq!(
-        events.len(),
-        1,
-        "valid token must create exactly one bus event"
-    );
-    let payload = &events[0].payload;
-    // Persisted payload's query.token must be redacted.
-    assert_eq!(
-        payload["query"]["token"], "<redacted>",
-        "secret must be redacted in persisted payload"
-    );
-    let payload_str = serde_json::to_string(payload).unwrap();
-    assert!(
-        !payload_str.contains(WEBHOOK_SECRET),
-        "secret leaked into persisted payload: {payload_str}"
-    );
+    // 2026-05-22 — bus removed in M6 rip-out. Bus-event persistence
+    // assertions retired; the success-status assertion above is the
+    // meaningful contract for this test. Payload redaction moves
+    // to a plugin-level test if/when reintroduced.
 }
 
-/// HMAC-SHA256 header auth: matching signature → 200 + bus event.
+/// HMAC-SHA256 header auth: matching signature â†’ 200 + bus event.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hmac_header_valid_accepts() {
     let tmp = tempfile::tempdir().unwrap();
@@ -362,10 +326,9 @@ async fn hmac_header_valid_accepts() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(count_webhook_events(&state), 1);
 }
 
-/// HMAC-SHA256 header auth: wrong signature → 401, no bus event.
+/// HMAC-SHA256 header auth: wrong signature â†’ 401, no bus event.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hmac_header_mismatch_rejects() {
     let tmp = tempfile::tempdir().unwrap();
@@ -387,10 +350,9 @@ async fn hmac_header_mismatch_rejects() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(count_webhook_events(&state), 0);
 }
 
-/// HMAC-SHA256 header auth: signature header absent entirely → 401.
+/// HMAC-SHA256 header auth: signature header absent entirely â†’ 401.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hmac_header_missing_rejects() {
     let tmp = tempfile::tempdir().unwrap();
@@ -406,11 +368,10 @@ async fn hmac_header_missing_rejects() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(count_webhook_events(&state), 0);
 }
 
 /// Backward compatibility: a plugin manifest with NO `auth` field
-/// still works — the dispatcher falls back to the legacy "handler
+/// still works â€” the dispatcher falls back to the legacy "handler
 /// validates" model and the bus event IS published. This preserves
 /// today's behavior for any external plugin not yet migrated to
 /// host-enforced auth. The deprecation warning is logged (we don't
@@ -418,7 +379,7 @@ async fn hmac_header_missing_rejects() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_no_auth_field_still_dispatches() {
     let tmp = tempfile::tempdir().unwrap();
-    let (app, state) = build_app(tmp.path().to_path_buf());
+    let (app, _state) = build_app(tmp.path().to_path_buf());
     install_plugin(app.clone(), MANIFEST_LEGACY).await;
 
     let (status, _) = post_webhook(
@@ -433,11 +394,6 @@ async fn legacy_no_auth_field_still_dispatches() {
         StatusCode::OK,
         "manifest without `auth` must still dispatch (legacy compat)"
     );
-    assert_eq!(
-        count_webhook_events(&state),
-        1,
-        "legacy mode still publishes a bus event"
-    );
 }
 
 /// Legacy mode also redacts common secret query keys from the
@@ -449,7 +405,7 @@ async fn legacy_no_auth_field_still_dispatches() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_mode_still_redacts_known_secret_keys() {
     let tmp = tempfile::tempdir().unwrap();
-    let (app, state) = build_app(tmp.path().to_path_buf());
+    let (app, _state) = build_app(tmp.path().to_path_buf());
     install_plugin(app.clone(), MANIFEST_LEGACY).await;
 
     let (status, _) = post_webhook(
@@ -460,10 +416,6 @@ async fn legacy_mode_still_redacts_known_secret_keys() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let events = BusEventStore::new(&state.db)
-        .list_recent_for_kind(BusEventKind::WebhookReceived, 10)
-        .unwrap();
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].payload["query"]["token"], "<redacted>");
-    assert_eq!(events[0].payload["query"]["user"], "alice");
+    // 2026-05-22 — bus removed; persisted-payload-redaction check
+    // moves to a follow-up plugin-level test.
 }

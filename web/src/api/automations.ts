@@ -9,24 +9,53 @@ import { ApiError, apiFetch } from "./client";
 
 // ---- Wire shapes (mirror Rust DTOs in server/automations_admin.rs) ----
 
-export type BusEventKind =
-    | "webhook.received"
-    | "socket.message"
-    | "plugin.emit"
-    | "routine.fired"
-    | "other";
+/**
+ * Bus-event kind. Open alphabet — any dotted string is valid; plugins
+ * declare their own kinds via the registry (see RegisteredEventKind).
+ * The canonical list at runtime comes from
+ * `/api/admin/automations/registered-events`.
+ *
+ * The constants below are the well-known kinds that ship with core or
+ * are referenced in legacy code paths; the type stays `string` so
+ * plugin-defined kinds work too.
+ */
+export type BusEventKind = string;
+
+export const KNOWN_BUS_EVENT_KINDS = [
+    "webhook.received",
+    "socket.message",
+    "plugin.emit",
+    "routine.fired",
+    "web.prompt.submitted",
+    "other",
+] as const;
 
 export type NodeKind =
     | "Filter"
     | "Transform"
     | "Branch"
     | "Terminal"
+    // Phase A of the Flows middleware redesign (2026-05-22):
+    // rewrites the user-facing prompt the chat turn driver sees.
+    // Config: { expr: "<Rhai expression returning a string>" }
+    | "RewritePrompt"
+    // Phase B mutators (2026-05-22): pre-turn middleware that
+    // mutates the chat handler's effective inputs before the turn
+    // driver runs. SetSkills/SetTools/AddAttachment/AddMemory are
+    // additive lists; SetTrust is a scalar override.
+    | "SetSkills"     // { skills: ["name", ...] }
+    | "SetTools"      // { tools: ["name", ...] }
+    | "SetTrust"      // { trust: "controller"|"known_high"|... }
+    | "AddAttachment" // { attachment_ids: ["id", ...] }
+    | "AddMemory"     // { text: "string" }
     | "AskAgent"
-    // Reserved (server-side validator rejects with NotYetImplemented):
+    | "Notify"
     | "CallPlugin"
+    // M6 — emits a reply through the ReplyRouter using envelope.origin
+    | "SendReply"
+    // Reserved (server-side validator rejects with NotYetImplemented):
     | "AppendToChat"
     | "HttpFetch"
-    | "Notify"
     | "AwaitApproval"
     | "CallAutomation"
     | "Parallel"
@@ -79,6 +108,14 @@ export interface AutomationView {
     definition: AutomationDef;
     created_at: number;
     updated_at: number;
+    /** M6 — `"operator"` | `"core"` | `"plugin:<id>"`. */
+    source?: string;
+    /** M6 — `true` when the operator has edited a non-operator row. */
+    operator_modified?: boolean;
+    /** M6 — convenience: `true` for core- + plugin-shipped defaults.
+     *  When true the SPA hides the delete button (server-side
+     *  delete returns 403 with code `automation_is_default`). */
+    is_default?: boolean;
 }
 
 export interface UpsertAutomationBody {
@@ -275,15 +312,66 @@ export interface RecentBusEvent {
     payload: unknown;
 }
 
+/**
+ * Origin reference — mirrors the Rust `OriginRef` enum's `serde(tag =
+ * "kind")` shape. Used in the test-run drawer to test envelope-gated
+ * trigger filters without having to wait for a real event of the
+ * matching kind.
+ */
+export type OriginRef =
+    | { kind: "web_socket_session"; session_id: string }
+    | {
+          kind: "plugin_channel";
+          plugin_id: string;
+          channel_ref: unknown;
+          expires_at_ms?: number | null;
+      }
+    | { kind: "chat_append"; thread_id: string }
+    | { kind: "alert" }
+    | { kind: "none" };
+
+/** Mirrors the Rust `SenderIdentity` enum. */
+export type SenderIdentity =
+    | { kind: "principal"; id: string; trust: TrustClass }
+    | {
+          kind: "external";
+          plugin_id: string;
+          handle: string;
+          trust: TrustClass;
+      }
+    | { kind: "system" };
+
+/** Trust class — keep in lockstep with Rust `core::trust::TrustClass`.
+ *  Lower-cased per `#[serde(rename_all = "snake_case")]`. */
+export type TrustClass =
+    | "controller"
+    | "known_high"
+    | "known_limited"
+    | "cold_contact"
+    | "blocked";
+
+export interface EventEnvelope {
+    origin: OriginRef;
+    identity: SenderIdentity;
+    correlation_id: string;
+    parent_event_id?: string | null;
+}
+
 export interface SampleEventBody {
     kind: BusEventKind;
     source: string;
     payload: unknown;
+    /** Optional envelope. When omitted the server defaults to
+     *  `EventEnvelope::system_internal()`. */
+    envelope?: EventEnvelope;
 }
 
 export interface TestRunRequest {
     event_id?: string;
     sample_event?: SampleEventBody;
+    /** Caller-supplied run id. When set, FlowChannelHub publishes
+     *  under this id so SSE subscribers can correlate. */
+    client_run_id?: string;
 }
 
 export async function testRunAutomation(
@@ -311,6 +399,98 @@ export async function listRecentBusEvents(
     );
 }
 
+// ---- M6 registry inspection ----
+
+export interface RegisteredEventKind {
+    kind: string;
+    source: string;
+    description: string;
+    payload_schema?: unknown;
+    expects_reply: boolean;
+    default_origin_kind: string;
+}
+
+export interface RegisteredReplyHandler {
+    name: string;
+    plugin_id: string;
+    description: string;
+    supports_streaming: boolean;
+    supports_attachments: boolean;
+    supports_inline_chart: boolean;
+    supports_table: boolean;
+    supports_card: boolean;
+    supports_markdown: boolean;
+    max_attachment_size_bytes?: number;
+    max_attachments_per_message?: number;
+    max_text_length?: number;
+    allowed_mime_prefixes?: string[];
+}
+
+export interface DefaultFlowSummary {
+    id: string;
+    name: string;
+    enabled: boolean;
+    source: string;
+    source_version?: string;
+    operator_modified: boolean;
+}
+
+export async function listRegisteredEvents(
+    tokenAccessor: () => string | null,
+): Promise<RegisteredEventKind[]> {
+    return apiFetch<RegisteredEventKind[]>(
+        `${BASE}/registered-events`,
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function listRegisteredReplyHandlers(
+    tokenAccessor: () => string | null,
+): Promise<RegisteredReplyHandler[]> {
+    return apiFetch<RegisteredReplyHandler[]>(
+        `${BASE}/registered-reply-handlers`,
+        {},
+        tokenAccessor,
+    );
+}
+
+export async function listDefaultFlows(
+    tokenAccessor: () => string | null,
+): Promise<DefaultFlowSummary[]> {
+    return apiFetch<DefaultFlowSummary[]>(
+        `${BASE}/default-flows`,
+        {},
+        tokenAccessor,
+    );
+}
+
+/** POST /api/web/prompt — M6 web-prompt entrypoint (shadow mode). */
+export interface SubmitPromptRequest {
+    text: string;
+    session_id: string;
+    conversation_id?: string;
+    attachment_ids?: string[];
+}
+
+export interface SubmitPromptResponse {
+    event_id: string;
+}
+
+export async function submitWebPrompt(
+    body: SubmitPromptRequest,
+    tokenAccessor: () => string | null,
+): Promise<SubmitPromptResponse> {
+    return apiFetch<SubmitPromptResponse>(
+        "/api/web/prompt",
+        {
+            method: "POST",
+            body,
+        },
+        tokenAccessor,
+    );
+}
+
 // ---- Helpers for templated defaults the UI uses ----
 
 /** Minimal valid graph: trigger → Terminal. Used as the seed when the
@@ -327,7 +507,13 @@ export function emptyAutomationDef(kind: BusEventKind = "webhook.received"): Aut
     };
 }
 
-/** Friendly label for the trigger-kind dropdown. */
+/** Friendly label for a trigger-kind shown in dropdowns and badges.
+ *
+ *  With BusEventKind open to plugin-defined kinds, we humanize the
+ *  dotted form: `whatsapp.message.received` -> "WhatsApp message
+ *  received". The registry's `description` field (when available) is a
+ *  better source, but callers without registry context fall through to
+ *  this. */
 export function kindLabel(k: BusEventKind): string {
     switch (k) {
         case "webhook.received":
@@ -338,9 +524,18 @@ export function kindLabel(k: BusEventKind): string {
             return "Plugin emit";
         case "routine.fired":
             return "Routine fired";
+        case "web.prompt.submitted":
+            return "Web prompt submitted";
         case "other":
             return "Other";
     }
+    // Humanize plugin-declared kinds:
+    //   "whatsapp.message.received" -> "Whatsapp message received"
+    //   "calendar.event.starting_soon" -> "Calendar event starting soon"
+    if (!k) return "(unknown)";
+    const words = k.replace(/[._]/g, " ").trim();
+    if (words.length === 0) return k;
+    return words.charAt(0).toUpperCase() + words.slice(1).toLowerCase();
 }
 
 export function formatPercent(v: number | null): string {

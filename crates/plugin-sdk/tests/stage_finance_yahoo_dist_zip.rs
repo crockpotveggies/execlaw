@@ -15,13 +15,13 @@ fn dist_finance_yahoo_zip_stages_cleanly() {
         .unwrap()
         .parent()
         .unwrap();
-    let zip_path = workspace_root.join("dist").join("finance-yahoo-0.1.0.zip");
+    let zip_path = workspace_root.join("dist").join("finance-yahoo-0.2.2.zip");
     if !zip_path.exists() {
         // Fresh clones / CI may not have the zip yet — it's a release
         // artifact rebuilt by the packaging step, not a checked-in
         // dev requirement.
         eprintln!(
-            "dist/finance-yahoo-0.1.0.zip not present at {}; skipping",
+            "dist/finance-yahoo-0.2.2.zip not present at {}; skipping",
             zip_path.display()
         );
         return;
@@ -30,7 +30,7 @@ fn dist_finance_yahoo_zip_stages_cleanly() {
     let staged = stage_zip(BufReader::new(f)).expect("stage_zip must accept the dist zip");
 
     assert_eq!(staged.manifest.plugin.id, "finance-yahoo");
-    assert_eq!(staged.manifest.plugin.version, "0.1.0");
+    assert_eq!(staged.manifest.plugin.version, "0.2.2");
 
     // Pin the v0.1 tool surface — a regression that drops or renames
     // one of these breaks the agent's grounded tool definitions.

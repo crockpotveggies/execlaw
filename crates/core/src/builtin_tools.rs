@@ -1233,10 +1233,102 @@ struct WebFetchArgs {
     /// web_fetch → synthesise turns hit the model's context.
     #[serde(default = "default_web_fetch_max_chars")]
     max_chars: usize,
+    /// 2026-05-25 — when `true`, the response body is persisted as
+    /// a conversation attachment instead of being returned inline.
+    /// The tool returns `{attachment_id, mime_type, byte_len,
+    /// filename, final_url, status, truncated, sha256}` and the
+    /// model can hand the `attachment_id` to a downstream tool that
+    /// consumes attachments (notably `python.execute`, whose
+    /// pre-run hydrator drops conversation attachments into
+    /// `/work/<convo>/uploads/<filename>` so the sandbox kernel
+    /// can `pd.read_csv('/work/uploads/<filename>')` etc.).
+    ///
+    /// Bypasses the textual-content-type allowlist that the inline
+    /// path enforces — CSV, parquet, PNG, PDF, xlsx, etc. all
+    /// flow through. The 1 MiB HTTP-layer size cap still applies.
+    ///
+    /// Defaults to `false` for backward compatibility — existing
+    /// callers get the original text-body behavior unchanged.
+    #[serde(default)]
+    as_attachment: bool,
+    /// Optional filename for the attachment when `as_attachment`
+    /// is true. If unset, derived from the URL's final path segment
+    /// (e.g. `https://example.com/data/penguins.csv` → `penguins.csv`).
+    /// If the URL has no usable segment, falls back to `download.bin`.
+    /// The operator sees this in the attachment chip and the SPA's
+    /// save-as dialog; downstream `python.execute` looks for the
+    /// file at `/work/<convo>/uploads/<filename>`, so a stable,
+    /// reasonable name matters.
+    #[serde(default)]
+    filename: Option<String>,
 }
 
 fn default_web_fetch_max_chars() -> usize {
     3000
+}
+
+/// Derive an attachment filename from a URL when the caller didn't
+/// supply one. Prefers the URL's last path segment if it looks like
+/// a real filename (contains a `.`, no `/`, non-empty); otherwise
+/// returns a generic fallback the SPA can still display safely.
+///
+/// Examples:
+///   - `https://example.com/data/penguins.csv`        → `penguins.csv`
+///   - `https://example.com/api/items?fmt=json`        → `download.json` (via mime fallback)
+///   - `https://example.com/`                          → `download.bin`
+///
+/// MIME-derived extension fallback: if the URL has no usable
+/// segment, the caller's `mime_type` (when known) picks a sane
+/// extension so `pd.read_csv('/work/uploads/download.csv')` works
+/// even on `https://example.com/?id=42`-style endpoints.
+fn derive_attachment_filename(url: &str, content_type: Option<&str>) -> String {
+    // 1. Try the URL's last path segment. Done manually (rather than
+    //    pulling the `url` crate into core) because the logic we need
+    //    is "find the bit between the last `/` and the first `?`/`#`".
+    //    Skip the scheme + authority by splitting on `://` first; that
+    //    way `https://host/path?q` parses correctly without treating
+    //    `https:` as a path.
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    // The path starts after the first `/`. Drop the authority.
+    let path_and_query = after_scheme.split_once('/').map(|(_, rest)| rest).unwrap_or("");
+    // Strip query + fragment.
+    let path = path_and_query
+        .split_once(|c| c == '?' || c == '#')
+        .map(|(p, _)| p)
+        .unwrap_or(path_and_query);
+    if let Some(last) = path.rsplit('/').find(|s| !s.is_empty()) {
+        let trimmed = last.trim();
+        if !trimmed.is_empty() && trimmed.contains('.') && !trimmed.contains('/') {
+            return trimmed.to_owned();
+        }
+    }
+    // 2. Fall back to a generic name + MIME-derived extension.
+    let ext = content_type
+        .and_then(|ct| ct.split(';').next())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .and_then(|primary| match primary.as_str() {
+            "text/csv" => Some("csv"),
+            "text/tab-separated-values" => Some("tsv"),
+            "application/json" => Some("json"),
+            "application/xml" | "text/xml" => Some("xml"),
+            "text/html" => Some("html"),
+            "text/plain" => Some("txt"),
+            "application/pdf" => Some("pdf"),
+            "image/png" => Some("png"),
+            "image/jpeg" => Some("jpg"),
+            "image/gif" => Some("gif"),
+            "image/svg+xml" => Some("svg"),
+            "image/webp" => Some("webp"),
+            "application/zip" => Some("zip"),
+            "application/octet-stream" => Some("bin"),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => Some("xlsx"),
+            "application/vnd.apache.parquet" | "application/x-parquet" => Some("parquet"),
+            _ => None,
+        });
+    match ext {
+        Some(e) => format!("download.{e}"),
+        None => "download.bin".to_owned(),
+    }
 }
 
 fn default_allowed_for_web_fetch() -> Vec<String> {
@@ -1270,12 +1362,33 @@ impl WebFetchTool {
             descriptor: ToolDescriptor {
                 name: "web_fetch".into(),
                 description:
-                    "Fetch a URL via HTTP GET and return the response body as text. Limited to \
-                     http(s); private/loopback/link-local addresses are rejected; binary \
-                     content types are rejected. The agent-visible body is capped at 3000 chars \
-                     by default (override with `max_chars`, up to 50000) to keep multi-step \
-                     research flows from blowing the model's context window. Useful for reading \
-                     articles, JSON APIs, RSS feeds, and other public textual content."
+                    "Fetch a URL via HTTP GET. Two modes:\n\n\
+                     (1) Default — return the response body as text inline. \
+                     Limited to text/json/xml content types; binary types are \
+                     rejected. The agent-visible body is capped at 3000 chars \
+                     by default (override with `max_chars`, up to 50000) to keep \
+                     multi-step research flows from blowing the model's context \
+                     window. Useful for reading articles, JSON APIs, RSS feeds, \
+                     and other public textual content.\n\n\
+                     (2) `as_attachment: true` — persist the raw response bytes \
+                     as a conversation attachment and return \
+                     {attachment_id, mime_type, byte_len, filename, ...} \
+                     instead of an inline body. Use this to ingest CSV/parquet/\
+                     xlsx/PNG/PDF datasets that the python.execute sandbox \
+                     cannot fetch itself (the sandbox runs --network none). \
+                     The attachment is auto-hydrated into \
+                     `/work/<conversation_id>/uploads/<filename>` before the \
+                     next `python.execute` call, so the kernel can read it \
+                     directly: `pd.read_csv('/work/uploads/penguins.csv')`. \
+                     The content-type allowlist is NOT enforced in this mode \
+                     — binary downloads are the whole point. The 1 MiB \
+                     HTTP-layer size cap still applies.\n\n\
+                     Common pattern for `pull a remote dataset and analyse it`:\n  \
+                     1. web_fetch(url, as_attachment: true) → {attachment_id, filename: 'penguins.csv'}\n  \
+                     2. python.execute(code: \"import pandas as pd; df = pd.read_csv('/work/uploads/penguins.csv'); print(df.groupby('species').size().to_dict())\") → species counts\n  \
+                     3. chart.render(kind: 'bar', spec: {series: [...]}) → inline chart\n\n\
+                     Limited to http(s); private/loopback/link-local addresses \
+                     are rejected (SSRF guard)."
                         .into(),
                 schema: json!({
                     "type": "object",
@@ -1290,7 +1403,16 @@ impl WebFetchTool {
                             "default": 3000,
                             "minimum": 256,
                             "maximum": 50000,
-                            "description": "Cap on the returned body length (chars). Default 3000 (~750 tokens). Bump if the page is long and you need more — the response sets `truncated: true` when this fires."
+                            "description": "Cap on the returned body length (chars). Default 3000 (~750 tokens). Bump if the page is long and you need more — the response sets `truncated: true` when this fires. Ignored when as_attachment is true."
+                        },
+                        "as_attachment": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "When true, persist the raw response bytes as a conversation attachment and return {attachment_id, mime_type, byte_len, filename, final_url, status, truncated, sha256} instead of an inline body. The attachment is auto-hydrated into /work/<conversation_id>/uploads/<filename> before the next python.execute call. Binary content types are permitted in this mode."
+                        },
+                        "filename": {
+                            "type": "string",
+                            "description": "Optional filename for the persisted attachment. Defaults to the URL's last path segment (e.g. 'penguins.csv') or 'download.<ext>' derived from the response Content-Type when the URL has no usable segment. Only used when as_attachment is true."
                         }
                     },
                     "required": ["url"],
@@ -1298,7 +1420,13 @@ impl WebFetchTool {
                 }),
                 source: ToolSource::Builtin,
                 latency: ToolLatency::Medium,
-                capabilities: vec![Capability::WebFetch],
+                // Both capabilities are needed: WebFetch for the HTTP call,
+                // AttachmentSend so the dispatcher wires `ctx.attachments`
+                // — which the `as_attachment: true` branch uses to call
+                // `create_artifact`. The inline-body branch ignores the
+                // attachments handle, so non-attachment callers don't pay
+                // any extra cost.
+                capabilities: vec![Capability::WebFetch, Capability::AttachmentSend],
                 default_allowed_classes: default_allowed_for_web_fetch(),
             },
         }
@@ -1321,36 +1449,100 @@ impl ToolImpl for WebFetchTool {
                 return ToolOutcome::denied("web_fetch capability not granted to this tool");
             }
         };
-        // Cap the agent-visible body at `max_chars`. We slice on
-        // char boundaries — naive byte slicing would corrupt UTF-8
-        // mid-codepoint and the JSON serialisation downstream
-        // would error.
-        let cap = args.max_chars.clamp(256, 50_000);
-        match api.get(&args.url).await {
-            Ok(resp) => {
-                let (body, truncated_by_agent_cap) = if resp.body.chars().count() > cap {
-                    let mut s = String::with_capacity(cap + 8);
-                    for ch in resp.body.chars().take(cap) {
-                        s.push(ch);
+
+        // --- Branch (2): persist as conversation attachment --------
+        // This is the path that lets python.execute ingest remote
+        // datasets — the sandbox container runs `--network none`, so
+        // the agent CANNOT `pd.read_csv("https://…")` directly. The
+        // attachment lands in /work/<convo>/uploads/<filename> via
+        // the python_sandbox::hydrate_uploads pre-execute step.
+        if args.as_attachment {
+            let attachments = match ctx.attachments.as_ref() {
+                Some(a) => a,
+                None => {
+                    return ToolOutcome::denied(
+                        "web_fetch(as_attachment=true) requires the attachment-send capability \
+                         to be wired (dispatcher could not construct an AttachmentApi for this turn)",
+                    );
+                }
+            };
+            match api.get_bytes(&args.url).await {
+                Ok(resp) => {
+                    let mime_type = resp
+                        .content_type
+                        .as_deref()
+                        .and_then(|ct| ct.split(';').next().map(|s| s.trim().to_owned()))
+                        .unwrap_or_else(|| "application/octet-stream".to_owned());
+                    let filename = args
+                        .filename
+                        .clone()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            derive_attachment_filename(&resp.final_url, resp.content_type.as_deref())
+                        });
+                    let byte_len = resp.body.len();
+                    // Conversation-scoped attachment (state_attachments
+                    // row, NOT state_artifacts) so the python sandbox's
+                    // `hydrate_uploads` step picks it up by
+                    // `list_for_conversation(caller_conversation_id)`
+                    // and drops the bytes at /work/<convo>/uploads/
+                    // <filename> for the next python.execute call.
+                    match attachments
+                        .create_conversation_attachment(&filename, &mime_type, resp.body)
+                        .await
+                    {
+                        Ok(view) => ToolOutcome::Ok(json!({
+                            "attachment_id": view.attachment_id,
+                            "sha256": view.sha256,
+                            "byte_len": byte_len,
+                            "size_bytes": view.size_bytes,
+                            "filename": filename,
+                            "mime_type": mime_type,
+                            "final_url": resp.final_url,
+                            "status": resp.status,
+                            "truncated": resp.truncated,
+                            // Help the agent compose the next-turn path
+                            // without having to memorise the convention.
+                            "sandbox_path_hint": format!("/work/<conversation_id>/uploads/{filename}"),
+                        })),
+                        Err(e) => e.into_outcome(),
                     }
-                    s.push_str("\n…");
-                    (s, true)
-                } else {
-                    (resp.body, false)
-                };
-                ToolOutcome::Ok(json!({
-                    "final_url": resp.final_url,
-                    "status": resp.status,
-                    "content_type": resp.content_type,
-                    "body": body,
-                    // `truncated` is true if EITHER the HTTP-layer
-                    // cap (1 MiB) OR the agent-visible cap fired.
-                    // The agent doesn't need to distinguish — both
-                    // mean "request more via max_chars to see more".
-                    "truncated": resp.truncated || truncated_by_agent_cap,
-                }))
+                }
+                Err(e) => e.into_outcome(),
             }
-            Err(e) => e.into_outcome(),
+        } else {
+            // --- Branch (1): original text-body behavior, unchanged.
+            // Cap the agent-visible body at `max_chars`. We slice on
+            // char boundaries — naive byte slicing would corrupt UTF-8
+            // mid-codepoint and the JSON serialisation downstream
+            // would error.
+            let cap = args.max_chars.clamp(256, 50_000);
+            match api.get(&args.url).await {
+                Ok(resp) => {
+                    let (body, truncated_by_agent_cap) = if resp.body.chars().count() > cap {
+                        let mut s = String::with_capacity(cap + 8);
+                        for ch in resp.body.chars().take(cap) {
+                            s.push(ch);
+                        }
+                        s.push_str("\n…");
+                        (s, true)
+                    } else {
+                        (resp.body, false)
+                    };
+                    ToolOutcome::Ok(json!({
+                        "final_url": resp.final_url,
+                        "status": resp.status,
+                        "content_type": resp.content_type,
+                        "body": body,
+                        // `truncated` is true if EITHER the HTTP-layer
+                        // cap (1 MiB) OR the agent-visible cap fired.
+                        // The agent doesn't need to distinguish — both
+                        // mean "request more via max_chars to see more".
+                        "truncated": resp.truncated || truncated_by_agent_cap,
+                    }))
+                }
+                Err(e) => e.into_outcome(),
+            }
         }
     }
 }
@@ -4022,19 +4214,123 @@ mod tests {
 
     // --- web_fetch ----------------------------------------------------
 
-    use crate::tool::{WebFetchApi, WebFetchResponse};
+    use crate::tool::{
+        AttachmentApi, CreatedArtifactView, DeliveredAttachmentView, WebFetchApi, WebFetchBytes,
+        WebFetchResponse,
+    };
 
     /// Test stub for WebFetchApi — captures the URL the tool passed
     /// in and lets the test inject a canned response. Avoids hitting
     /// the network from `core`'s test suite.
+    ///
+    /// 2026-05-25 — also stubs `get_bytes` for the
+    /// `as_attachment: true` path. Cloning the textual body's
+    /// bytes is the default-impl fallback shape, but tests that
+    /// want to drive the binary path verbatim (e.g. with a non-UTF-8
+    /// byte sequence) set `canned_bytes` directly.
     struct StubWebFetchApi {
         canned: WebFetchResponse,
+        canned_bytes: Option<WebFetchBytes>,
     }
 
     #[async_trait]
     impl WebFetchApi for StubWebFetchApi {
         async fn get(&self, _url: &str) -> Result<WebFetchResponse, crate::tool::ApiError> {
             Ok(self.canned.clone())
+        }
+        async fn get_bytes(&self, _url: &str) -> Result<WebFetchBytes, crate::tool::ApiError> {
+            if let Some(b) = self.canned_bytes.clone() {
+                return Ok(b);
+            }
+            // Fall through to the textual canned response for
+            // tests that only need the bytes round-trip.
+            Ok(WebFetchBytes {
+                final_url: self.canned.final_url.clone(),
+                status: self.canned.status,
+                content_type: self.canned.content_type.clone(),
+                body: self.canned.body.as_bytes().to_vec(),
+                truncated: self.canned.truncated,
+            })
+        }
+    }
+
+    /// In-memory stub for AttachmentApi — records every
+    /// `create_conversation_attachment` call so tests can assert on
+    /// the filename / mime / payload that flowed through. Returns
+    /// a deterministic attachment_id derived from the payload's
+    /// sha so distinct calls land distinct ids.
+    struct StubAttachmentApi {
+        calls: std::sync::Mutex<Vec<(String, String, Vec<u8>)>>,
+    }
+
+    impl StubAttachmentApi {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn last_call(&self) -> Option<(String, String, Vec<u8>)> {
+            self.calls.lock().unwrap().last().cloned()
+        }
+    }
+
+    #[async_trait]
+    impl AttachmentApi for StubAttachmentApi {
+        async fn send(
+            &self,
+            _attachment_id: &str,
+            _caption: Option<&str>,
+        ) -> Result<DeliveredAttachmentView, crate::tool::ApiError> {
+            unimplemented!("send not exercised by web_fetch tests")
+        }
+        async fn create_artifact(
+            &self,
+            _filename: &str,
+            _mime_type: &str,
+            _bytes: Vec<u8>,
+            _ttl_seconds: Option<i64>,
+        ) -> Result<CreatedArtifactView, crate::tool::ApiError> {
+            // web_fetch deliberately calls `create_conversation_attachment`
+            // (not `create_artifact`) so this path lets us catch a
+            // regression that re-routes the tool to artifacts.
+            Err(crate::tool::ApiError::Storage(
+                "web_fetch must NOT call create_artifact — use create_conversation_attachment so \
+                 the python sandbox hydrator finds the row"
+                    .into(),
+            ))
+        }
+        async fn emit_chart_card(
+            &self,
+            _attachment_id: &str,
+            _svg: &str,
+            _filename: &str,
+            _title: Option<&str>,
+            _width: u32,
+            _height: u32,
+        ) -> Result<(), crate::tool::ApiError> {
+            unimplemented!("emit_chart_card not exercised by web_fetch tests")
+        }
+        async fn create_conversation_attachment(
+            &self,
+            filename: &str,
+            mime_type: &str,
+            bytes: Vec<u8>,
+        ) -> Result<CreatedArtifactView, crate::tool::ApiError> {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(&bytes);
+            let sha = format!("{:x}", h.finalize());
+            let attachment_id = format!("att-{}", &sha[..16]);
+            let size_bytes = bytes.len() as u64;
+            self.calls
+                .lock()
+                .unwrap()
+                .push((filename.to_owned(), mime_type.to_owned(), bytes));
+            Ok(CreatedArtifactView {
+                attachment_id,
+                sha256: sha,
+                size_bytes,
+            })
         }
     }
 
@@ -4045,9 +4341,30 @@ mod tests {
     ) -> ToolCtx {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let mut ctx = ToolCtx::empty(cid, "Controller", clock);
-        ctx.web_fetch = Some(Arc::new(StubWebFetchApi { canned }));
+        ctx.web_fetch = Some(Arc::new(StubWebFetchApi {
+            canned,
+            canned_bytes: None,
+        }));
         let _ = db; // db handle isn't needed for the stub variant.
         ctx
+    }
+
+    fn ctx_with_stub_web_fetch_and_attachments(
+        db: &Database,
+        cid: ConversationId,
+        canned: WebFetchResponse,
+        canned_bytes: Option<WebFetchBytes>,
+    ) -> (ToolCtx, Arc<StubAttachmentApi>) {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let mut ctx = ToolCtx::empty(cid, "Controller", clock);
+        ctx.web_fetch = Some(Arc::new(StubWebFetchApi {
+            canned,
+            canned_bytes,
+        }));
+        let stub_atts = Arc::new(StubAttachmentApi::new());
+        ctx.attachments = Some(stub_atts.clone());
+        let _ = db;
+        (ctx, stub_atts)
     }
 
     #[tokio::test]
@@ -4213,6 +4530,282 @@ mod tests {
             }
             other => panic!("expected Denied, got {other:?}"),
         }
+    }
+
+    // --- web_fetch as_attachment path (Slice F) -----------------------
+    //
+    // The `as_attachment: true` branch lets the agent ingest a remote
+    // dataset (CSV / parquet / xlsx) that the python.execute sandbox
+    // can't fetch itself (--network none). The contract:
+    //   1. Tool returns {attachment_id, mime_type, byte_len, filename,
+    //      final_url, status, sandbox_path_hint, ...} instead of inline body.
+    //   2. The attachment is conversation-scoped (state_attachments,
+    //      not state_artifacts) so the python sandbox hydrator picks
+    //      it up on the next execute call.
+    //   3. The filename derives from the URL path segment when the
+    //      caller didn't supply one.
+    //   4. Without `Capability::AttachmentSend` wired, the path fails
+    //      with a clean denial — not a panic, not silent data loss.
+
+    #[tokio::test]
+    async fn web_fetch_as_attachment_returns_attachment_id_and_metadata() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "wa-csv");
+        let csv = "species,count\nAdelie,152\nGentoo,124\nChinstrap,68\n";
+        let canned = WebFetchResponse {
+            final_url: "https://example.com/data/penguins.csv".into(),
+            status: 200,
+            content_type: Some("text/csv".into()),
+            body: csv.into(),
+            truncated: false,
+        };
+        let (ctx, stub_atts) =
+            ctx_with_stub_web_fetch_and_attachments(&db, cid, canned, None);
+        let out = WebFetchTool::new()
+            .invoke(
+                ctx,
+                json!({"url": "https://example.com/data/penguins.csv", "as_attachment": true}),
+            )
+            .await;
+        match out {
+            ToolOutcome::Ok(v) => {
+                // Attachment metadata shape — every field is what the
+                // agent will see in the next-turn tool_result and
+                // reach for when constructing its python.execute call.
+                assert!(v["attachment_id"].as_str().unwrap().starts_with("att-"));
+                assert_eq!(v["mime_type"], "text/csv");
+                assert_eq!(v["filename"], "penguins.csv");
+                assert_eq!(v["status"], 200);
+                assert_eq!(v["byte_len"], csv.len() as i64);
+                assert_eq!(v["final_url"], "https://example.com/data/penguins.csv");
+                // The hint points the model at the right sandbox path
+                // (the placeholder gets resolved by the SPA / agent's
+                // conversation-id substitution; we just verify the shape).
+                assert_eq!(
+                    v["sandbox_path_hint"],
+                    "/work/<conversation_id>/uploads/penguins.csv"
+                );
+                // No `body` field on the attachment path — that's the
+                // whole point of `as_attachment: true`.
+                assert!(v.get("body").is_none());
+                // Stub captured the call.
+                let (filename, mime, bytes) = stub_atts.last_call().expect("at least one call");
+                assert_eq!(filename, "penguins.csv");
+                assert_eq!(mime, "text/csv");
+                assert_eq!(bytes, csv.as_bytes());
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_as_attachment_strips_charset_suffix_from_mime() {
+        // `Content-Type: text/csv; charset=utf-8` should land as
+        // `mime_type: "text/csv"` in the attachment row — the charset
+        // suffix is for the wire, not the persistent record.
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "wa-mime");
+        let canned = WebFetchResponse {
+            final_url: "https://example.com/penguins.csv".into(),
+            status: 200,
+            content_type: Some("text/csv; charset=utf-8".into()),
+            body: "x".into(),
+            truncated: false,
+        };
+        let (ctx, stub_atts) =
+            ctx_with_stub_web_fetch_and_attachments(&db, cid, canned, None);
+        let out = WebFetchTool::new()
+            .invoke(
+                ctx,
+                json!({"url": "https://example.com/penguins.csv", "as_attachment": true}),
+            )
+            .await;
+        match out {
+            ToolOutcome::Ok(v) => {
+                assert_eq!(v["mime_type"], "text/csv");
+                let (_, mime, _) = stub_atts.last_call().unwrap();
+                assert_eq!(mime, "text/csv");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_as_attachment_derives_filename_from_url_when_unset() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "wa-fname-url");
+        let canned = WebFetchResponse {
+            final_url: "https://example.com/datasets/iris.parquet".into(),
+            status: 200,
+            content_type: Some("application/x-parquet".into()),
+            body: "binbody".into(),
+            truncated: false,
+        };
+        let (ctx, _) = ctx_with_stub_web_fetch_and_attachments(&db, cid, canned, None);
+        let out = WebFetchTool::new()
+            .invoke(
+                ctx,
+                json!({
+                    "url": "https://example.com/datasets/iris.parquet",
+                    "as_attachment": true
+                }),
+            )
+            .await;
+        match out {
+            ToolOutcome::Ok(v) => {
+                assert_eq!(v["filename"], "iris.parquet");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_as_attachment_uses_explicit_filename_when_supplied() {
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "wa-fname-arg");
+        let canned = WebFetchResponse {
+            final_url: "https://example.com/?id=42".into(),
+            status: 200,
+            content_type: Some("application/json".into()),
+            body: "{}".into(),
+            truncated: false,
+        };
+        let (ctx, _) = ctx_with_stub_web_fetch_and_attachments(&db, cid, canned, None);
+        let out = WebFetchTool::new()
+            .invoke(
+                ctx,
+                json!({
+                    "url": "https://example.com/?id=42",
+                    "as_attachment": true,
+                    "filename": "report.json"
+                }),
+            )
+            .await;
+        match out {
+            ToolOutcome::Ok(v) => {
+                assert_eq!(v["filename"], "report.json");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_as_attachment_falls_back_to_mime_extension_for_query_only_urls() {
+        // URL has no usable path segment (`example.com/?id=42`) — the
+        // filename should fall back to "download.<ext>" derived from
+        // the Content-Type.
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "wa-fallback");
+        let canned = WebFetchResponse {
+            final_url: "https://example.com/?id=42".into(),
+            status: 200,
+            content_type: Some("text/csv".into()),
+            body: "a,b\n1,2\n".into(),
+            truncated: false,
+        };
+        let (ctx, _) = ctx_with_stub_web_fetch_and_attachments(&db, cid, canned, None);
+        let out = WebFetchTool::new()
+            .invoke(
+                ctx,
+                json!({"url": "https://example.com/?id=42", "as_attachment": true}),
+            )
+            .await;
+        match out {
+            ToolOutcome::Ok(v) => {
+                assert_eq!(v["filename"], "download.csv");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_as_attachment_denied_when_attachment_capability_missing() {
+        // Without `ctx.attachments` wired, the path fails cleanly so
+        // the agent gets a meaningful error rather than silent data loss.
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "wa-no-att");
+        let canned = WebFetchResponse {
+            final_url: "https://example.com/x.csv".into(),
+            status: 200,
+            content_type: Some("text/csv".into()),
+            body: "x".into(),
+            truncated: false,
+        };
+        // Use the no-attachments helper.
+        let ctx = ctx_with_stub_web_fetch(&db, cid, canned);
+        let out = WebFetchTool::new()
+            .invoke(
+                ctx,
+                json!({"url": "https://example.com/x.csv", "as_attachment": true}),
+            )
+            .await;
+        match out {
+            ToolOutcome::Denied { reason } => {
+                assert!(reason.contains("attachment"));
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_as_attachment_default_false_preserves_legacy_inline_path() {
+        // Backward-compat: without `as_attachment`, callers get the
+        // original inline body. A bench / test fixture that omitted
+        // the new field must keep working unchanged.
+        let db = fresh_db();
+        let cid = seed_conversation(&db, "wa-legacy");
+        let canned = WebFetchResponse {
+            final_url: "https://example.com/article".into(),
+            status: 200,
+            content_type: Some("text/html".into()),
+            body: "<html>hi</html>".into(),
+            truncated: false,
+        };
+        let ctx = ctx_with_stub_web_fetch(&db, cid, canned);
+        let out = WebFetchTool::new()
+            .invoke(ctx, json!({"url": "https://example.com/article"}))
+            .await;
+        match out {
+            ToolOutcome::Ok(v) => {
+                assert_eq!(v["body"], "<html>hi</html>");
+                assert!(v.get("attachment_id").is_none());
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_attachment_filename_prefers_url_path_segment() {
+        assert_eq!(
+            derive_attachment_filename(
+                "https://example.com/data/penguins.csv",
+                Some("text/csv")
+            ),
+            "penguins.csv"
+        );
+        // Query string + fragment must not bleed into the filename.
+        assert_eq!(
+            derive_attachment_filename(
+                "https://example.com/data/penguins.csv?dl=1#row=10",
+                Some("text/csv")
+            ),
+            "penguins.csv"
+        );
+        // Trailing slash → no usable segment → MIME fallback.
+        assert_eq!(
+            derive_attachment_filename("https://example.com/", Some("application/json")),
+            "download.json"
+        );
+        // Bare host → MIME fallback.
+        assert_eq!(
+            derive_attachment_filename("https://example.com", Some("text/csv")),
+            "download.csv"
+        );
+        // No MIME, no path → generic .bin.
+        assert_eq!(
+            derive_attachment_filename("https://example.com/", None),
+            "download.bin"
+        );
     }
 
     // --- list_chats ---------------------------------------------------

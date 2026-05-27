@@ -155,33 +155,10 @@ impl Inner {
             status: dispatch_status.as_str().to_owned(),
         });
 
-        // M1 of Automations — also emit on the durable automation
-        // bus so flows can subscribe to routine completions. The
-        // dedup id `routine:{routine_id}:{run_id}` is stable by
-        // construction (run ids are monotonic per routine); if this
-        // method is ever re-entered for the same run_id (it isn't
-        // today, but designs change), the bus dedups silently.
-        let bus_evt = execlaw_core::automation_bus::Event {
-            id: format!("routine:{}:{}", routine.id, run_id),
-            kind: execlaw_core::automation_bus::BusEventKind::RoutineFired,
-            source: format!("routine:{}", routine.id),
-            received_at: chrono::Utc::now().timestamp_millis(),
-            payload: serde_json::json!({
-                "routine_id": routine.id,
-                "run_id": run_id,
-                "status": dispatch_status.as_str(),
-                "conversation_id": conversation_id,
-                "error": dispatch_error,
-            }),
-        };
-        if let Err(e) = self.state.automation_bus.publish(bus_evt).await {
-            tracing::warn!(
-                routine_id = %routine.id,
-                run_id = %run_id,
-                error = %e,
-                "automation bus: routine publish failed",
-            );
-        }
+        // 2026-05-22 — M6 rip-out: routine.fired bus emission
+        // retired. Routines still run + publish UiEvent::RoutineDispatched
+        // above; flow subscription will be reintroduced through the
+        // middleware redesign as a chat-prompt-style hook.
         Ok(())
     }
 }

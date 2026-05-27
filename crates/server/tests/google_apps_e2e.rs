@@ -1,4 +1,4 @@
-//! End-to-end integration test for the real `plugins/google-apps`
+﻿//! End-to-end integration test for the real `plugins/google-apps`
 //! Rhai plugin loaded through the full server install path.
 //!
 //! Exercises:
@@ -8,7 +8,7 @@
 //!   * HookRegistry picks up tool entries from each module.
 //!   * `PluginHost::call_tool` dispatches against a mock API.
 //!   * `enabled_modules` toggle gating works through the full vault
-//!     → script path (write the setting, observe disabled tools
+//!     â†’ script path (write the setting, observe disabled tools
 //!     throw a clear error).
 //!   * Trust-floor adversarial: a sub-Controller caller invoking
 //!     `gmail.send_message` is rejected before the script runs.
@@ -177,16 +177,14 @@ fn build_app(stage_root: PathBuf) -> (axum::Router, AppState) {
         host_transports: execlaw_server::transport_registry::HostTransportRegistry::new(),
         skill_capture: execlaw_skills::AutoCaptureSink::noop(),
         reuse_update: execlaw_skills::ReuseUpdateSink::noop(),
-        automation_bus: execlaw_server::automation_bus::AutomationBus::stub(db),
-        automation_agent_pool: execlaw_server::automation_agent::AutomationsAgentPool::new(
-            std::sync::Arc::new(execlaw_server::automation_agent::StubAgentInvoker::err(
-                "test pool: no LLM",
-            )),
-        ),
+
         data_dir: std::env::temp_dir().join(format!("execlaw-test-{}", uuid::Uuid::new_v4())),
         inference_metrics: execlaw_server::inference_metrics::InferenceMetrics::new(),
+        personality_cache: std::sync::Arc::new(
+            execlaw_server::personality_cache::PersonalityCache::new(),
+        ),
     };
-    // Wire host capabilities into the script engine — without this
+    // Wire host capabilities into the script engine â€” without this
     // the Rhai script's vault_get / vault_put / sidecar_url all
     // error with "host capabilities not wired". Production does
     // this in cli/main.rs after constructing AppState; tests have
@@ -388,13 +386,13 @@ async fn enabled_modules_setting_gates_dispatch() {
     seed_oauth(&state.db, "ya29.fake");
 
     // Flip enabled_modules to just ["gmail"] via the vault directly
-    // — same byte-for-byte path the SPA's PUT handler writes through.
+    // â€” same byte-for-byte path the SPA's PUT handler writes through.
     let now = chrono::Utc::now().timestamp();
     VaultRowStore::new(&state.db)
         .put(Some(PLUGIN_ID), "enabled_modules", br#"["gmail"]"#, now)
         .unwrap();
 
-    // Gmail still flows. (Caller is Controller — every gmail tool
+    // Gmail still flows. (Caller is Controller â€” every gmail tool
     // pins Controller now, so anything sub-Controller bounces at the
     // trust-floor gate before reaching the module check.)
     let _ = state
@@ -437,7 +435,7 @@ async fn enabled_modules_setting_gates_dispatch() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_google_apps_tool_rejects_sub_controller_callers() {
     // v0.3.0 trust contract: NO carve-outs. Every google-apps tool
-    // touches the operator's personal Google account in some way —
+    // touches the operator's personal Google account in some way â€”
     // mailbox, files, calendar (even freeBusy leaks the operator's
     // daily schedule, which is itself a surveillance primitive),
     // contacts, tasks. Outside principals (KnownTrusted at best
@@ -466,8 +464,8 @@ async fn every_google_apps_tool_rejects_sub_controller_callers() {
     assert_eq!(status, StatusCode::OK);
     seed_oauth(&state.db, "ya29.fake");
 
-    // Every google-apps tool — including the previously-carved-out
-    // check_availability — must be rejected for a KnownTrusted caller.
+    // Every google-apps tool â€” including the previously-carved-out
+    // check_availability â€” must be rejected for a KnownTrusted caller.
     for tool in [
         "gmail.list_labels",
         "calendar.list_calendars",
@@ -502,7 +500,7 @@ async fn every_google_apps_tool_rejects_sub_controller_callers() {
 async fn controller_floor_tool_rejects_sub_controller_caller() {
     // Adversarial: a Contact-tier principal calling gmail.send_message
     // must be rejected BEFORE the script runs. This is the security
-    // invariant — letting a Signal contact spam mail through the
+    // invariant â€” letting a Signal contact spam mail through the
     // operator's Gmail is exactly the attack `trust_floor` exists to
     // prevent.
     let (mock_url, _calls) = spawn_mock_api();
@@ -532,7 +530,7 @@ async fn controller_floor_tool_rejects_sub_controller_caller() {
         )
         .await
         .unwrap_err();
-    // The trust-floor gate fires with a message naming the floor —
+    // The trust-floor gate fires with a message naming the floor â€”
     // the exact prose lives in plugin-host; assert the salient bits.
     assert!(
         err.to_lowercase().contains("trust") || err.contains("Controller"),

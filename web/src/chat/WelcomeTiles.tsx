@@ -167,8 +167,8 @@ function synthesiseBriefItems(data: BriefData): BriefItem[] {
                 : null;
         const headline =
             data.runs24h > 0
-                ? `${data.runs24h} automation run${data.runs24h === 1 ? "" : "s"}`
-                : `${data.activeAutomations} automation${data.activeAutomations === 1 ? "" : "s"} standing by`;
+                ? `${data.runs24h} flow run${data.runs24h === 1 ? "" : "s"}`
+                : `${data.activeAutomations} flow${data.activeAutomations === 1 ? "" : "s"} standing by`;
         const detail =
             data.runs24h > 0
                 ? successPct !== null

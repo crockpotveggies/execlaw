@@ -14,6 +14,7 @@ import {
     useCallback,
     useEffect,
     useMemo,
+    useRef,
     useState,
     type ChangeEvent,
 } from "react";
@@ -38,9 +39,85 @@ import {
     type AutomationRunView,
     type BusEventKind,
     type DryRunResult,
+    type EventEnvelope,
     type RecentBusEvent,
     type StepTrace,
+    type TrustClass,
 } from "../api/automations";
+
+/**
+ * Live trace event surfaced from the FlowChannelHub SSE feed. Matches
+ * the Rust `FlowChannelEvent` union — but tagged narrowly here so the
+ * render code can switch on `t` without needing the full Rust schema
+ * mirror. We keep the unparsed JSON in `raw` for debugging.
+ */
+interface LiveTraceEvent {
+    /** Local ms timestamp the SPA received the frame. */
+    ts: number;
+    /** SSE `event:` header (e.g. "node_started", "agent_text_delta"). */
+    t: string;
+    /** Decoded data payload. */
+    data: Record<string, unknown>;
+}
+
+/**
+ * Compose an `EventEnvelope` from the test-run drawer's three
+ * dropdowns. `system_internal` (the default) returns the same shape
+ * as the server's `EventEnvelope::system_internal()` so this stays a
+ * no-op when the operator hasn't customized the envelope. */
+function buildSampleEnvelope(
+    originKind: string,
+    identityKind: string,
+    identityTrust: string,
+): EventEnvelope {
+    // Origin
+    let origin: EventEnvelope["origin"];
+    switch (originKind) {
+        case "web_socket_session":
+            origin = { kind: "web_socket_session", session_id: "test-session" };
+            break;
+        case "chat_append":
+            origin = { kind: "chat_append", thread_id: "test-thread" };
+            break;
+        case "alert":
+            origin = { kind: "alert" };
+            break;
+        case "none":
+            origin = { kind: "none" };
+            break;
+        default:
+            // Default = "system" / no replyable origin. We map this to
+            // OriginRef::None which is what `system_internal()` uses.
+            origin = { kind: "none" };
+            break;
+    }
+    // Identity
+    let identity: EventEnvelope["identity"];
+    const trust = (identityTrust as TrustClass);
+    switch (identityKind) {
+        case "principal":
+            identity = { kind: "principal", id: "test-operator", trust };
+            break;
+        case "external":
+            identity = {
+                kind: "external",
+                plugin_id: "test-plugin",
+                handle: "test-handle",
+                trust,
+            };
+            break;
+        case "system":
+        default:
+            identity = { kind: "system" };
+            break;
+    }
+    return {
+        origin,
+        identity,
+        correlation_id: `test-${crypto.randomUUID()}`,
+        parent_event_id: null,
+    };
+}
 
 interface Props {
     /** Automation id or the literal "new" for create mode. */
@@ -62,6 +139,10 @@ export function AutomationDetailPage({ id }: Props) {
     const [error, setError] = useState<string | null>(null);
     const [busy, setBusy] = useState<boolean>(false);
     const [expandedRunId, setExpandedRunId] = useState<string | null>(null);
+    // M6 — provenance fields, surfaced for the delete-button guard
+    // and (future) the diff-on-upgrade card.
+    const [source, setSource] = useState<string>("operator");
+    const [isDefault, setIsDefault] = useState<boolean>(false);
     // M4c additions:
     const [view, setView] = useState<"canvas" | "code">("canvas");
     const [testRunOpen, setTestRunOpen] = useState<boolean>(false);
@@ -69,6 +150,29 @@ export function AutomationDetailPage({ id }: Props) {
     const [selectedEventId, setSelectedEventId] = useState<string>("");
     const [testRunResult, setTestRunResult] = useState<DryRunResult | null>(null);
     const [testRunBusy, setTestRunBusy] = useState<boolean>(false);
+    // Audit fix #8: live SSE trace events buffered as the run executes.
+    // Cleared at the start of each new run. The Eventsource ref is
+    // held so the unmount cleanup can close it even if the run is
+    // still streaming.
+    const [liveTrace, setLiveTrace] = useState<LiveTraceEvent[]>([]);
+    const liveSourceRef = useRef<EventSource | null>(null);
+    useEffect(() => {
+        // Close any open SSE on page unmount.
+        return () => {
+            liveSourceRef.current?.close();
+            liveSourceRef.current = null;
+        };
+    }, []);
+    // Audit fix #9: envelope override used to test trigger filters that
+    // gate on `event.envelope.origin.kind`, `identity.trust`, etc. The
+    // form composes these strings into an `EventEnvelope` JSON object
+    // when the operator hits Run. `null` means "let the server default
+    // to system_internal()".
+    const [sampleOriginKind, setSampleOriginKind] = useState<string>("system_internal");
+    const [sampleIdentityKind, setSampleIdentityKind] = useState<string>("system");
+    const [sampleIdentityTrust, setSampleIdentityTrust] = useState<string>("controller");
+    const [samplePayloadJson, setSamplePayloadJson] = useState<string>("{}");
+    const [samplePayloadErr, setSamplePayloadErr] = useState<string | null>(null);
 
     // Parsed definition for canvas rendering. `null` when the JSON
     // textarea contains invalid syntax — we render an inline parse
@@ -137,10 +241,12 @@ export function AutomationDetailPage({ id }: Props) {
                 setEnabled(row.enabled);
                 setDefJson(JSON.stringify(row.definition, null, 2));
                 setRuns(runRows);
+                setSource(row.source ?? "operator");
+                setIsDefault(Boolean(row.is_default));
                 setLoaded(true);
             } catch (e) {
                 if (!cancelled) {
-                    setError((e as Error).message || "Failed to load automation");
+                    setError((e as Error).message || "Failed to load flow");
                     setLoaded(true);
                 }
             }
@@ -207,7 +313,7 @@ export function AutomationDetailPage({ id }: Props) {
 
     const onTestRun = useCallback(async () => {
         if (isNew) {
-            setError("Save the automation before test-running.");
+            setError("Save the flow before test-running.");
             return;
         }
         if (!parsedDef.def) {
@@ -219,16 +325,96 @@ export function AutomationDetailPage({ id }: Props) {
         setTestRunBusy(true);
         setError(null);
         setTestRunResult(null);
+        setLiveTrace([]);
+        // Mint the run id client-side and open SSE FIRST so we don't
+        // race the executor publishing NodeStarted events before our
+        // subscriber attaches to the broadcast channel. The endpoint
+        // accepts un-keyed `flow-runs/{id}/events`; the hub creates
+        // the broadcast channel on first subscribe.
+        const clientRunId = `dry-${crypto.randomUUID()}`;
+        // Close any previous EventSource before opening a new one.
+        liveSourceRef.current?.close();
+        // EventSource is missing under jsdom (test env) and could be
+        // missing in older WebViews — gate the live-trace plumbing
+        // behind a feature detect. The POST response still carries
+        // the full DryRunResult so the run remains usable; we just
+        // don't get the per-step streaming UI.
+        if (typeof EventSource !== "undefined") {
+            const es = new EventSource(
+                `/api/automations/flow-runs/${encodeURIComponent(clientRunId)}/events`,
+            );
+            liveSourceRef.current = es;
+            const eventTypes = [
+                "node_started",
+                "node_finished",
+                "agent_turn_started",
+                "agent_text_delta",
+                "agent_tool_call_delta",
+                "agent_turn_finished",
+                "reply_routed",
+                "run_finished",
+            ];
+            for (const t of eventTypes) {
+                es.addEventListener(t, (ev) => {
+                    let data: Record<string, unknown> = {};
+                    try {
+                        data = JSON.parse((ev as MessageEvent).data);
+                    } catch {
+                        // Leave data empty — the SSE channel guarantees
+                        // valid JSON per the server but defensive parse
+                        // keeps a single bad frame from crashing the UI.
+                    }
+                    setLiveTrace((prev) => [...prev, { ts: Date.now(), t, data }]);
+                    if (t === "run_finished") {
+                        es.close();
+                        liveSourceRef.current = null;
+                    }
+                });
+            }
+            es.onerror = () => {
+                // Broadcast channels may close cleanly when the run
+                // finishes BEFORE the run_finished event lands (race in
+                // the publish/close path). We don't surface this — the
+                // POST response carries the canonical outcome.
+                es.close();
+                if (liveSourceRef.current === es) {
+                    liveSourceRef.current = null;
+                }
+            };
+        }
         try {
-            const body = selectedEventId
-                ? { event_id: selectedEventId }
-                : {
-                      sample_event: {
-                          kind: parsedDef.def.trigger.kind,
-                          source: "test-run",
-                          payload: {},
-                      },
-                  };
+            let body: Record<string, unknown>;
+            if (selectedEventId) {
+                body = { event_id: selectedEventId, client_run_id: clientRunId };
+            } else {
+                // Synthesize-mode: build payload + envelope from the
+                // form. Bail with an inline error if the payload JSON
+                // is bad so the run never hits the server with junk.
+                let payload: unknown = {};
+                try {
+                    payload = samplePayloadJson.trim() === ""
+                        ? {}
+                        : JSON.parse(samplePayloadJson);
+                    setSamplePayloadErr(null);
+                } catch (e) {
+                    setSamplePayloadErr((e as Error).message);
+                    setTestRunBusy(false);
+                    return;
+                }
+                body = {
+                    sample_event: {
+                        kind: parsedDef.def.trigger.kind,
+                        source: "test-run",
+                        payload,
+                        envelope: buildSampleEnvelope(
+                            sampleOriginKind,
+                            sampleIdentityKind,
+                            sampleIdentityTrust,
+                        ),
+                    },
+                    client_run_id: clientRunId,
+                };
+            }
             const result = await testRunAutomation(id, body, token);
             setTestRunResult(result);
         } catch (e) {
@@ -236,11 +422,33 @@ export function AutomationDetailPage({ id }: Props) {
         } finally {
             setTestRunBusy(false);
         }
-    }, [id, isNew, parsedDef.def, selectedEventId, token]);
+    }, [
+        id,
+        isNew,
+        parsedDef.def,
+        selectedEventId,
+        token,
+        samplePayloadJson,
+        sampleOriginKind,
+        sampleIdentityKind,
+        sampleIdentityTrust,
+    ]);
 
     const onDelete = useCallback(async () => {
         if (isNew) return;
-        if (!confirm("Delete this automation? This cannot be undone.")) return;
+        if (isDefault) {
+            // Belt-and-suspenders — the button is hidden when
+            // isDefault, but a stale-state click would otherwise hit
+            // the server and get a 403. Surface the same message
+            // the server returns without round-tripping.
+            setError(
+                `Default flows shipped by '${source}' cannot be deleted. Disable via the Enabled switch, or uninstall the source ${
+                    source === "core" ? "feature" : "plugin"
+                }.`,
+            );
+            return;
+        }
+        if (!confirm("Delete this flow? This cannot be undone.")) return;
         setBusy(true);
         try {
             await deleteAutomation(id, token);
@@ -249,7 +457,7 @@ export function AutomationDetailPage({ id }: Props) {
             setError((e as Error).message || "Delete failed");
             setBusy(false);
         }
-    }, [id, isNew, navigate, token]);
+    }, [id, isNew, isDefault, source, navigate, token]);
 
     if (!loaded) {
         return (
@@ -304,7 +512,7 @@ export function AutomationDetailPage({ id }: Props) {
                     >
                         Save
                     </Button>
-                    {!isNew && (
+                    {!isNew && !isDefault && (
                         <Button
                             variant="outline-danger"
                             size="sm"
@@ -314,6 +522,18 @@ export function AutomationDetailPage({ id }: Props) {
                         >
                             Delete
                         </Button>
+                    )}
+                    {!isNew && isDefault && (
+                        <span
+                            className="badge text-bg-secondary align-self-center"
+                            title={`This is a default flow shipped by '${source}'. Disable it via the Enabled switch instead, or uninstall the source ${
+                                source === "core" ? "feature" : "plugin"
+                            } to remove it.`}
+                            data-testid="automation-default-badge"
+                        >
+                            <i className="bi bi-shield-lock-fill me-1" aria-hidden />
+                            {source === "core" ? "Core default" : `From ${source}`}
+                        </span>
                     )}
                 </div>
             </div>
@@ -396,6 +616,16 @@ export function AutomationDetailPage({ id }: Props) {
                     onRun={onTestRun}
                     busy={testRunBusy}
                     result={testRunResult}
+                    liveTrace={liveTrace}
+                    samplePayloadJson={samplePayloadJson}
+                    onSamplePayloadJsonChange={setSamplePayloadJson}
+                    samplePayloadErr={samplePayloadErr}
+                    sampleOriginKind={sampleOriginKind}
+                    onSampleOriginKindChange={setSampleOriginKind}
+                    sampleIdentityKind={sampleIdentityKind}
+                    onSampleIdentityKindChange={setSampleIdentityKind}
+                    sampleIdentityTrust={sampleIdentityTrust}
+                    onSampleIdentityTrustChange={setSampleIdentityTrust}
                 />
             )}
 
@@ -421,6 +651,18 @@ interface TestRunDrawerProps {
     onRun: () => void;
     busy: boolean;
     result: DryRunResult | null;
+    /** Live SSE trace events for the in-flight run. */
+    liveTrace: LiveTraceEvent[];
+    // Synthesize-mode envelope override fields (audit fix #9).
+    samplePayloadJson: string;
+    onSamplePayloadJsonChange: (s: string) => void;
+    samplePayloadErr: string | null;
+    sampleOriginKind: string;
+    onSampleOriginKindChange: (s: string) => void;
+    sampleIdentityKind: string;
+    onSampleIdentityKindChange: (s: string) => void;
+    sampleIdentityTrust: string;
+    onSampleIdentityTrustChange: (s: string) => void;
 }
 
 function TestRunDrawer({
@@ -432,7 +674,21 @@ function TestRunDrawer({
     onRun,
     busy,
     result,
+    liveTrace,
+    samplePayloadJson,
+    onSamplePayloadJsonChange,
+    samplePayloadErr,
+    sampleOriginKind,
+    onSampleOriginKindChange,
+    sampleIdentityKind,
+    onSampleIdentityKindChange,
+    sampleIdentityTrust,
+    onSampleIdentityTrustChange,
 }: TestRunDrawerProps) {
+    // The envelope-builder block is only useful in synthesize mode
+    // (selectedEventId === "") because real captured events already
+    // carry their own envelope.
+    const synthesizeMode = selectedEventId === "";
     return (
         <section className="mt-4" data-testid="test-run-drawer">
             <div className="d-flex justify-content-between align-items-center">
@@ -471,10 +727,117 @@ function TestRunDrawer({
                         </Form.Select>
                         <div className="small text-muted mt-1">
                             Pick from the last 50 events of this trigger's kind.
-                            "Synthesize" runs against an empty-payload event of
-                            the trigger kind — useful for shape-only smoke tests.
+                            "Synthesize" runs against an envelope you compose
+                            below — useful for testing trigger filters that gate
+                            on origin / identity / payload.
                         </div>
                     </Form.Group>
+                    {synthesizeMode && (
+                        <div
+                            className="border rounded p-2 mb-2"
+                            style={{ background: "#0e131a", borderColor: "#30363d" }}
+                            data-testid="test-run-synthesize-block"
+                        >
+                            <div className="small text-muted mb-1">
+                                Synthesize event details
+                            </div>
+                            <Form.Group className="mb-2">
+                                <Form.Label className="small text-muted mb-1">
+                                    Payload (JSON)
+                                </Form.Label>
+                                <Form.Control
+                                    as="textarea"
+                                    rows={3}
+                                    size="sm"
+                                    value={samplePayloadJson}
+                                    onChange={(e) =>
+                                        onSamplePayloadJsonChange(e.target.value)
+                                    }
+                                    spellCheck={false}
+                                    className="font-monospace small"
+                                    data-testid="test-run-payload"
+                                />
+                                {samplePayloadErr && (
+                                    <div
+                                        className="small text-danger mt-1"
+                                        data-testid="test-run-payload-error"
+                                    >
+                                        {samplePayloadErr}
+                                    </div>
+                                )}
+                            </Form.Group>
+                            <div className="row g-2">
+                                <Form.Group className="col">
+                                    <Form.Label className="small text-muted mb-1">
+                                        Origin kind
+                                    </Form.Label>
+                                    <Form.Select
+                                        size="sm"
+                                        value={sampleOriginKind}
+                                        onChange={(e) =>
+                                            onSampleOriginKindChange(e.target.value)
+                                        }
+                                        data-testid="test-run-origin-kind"
+                                    >
+                                        <option value="system_internal">
+                                            system_internal (default)
+                                        </option>
+                                        <option value="web_socket_session">
+                                            web_socket_session
+                                        </option>
+                                        <option value="chat_append">chat_append</option>
+                                        <option value="alert">alert</option>
+                                        <option value="none">none</option>
+                                    </Form.Select>
+                                </Form.Group>
+                                <Form.Group className="col">
+                                    <Form.Label className="small text-muted mb-1">
+                                        Identity kind
+                                    </Form.Label>
+                                    <Form.Select
+                                        size="sm"
+                                        value={sampleIdentityKind}
+                                        onChange={(e) =>
+                                            onSampleIdentityKindChange(e.target.value)
+                                        }
+                                        data-testid="test-run-identity-kind"
+                                    >
+                                        <option value="system">system</option>
+                                        <option value="principal">principal</option>
+                                        <option value="external">external</option>
+                                    </Form.Select>
+                                </Form.Group>
+                                <Form.Group className="col">
+                                    <Form.Label className="small text-muted mb-1">
+                                        Trust
+                                    </Form.Label>
+                                    <Form.Select
+                                        size="sm"
+                                        value={sampleIdentityTrust}
+                                        onChange={(e) =>
+                                            onSampleIdentityTrustChange(e.target.value)
+                                        }
+                                        disabled={sampleIdentityKind === "system"}
+                                        data-testid="test-run-identity-trust"
+                                    >
+                                        <option value="controller">controller</option>
+                                        <option value="known_high">known_high</option>
+                                        <option value="known_limited">
+                                            known_limited
+                                        </option>
+                                        <option value="cold_contact">cold_contact</option>
+                                        <option value="blocked">blocked</option>
+                                    </Form.Select>
+                                </Form.Group>
+                            </div>
+                            <div className="small text-muted mt-1">
+                                The envelope is reachable from Rhai as{" "}
+                                <code>event.envelope.origin.kind</code> and{" "}
+                                <code>event.envelope.identity.trust</code>.
+                                System identity ignores the trust field.
+                            </div>
+                        </div>
+                    )}
                     <Button
                         variant="primary"
                         size="sm"
@@ -484,11 +847,134 @@ function TestRunDrawer({
                     >
                         {busy ? "Running…" : "Run"}
                     </Button>
+                    {liveTrace.length > 0 && (
+                        <LiveTraceView trace={liveTrace} runningStill={busy} />
+                    )}
                     {result && <TestRunResultView result={result} />}
                 </div>
             )}
         </section>
     );
+}
+
+function LiveTraceView({
+    trace,
+    runningStill,
+}: {
+    trace: LiveTraceEvent[];
+    runningStill: boolean;
+}) {
+    // Aggregate AgentTextDelta frames per (run_id, node_id) so the
+    // running agent text is shown as one growing block rather than
+    // 60+ rows. Other event kinds render verbatim.
+    type Row =
+        | { kind: "event"; ts: number; t: string; data: Record<string, unknown> }
+        | { kind: "agent-text"; nodeId: string; text: string };
+    const rows: Row[] = useMemo(() => {
+        const out: Row[] = [];
+        for (const ev of trace) {
+            if (ev.t === "agent_text_delta") {
+                const nodeId =
+                    (ev.data.node_id as string | undefined) ?? "(unknown)";
+                const delta = (ev.data.delta as string | undefined) ?? "";
+                const last = out[out.length - 1];
+                if (
+                    last &&
+                    last.kind === "agent-text" &&
+                    last.nodeId === nodeId
+                ) {
+                    last.text += delta;
+                } else {
+                    out.push({ kind: "agent-text", nodeId, text: delta });
+                }
+            } else {
+                out.push({
+                    kind: "event",
+                    ts: ev.ts,
+                    t: ev.t,
+                    data: ev.data,
+                });
+            }
+        }
+        return out;
+    }, [trace]);
+    return (
+        <div
+            className="mt-3 border rounded p-2"
+            style={{ background: "#0e131a", borderColor: "#30363d" }}
+            data-testid="live-trace"
+        >
+            <div className="small text-muted mb-1">
+                <i
+                    className={`bi ${
+                        runningStill ? "bi-broadcast" : "bi-check-circle"
+                    } me-1`}
+                    aria-hidden
+                />
+                Live trace · {trace.length} event(s){" "}
+                {runningStill && (
+                    <span className="text-info"> · streaming…</span>
+                )}
+            </div>
+            <ul
+                className="small mb-0 font-monospace"
+                style={{ listStyle: "none", paddingLeft: 0, maxHeight: 200, overflowY: "auto" }}
+            >
+                {rows.map((r, i) => {
+                    if (r.kind === "agent-text") {
+                        return (
+                            <li
+                                key={`a-${i}`}
+                                style={{ color: "#a5d8ff" }}
+                                data-testid="live-trace-agent-text"
+                            >
+                                <span style={{ color: "#7d8590" }}>
+                                    [agent_text {r.nodeId}]
+                                </span>{" "}
+                                {r.text}
+                            </li>
+                        );
+                    }
+                    return (
+                        <li
+                            key={`e-${i}`}
+                            data-testid={`live-trace-row-${r.t}`}
+                        >
+                            <span style={{ color: "#7d8590" }}>
+                                [{r.t}]
+                            </span>{" "}
+                            {summarizeEventData(r.t, r.data)}
+                        </li>
+                    );
+                })}
+            </ul>
+        </div>
+    );
+}
+
+function summarizeEventData(t: string, data: Record<string, unknown>): string {
+    // One-line summary per FlowChannelEvent variant. Keeps the trace
+    // readable — the raw JSON is debug-only and would explode the
+    // viewport on a chatty run.
+    const node = (data.node_id as string | undefined) ?? "";
+    switch (t) {
+        case "node_started":
+            return `→ ${node}`;
+        case "node_finished":
+            return `✓ ${node} (${(data.outcome as string | undefined) ?? "?"})`;
+        case "agent_turn_started":
+            return `agent ${node} turn ${data.turn_index ?? "?"}`;
+        case "agent_turn_finished":
+            return `agent ${node} done (${(data.exit_tool as string | undefined) ?? "?"})`;
+        case "agent_tool_call_delta":
+            return `agent ${node} tool ${(data.tool_name as string | undefined) ?? "?"}`;
+        case "reply_routed":
+            return `reply (${(data.route as string | undefined) ?? "?"})`;
+        case "run_finished":
+            return `outcome=${(data.outcome as string | undefined) ?? "?"}`;
+        default:
+            return JSON.stringify(data);
+    }
 }
 
 function TestRunResultView({ result }: { result: DryRunResult }) {

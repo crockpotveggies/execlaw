@@ -1,7 +1,7 @@
 [plugin]
 id = "signal"
 name = "Signal"
-version = "0.5.0"
+version = "0.5.1"
 description = "Signal Messenger transport — fully script-tier (Phase B). All host-side signal_*.rs code retired; this plugin's main.rhai owns inbound consumer, outbound, group ops, and admin pairing."
 author = "execlaw"
 license = "Apache-2.0"
@@ -178,3 +178,44 @@ entry = "ui/panel.js"
 [runtime]
 tier = "script"
 source = "main.rhai"
+
+# ===== M6 event-driven architecture =================================
+
+[[bus_events]]
+kind = "signal.message.received"
+description = "Inbound Signal message (DM or group)."
+expects_reply = true
+default_origin_kind = "plugin_channel"
+
+[[bus_events]]
+kind = "signal.cold_contact.arrived"
+description = "Message arrived from a sender not yet in the principal table (cold contact)."
+expects_reply = true
+default_origin_kind = "plugin_channel"
+
+[[reply_handlers]]
+name = "signal"
+description = "Send agent text back to the originating Signal conversation via signal-cli."
+supports_streaming = false
+supports_attachments = true
+supports_markdown = false
+max_attachment_size_bytes = 104857600
+max_attachments_per_message = 32
+max_text_length = 4096
+allowed_mime_prefixes = ["image/", "video/", "audio/", "application/pdf", "text/"]
+
+# ===== Phase E (Flows middleware) — default flow ====================
+#
+# Ships one chat.prompt flow narrowed to `event.payload.channel ==
+# "signal"`. Injects channel-aware reply guidance (concise, plain
+# text, no Markdown — Signal's renderer doesn't support it). The
+# importer in plugin-host stamps `source = "plugin:signal"` so the
+# operator can disable it via the Enabled toggle but cannot delete
+# it (uninstalling the plugin removes the row). Operator edits are
+# preserved on re-install because the importer is name-keyed.
+[[default_automations]]
+name = "Signal channel guidance"
+flow_path = "flows/default.json"
+enabled = true
+description = "Pre-turn middleware: when a chat.prompt arrives via the Signal channel, inject reply guidance (concise, plain text, no Markdown)."
+

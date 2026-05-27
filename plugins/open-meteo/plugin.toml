@@ -1,7 +1,7 @@
 [plugin]
 id = "open-meteo"
 name = "Open-Meteo Weather"
-version = "0.5.1"
+version = "0.5.2"
 # 0.5.1 (2026-05-16) — descriptions on the 4 data-ref tools
 # (historical / seasonal / ensemble / climate) + the
 # summarize_with_refs `_hint` trimmed hard. v0.5.0's verbose
@@ -177,3 +177,24 @@ entry = "ui/components/ChartInline.js"
 [runtime]
 tier = "script"
 source = "main.rhai"
+
+# ===== Phase E (Flows middleware) — default flow ====================
+#
+# Ships one chat.prompt flow (any channel) gated by a keyword
+# match on the user's prompt — fires only when the message
+# mentions weather / forecast / temperature / climate vocabulary.
+# When it fires, an AddMemory node injects a hint telling the
+# agent to call `open_meteo.geocode` + `open_meteo.forecast` /
+# `historical` / `marine` / `air_quality` rather than guessing.
+# Gating is on the trigger→ctx edge — when no keyword matches,
+# the flow returns Skipped and adds zero latency to the chat
+# turn. The importer in plugin-host stamps
+# `source = "plugin:open-meteo"` so the operator can disable it
+# via the Enabled toggle but cannot delete it. Operator edits
+# are preserved on re-install because the importer is name-keyed.
+[[default_automations]]
+name = "Open-Meteo weather hint"
+flow_path = "flows/default.json"
+enabled = true
+description = "Pre-turn middleware: when the user asks about weather / forecast / climate / air quality, inject a hint telling the agent to call the installed open_meteo.* tools rather than guess at conditions."
+

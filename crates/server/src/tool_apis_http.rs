@@ -37,7 +37,7 @@
 //! 2026-04-29.
 
 use async_trait::async_trait;
-use execlaw_core::tool::{ApiError, WebFetchApi, WebFetchResponse};
+use execlaw_core::tool::{ApiError, WebFetchApi, WebFetchBytes, WebFetchResponse};
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::time::Duration;
@@ -312,6 +312,66 @@ impl WebFetchApi for HttpWebFetchApi {
             status,
             content_type,
             body,
+            truncated,
+        })
+    }
+
+    /// Sibling of `get` that returns raw bytes for the
+    /// `web_fetch(as_attachment: true)` path. Same SSRF guard, same
+    /// size cap, same timeout — but the content-type allowlist is
+    /// intentionally not enforced because the whole point is to
+    /// accept binary downloads (CSV/parquet/PNG/PDF/xlsx) that the
+    /// agent can hand to `python.execute` via
+    /// `/work/<convo>/uploads/<filename>` after `hydrate_uploads`
+    /// drops the bytes there.
+    ///
+    /// Size cap is the load-bearing defense at this point — without
+    /// the content-type filter, a `Content-Length: 10TB` response
+    /// could in principle try to OOM us, so the streaming reader
+    /// stops at `max_bytes` and flags `truncated`.
+    async fn get_bytes(&self, url: &str) -> Result<WebFetchBytes, ApiError> {
+        let parsed = validate_url(url, self.allow_loopback)?;
+        let resp = self
+            .client
+            .get(parsed)
+            .timeout(self.timeout)
+            .send()
+            .await
+            .map_err(|e| ApiError::Storage(format!("network error: {e}")))?;
+        let status = resp.status().as_u16();
+        let final_url = resp.url().to_string();
+        // Re-validate the FINAL url after redirects — same SSRF
+        // defense pattern as `get`.
+        validate_url(&final_url, self.allow_loopback)?;
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_owned());
+        // NB: NO content-type allowlist here — see method doc.
+        use futures::StreamExt;
+        let mut stream = resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::with_capacity(8_192);
+        let mut truncated = false;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| ApiError::Storage(format!("body read: {e}")))?;
+            let remaining = self.max_bytes.saturating_sub(buf.len());
+            if chunk.len() > remaining {
+                buf.extend_from_slice(&chunk[..remaining]);
+                truncated = true;
+                break;
+            }
+            buf.extend_from_slice(&chunk);
+            if buf.len() >= self.max_bytes {
+                truncated = true;
+                break;
+            }
+        }
+        Ok(WebFetchBytes {
+            final_url,
+            status,
+            content_type,
+            body: buf,
             truncated,
         })
     }

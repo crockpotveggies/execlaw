@@ -1,7 +1,5 @@
 //! Shared application state.
 
-use crate::automation_agent::AutomationsAgentPool;
-use crate::automation_bus::AutomationBus;
 use crate::events::EventBus;
 use crate::inference_metrics::InferenceMetrics;
 use execlaw_core::Database;
@@ -220,21 +218,6 @@ pub struct AppState {
     /// request. Tests default to a tempdir; production threads the
     /// real path through from `cli/main.rs::cmd_serve`.
     pub data_dir: std::path::PathBuf,
-    /// M1 of Automations — durable event bus for external signals
-    /// (webhooks, sockets, plugin emits, routine fires). Always
-    /// present: `cmd_serve` spawns the real bus with the M1 no-op
-    /// handler; `routes::test_app_state` constructs a stub bus
-    /// whose `publish` still writes durably but no dispatcher
-    /// drives it. Distinct from `events: EventBus` above — that one
-    /// is the in-process SPA-broadcast bus; this one is the durable
-    /// inbox for automation triggers.
-    pub automation_bus: AutomationBus,
-    /// M3 + M4c — handle to the automations agent pool. The bus
-    /// handler closes over this (live dispatch); admin routes
-    /// (test-run, currently) also need it. Same `Arc<Semaphore>`
-    /// under the hood, so a test-run honors the pool's concurrency
-    /// cap alongside live runs.
-    pub automation_agent_pool: AutomationsAgentPool,
     /// M5 — per-consumer inference observability. Wrapping LLM
     /// calls with `metrics.observe(consumer, fut)` records
     /// in_flight, totals, and per-call latency for the
@@ -243,6 +226,13 @@ pub struct AppState {
     /// continue to call the inference client directly without
     /// observation — adding them is the M5 incremental rollout.
     pub inference_metrics: InferenceMetrics,
+    /// Per-turn personality-chunk cache. Avoids two indexed SQLite
+    /// reads on every chat turn by caching the composed default
+    /// chunk + a set of conversation ids known to have an override.
+    /// Invalidated from the personality upsert/delete handlers.
+    /// Always present (cheap default constructor); see
+    /// [`crate::personality_cache`] for the design notes.
+    pub personality_cache: Arc<crate::personality_cache::PersonalityCache>,
 }
 
 impl std::fmt::Debug for AppState {

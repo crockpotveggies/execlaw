@@ -528,17 +528,24 @@ fn display_label_for_channel(channel: &str) -> String {
     }
 }
 
-pub(crate) fn assemble_system_prompt(
-    db: &execlaw_core::Database,
+/// `pub` (not `pub(crate)`) so the benchmark suite can measure the
+/// cold/warm cache paths in isolation. Production callers are the
+/// three turn paths in `chats.rs` plus the `personality_cache` bench.
+pub fn assemble_system_prompt(
+    state: &AppState,
     conversation_id: Option<&str>,
     static_base: &str,
     routing_prose: &str,
     turn_context: &str,
 ) -> String {
-    let store = execlaw_core::personality::PersonalityStore::new(db);
-    let personality_chunk =
-        execlaw_core::personality::compose_system_prompt(&store, conversation_id)
-            .unwrap_or_default();
+    // Personality composition runs on every chat turn; the cache
+    // collapses the two indexed SQLite reads (default row + optional
+    // override) down to zero for the 99% case (no per-conversation
+    // override) and one for the rare conversation that has one. See
+    // [`crate::personality_cache`] for the invariants.
+    let personality_chunk = state
+        .personality_cache
+        .compose(&state.db, conversation_id);
     let p = personality_chunk.trim();
     let b = static_base.trim();
     let r = routing_prose.trim();

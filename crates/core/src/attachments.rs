@@ -68,6 +68,25 @@ pub fn plugin_artifact_path(root: &Path, sha256: &str) -> PathBuf {
     root.join(sha256)
 }
 
+/// MIME types treated as images — landed as vision content parts on
+/// the LLM request and explicitly EXCLUDED from the per-turn
+/// "Attached files" prose block.
+///
+/// Mirrored in `crates/server/src/chats/attachments.rs::is_image_mime`
+/// (server-side; the canonical gating function) and in migration
+/// 0014's backfill SQL. Keep all three in sync if the image set
+/// changes.
+///
+/// Lives in core because [`AttachmentStore::insert`] uses it to
+/// decide whether a new row should flip the conversation's
+/// `has_attachments` flag, and core can't depend on server.
+pub const IMAGE_MIMES: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif"];
+
+/// True iff `mime` is in [`IMAGE_MIMES`].
+pub fn is_image_mime(mime: &str) -> bool {
+    IMAGE_MIMES.contains(&mime)
+}
+
 pub struct AttachmentStore<'db> {
     db: &'db Database,
 }
@@ -77,9 +96,30 @@ impl<'db> AttachmentStore<'db> {
         Self { db }
     }
 
+    /// Insert a new attachment row.
+    ///
+    /// When the attachment is NOT an image (per [`is_image_mime`]),
+    /// also flips `state_conversations.has_attachments = 1` for the
+    /// owning conversation in the same transaction. That flag is the
+    /// fast-path gate read by the chats per-turn
+    /// `build_attached_files_block` so it can skip a full
+    /// `list_for_conversation` scan when the conversation has zero
+    /// agent-visible attachments (migration 0014). Atomically pairing
+    /// the row INSERT with the flag bump means the flag can never lag
+    /// the row across crashes / restarts.
+    ///
+    /// Image-only conversations leave the flag at 0 — image
+    /// attachments land as vision content parts and never appear in
+    /// the prose block.
+    ///
+    /// The conversation row is expected to exist before any attachment
+    /// is inserted (every attachment-insert call site lives downstream
+    /// of conversation creation). If it doesn't, the UPDATE silently
+    /// no-ops; the attachment row still lands.
     pub fn insert(&self, row: &AttachmentRow) -> Result<(), DbError> {
-        self.db.with_conn(|c| {
-            c.execute(
+        let bump_has_attachments = !is_image_mime(&row.mime_type);
+        self.db.transaction(|tx| {
+            tx.execute(
                 "INSERT INTO state_attachments(id, conversation_id, mime_type, path, sha256, received_at, filename) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
@@ -92,6 +132,18 @@ impl<'db> AttachmentStore<'db> {
                     row.filename,
                 ],
             )?;
+            if bump_has_attachments {
+                // `AND has_attachments = 0` skips the write when
+                // already set — avoids generating WAL noise on the
+                // 2nd, 3rd, … attachment of a long-running thread.
+                tx.execute(
+                    "UPDATE state_conversations \
+                       SET has_attachments = 1 \
+                     WHERE conversation_id = ?1 \
+                       AND has_attachments = 0",
+                    params![row.conversation_id.as_str()],
+                )?;
+            }
             Ok(())
         })
     }
@@ -546,8 +598,40 @@ impl<'db> AttachmentStore<'db> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversation::{
+        ConversationKind, ConversationRow, ConversationStore, Modality, Phase,
+    };
     use crate::db::{Database, DbConfig};
+    use crate::ids::EventSeq;
     use crate::migrations::MigrationRunner;
+
+    /// Helper: seed a conversation row so `AttachmentStore::insert`'s
+    /// `has_attachments` UPDATE has something to flip. Mirrors the FSM
+    /// upsert the chats layer would have done before any attachment
+    /// lands.
+    fn seed_conversation(db: &Database, cid: &str) {
+        ConversationStore::new(db)
+            .upsert(&ConversationRow {
+                conversation_id: ConversationId::from(cid),
+                kind: ConversationKind::ControllerDM,
+                last_seq: EventSeq(0),
+                phase: Phase::Idle,
+                controller_id: None,
+                trust_class: "Controller".into(),
+                snapshot_blob: None,
+                snapshot_seq: None,
+                lease_owner: None,
+                lease_expires: None,
+                modality: Modality::Text,
+                display_name: None,
+                display_name_source: "auto".into(),
+                is_pinned: false,
+                is_ephemeral: false,
+                ephemeral_expires_at: None,
+                last_activity_at: 0,
+            })
+            .unwrap();
+    }
 
     #[test]
     fn attachment_and_artifact_insert() {
@@ -582,6 +666,229 @@ mod tests {
                 expires_at: None,
             })
             .unwrap();
+    }
+
+    /// Image MIMEs are detected; everything else falls through.
+    /// Mirrors `crates/server/src/chats/attachments.rs::is_image_mime`
+    /// and the backfill list in migration 0014 — if any of these
+    /// three lists drift apart, the fast path either silently drops
+    /// real attachments or wastes work on image-only conversations.
+    #[test]
+    fn is_image_mime_matches_known_set_and_rejects_data_mimes() {
+        for m in IMAGE_MIMES {
+            assert!(is_image_mime(m), "{m} should be an image MIME");
+        }
+        for m in [
+            "text/csv",
+            "application/json",
+            "application/pdf",
+            "text/plain",
+            "image/svg+xml", // SVG NOT in the set — vision models don't accept it
+            "",
+        ] {
+            assert!(!is_image_mime(m), "{m} should NOT be an image MIME");
+        }
+    }
+
+    /// Inserting a non-image attachment flips
+    /// `state_conversations.has_attachments` in the same transaction.
+    /// This is the invariant the fast-path probe in
+    /// `build_attached_files_block` relies on.
+    #[test]
+    fn insert_non_image_flips_has_attachments_flag() {
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        seed_conversation(&db, "c-csv");
+        let cid = ConversationId::from("c-csv");
+
+        let cstore = ConversationStore::new(&db);
+        assert!(
+            !cstore.has_attachments(&cid).unwrap(),
+            "pristine conversation must default to has_attachments=false"
+        );
+
+        AttachmentStore::new(&db)
+            .insert(&AttachmentRow {
+                id: AttachmentId::new(),
+                conversation_id: cid.clone(),
+                mime_type: "text/csv".into(),
+                path: "/blobs/x.csv".into(),
+                sha256: "deadbeef".into(),
+                received_at: 1,
+                filename: Some("x.csv".into()),
+            })
+            .unwrap();
+
+        assert!(
+            cstore.has_attachments(&cid).unwrap(),
+            "non-image attachment insert must flip has_attachments to true"
+        );
+    }
+
+    /// Inserting an image-only attachment leaves
+    /// `has_attachments` at false — images never appear in the
+    /// per-turn prose block, so flipping the flag would force the
+    /// chats fast path through `list_for_conversation` for nothing.
+    #[test]
+    fn insert_image_does_not_flip_has_attachments_flag() {
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        seed_conversation(&db, "c-png");
+        let cid = ConversationId::from("c-png");
+
+        AttachmentStore::new(&db)
+            .insert(&AttachmentRow {
+                id: AttachmentId::new(),
+                conversation_id: cid.clone(),
+                mime_type: "image/png".into(),
+                path: "/blobs/x.png".into(),
+                sha256: "feedface".into(),
+                received_at: 1,
+                filename: Some("x.png".into()),
+            })
+            .unwrap();
+
+        assert!(
+            !ConversationStore::new(&db).has_attachments(&cid).unwrap(),
+            "image-only attachment must leave has_attachments=false"
+        );
+    }
+
+    /// A mixed-MIME conversation (image first, then CSV) ends up
+    /// with `has_attachments=true`. Order shouldn't matter — the
+    /// first non-image insert flips the flag and subsequent inserts
+    /// don't reset it.
+    #[test]
+    fn mixed_image_then_csv_ends_with_flag_true() {
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        seed_conversation(&db, "c-mix");
+        let cid = ConversationId::from("c-mix");
+        let store = AttachmentStore::new(&db);
+
+        store
+            .insert(&AttachmentRow {
+                id: AttachmentId::new(),
+                conversation_id: cid.clone(),
+                mime_type: "image/jpeg".into(),
+                path: "/blobs/a.jpg".into(),
+                sha256: "1111".into(),
+                received_at: 1,
+                filename: Some("a.jpg".into()),
+            })
+            .unwrap();
+        assert!(!ConversationStore::new(&db).has_attachments(&cid).unwrap());
+
+        store
+            .insert(&AttachmentRow {
+                id: AttachmentId::new(),
+                conversation_id: cid.clone(),
+                mime_type: "text/csv".into(),
+                path: "/blobs/b.csv".into(),
+                sha256: "2222".into(),
+                received_at: 2,
+                filename: Some("b.csv".into()),
+            })
+            .unwrap();
+        assert!(ConversationStore::new(&db).has_attachments(&cid).unwrap());
+
+        // A subsequent image insert must not reset the flag.
+        store
+            .insert(&AttachmentRow {
+                id: AttachmentId::new(),
+                conversation_id: cid.clone(),
+                mime_type: "image/webp".into(),
+                path: "/blobs/c.webp".into(),
+                sha256: "3333".into(),
+                received_at: 3,
+                filename: Some("c.webp".into()),
+            })
+            .unwrap();
+        assert!(
+            ConversationStore::new(&db).has_attachments(&cid).unwrap(),
+            "image insert must not reset has_attachments back to false"
+        );
+    }
+
+    /// Backfill behaviour: a conversation that had a non-image
+    /// attachment BEFORE migration 0014 ran should land at
+    /// `has_attachments=true` after the migration. Simulated by
+    /// inserting the attachment row directly (bypassing
+    /// AttachmentStore::insert), then re-running the migration's
+    /// backfill UPDATE manually.
+    ///
+    /// The check that matters: the SQL in 0014 picks up rows whose
+    /// `mime_type` is anything OTHER than the four image MIMEs.
+    /// If the image list in the migration drifts from `IMAGE_MIMES`
+    /// in this file, this test fails (and so does
+    /// `is_image_mime_matches_known_set_and_rejects_data_mimes`).
+    #[test]
+    fn backfill_flips_flag_for_preexisting_non_image_rows() {
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        seed_conversation(&db, "c-old-pdf");
+        seed_conversation(&db, "c-old-img");
+        let pdf_cid = ConversationId::from("c-old-pdf");
+        let img_cid = ConversationId::from("c-old-img");
+
+        // Bypass AttachmentStore::insert to simulate rows written
+        // before migration 0014 existed (when the flag wasn't being
+        // maintained). Reset has_attachments back to 0 after each
+        // insert so we're testing the backfill, not the live insert.
+        for (cid, mime, sha) in [
+            (&pdf_cid, "application/pdf", "aaaa"),
+            (&img_cid, "image/png", "bbbb"),
+        ] {
+            db.with_conn(|c| {
+                c.execute(
+                    "INSERT INTO state_attachments(id, conversation_id, mime_type, path, sha256, received_at, filename) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+                    params![
+                        AttachmentId::new().as_str(),
+                        cid.as_str(),
+                        mime,
+                        format!("/blobs/{sha}"),
+                        sha,
+                        1_i64,
+                    ],
+                )?;
+                c.execute(
+                    "UPDATE state_conversations SET has_attachments = 0 \
+                     WHERE conversation_id = ?1",
+                    params![cid.as_str()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        // Re-run the backfill statement (the body of migration 0014
+        // after the ALTER TABLE) — idempotent and safe.
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE state_conversations \
+                    SET has_attachments = 1 \
+                  WHERE conversation_id IN ( \
+                      SELECT DISTINCT conversation_id FROM state_attachments \
+                       WHERE mime_type NOT IN ( \
+                          'image/png', 'image/jpeg', 'image/webp', 'image/gif' \
+                       ) \
+                  )",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let cstore = ConversationStore::new(&db);
+        assert!(
+            cstore.has_attachments(&pdf_cid).unwrap(),
+            "PDF-bearing conversation must end up with has_attachments=true after backfill"
+        );
+        assert!(
+            !cstore.has_attachments(&img_cid).unwrap(),
+            "image-only conversation must stay at has_attachments=false after backfill"
+        );
     }
 
     /// Plugin-artifact round-trip: insert bytes, look up the row, verify

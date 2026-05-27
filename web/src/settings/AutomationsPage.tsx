@@ -53,7 +53,7 @@ export function AutomationsPage() {
             setAutomations(a);
             setSuggestions(s);
         } catch (e) {
-            setError((e as Error).message || "Failed to load automations");
+            setError((e as Error).message || "Failed to load flows");
         }
     }, [token]);
 
@@ -119,7 +119,7 @@ export function AutomationsPage() {
             <div className="d-flex justify-content-between align-items-start gap-3 mb-3">
                 <p className="execlaw-muted small mb-0">
                     Event-triggered flows. Webhooks, routines, and plugin
-                    emits land on the bus; matching automations run their
+                    emits land on the bus; matching flows run their
                     graph and write a per-step trace you can replay.
                 </p>
                 <Link
@@ -127,7 +127,7 @@ export function AutomationsPage() {
                     className="btn btn-primary btn-sm flex-shrink-0"
                     data-testid="new-automation-btn"
                 >
-                    <i className="bi bi-plus-lg me-1" aria-hidden /> New automation
+                    <i className="bi bi-plus-lg me-1" aria-hidden /> New flow
                 </Link>
             </div>
 
@@ -142,12 +142,12 @@ export function AutomationsPage() {
                 />
             )}
 
-            <h3 className="h6 mt-4 mb-2">Your automations</h3>
+            <h3 className="h6 mt-4 mb-2">Your flows</h3>
             {automations.length === 0 ? (
                 <ZeroState
                     testId="automations-empty"
                     icon="bi-lightning-charge-fill"
-                    title={<>No automations yet.</>}
+                    title={<>No flows yet.</>}
                     description={
                         <>
                             Event-triggered flows fire when webhooks,
@@ -164,7 +164,7 @@ export function AutomationsPage() {
                             data-testid="automations-empty-new-btn"
                         >
                             <i className="bi bi-plus-lg me-1" aria-hidden />
-                            New automation
+                            New flow
                         </Link>
                     }
                 />
@@ -184,7 +184,7 @@ function MetricCards({ metrics }: { metrics: AutomationMetrics | null }) {
         {
             label: "Active",
             value: metrics?.active_count ?? "—",
-            help: "Enabled automations",
+            help: "Enabled flows",
             testId: "metric-active",
         },
         {
@@ -202,7 +202,7 @@ function MetricCards({ metrics }: { metrics: AutomationMetrics | null }) {
         {
             label: "Untriaged (24h)",
             value: metrics?.untriaged_kinds_24h ?? "—",
-            help: "Distinct event kinds with no matching automation",
+            help: "Distinct event kinds with no matching flow",
             testId: "metric-untriaged",
         },
     ];
@@ -256,7 +256,7 @@ function SuggestionsSection({
                         <div className="me-3">
                             <div className="small execlaw-muted">
                                 {s.event_count} {kindLabel(s.kind).toLowerCase()} events
-                                from <code>{s.source}</code> with no automation
+                                from <code>{s.source}</code> with no flow
                             </div>
                             <div className="fw-semibold">
                                 {s.suggested_name}

@@ -27,7 +27,7 @@ use execlaw_core::Database;
 use execlaw_core::attachments::AttachmentStore;
 use execlaw_core::cards::{CardAction, CardClosedPayload, CardKind, CardOpenedPayload, CardState};
 use execlaw_core::ids::ConversationId;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
@@ -50,13 +50,25 @@ pub struct PythonSandboxService {
     work_root: PathBuf,
     artifacts_root: PathBuf,
     db: Database,
-    /// Conversations whose state_attachments have been hydrated into
-    /// /work/<convo>/uploads/ at least once this server lifetime.
-    /// Used by [`hydrate_if_needed`] to skip the work on every
-    /// execute. Repopulated from scratch on server restart — a
-    /// future enhancement could persist this so restart doesn't
-    /// re-copy the same files.
-    hydrated_convos: Arc<Mutex<HashSet<ConversationId>>>,
+    /// Per-conversation hydration watermark — the
+    /// `MAX(received_at)` we last observed in `state_attachments`
+    /// for that conversation. `hydrate_if_needed` re-queries the
+    /// current max on each call; a mismatch means a new attachment
+    /// landed (web composer, transport-inbound, or
+    /// `web_fetch(as_attachment: true)`) and we need to re-walk.
+    /// A match means the conversation's attachment set is unchanged
+    /// since the last hydration and we can skip the dir walk.
+    ///
+    /// Pre-2026-05-25 this was a `HashSet<ConversationId>` — once a
+    /// conversation was hydrated, the cache short-circuited every
+    /// subsequent execute. Broke `web_fetch(as_attachment: true)`
+    /// because the freshly-written attachment was invisible to the
+    /// next execute. The watermark variant self-heals on any new
+    /// attachment from any code path.
+    ///
+    /// `i64` value because `state_attachments.received_at` is a
+    /// unix-seconds epoch stored as INTEGER.
+    hydrated_convos: Arc<Mutex<HashMap<ConversationId, i64>>>,
     _eviction_handle: tokio::task::JoinHandle<()>,
     // OutputWatcher dropped on Drop tears down its OS thread + tokio
     // timer. Kept named to make the lifetime obvious to readers.
@@ -200,7 +212,7 @@ impl PythonSandboxService {
             work_root,
             artifacts_root,
             db,
-            hydrated_convos: Arc::new(Mutex::new(HashSet::new())),
+            hydrated_convos: Arc::new(Mutex::new(HashMap::new())),
             _eviction_handle,
             _watcher: watcher,
         }))
@@ -217,22 +229,65 @@ impl PythonSandboxService {
     }
 
     /// Hydrate this conversation's uploaded attachments into
-    /// /work/<convo>/uploads/ if we haven't already this process
-    /// lifetime. Called from python.execute before the first
-    /// ensure_for so the kernel can immediately read user-supplied
-    /// files. Subsequent executes for the same convo skip this work
-    /// (the file copies are idempotent on size match anyway, but
-    /// the DB query + dir walk would be wasteful per turn).
+    /// /work/<convo>/uploads/ when the attachment set has changed
+    /// since the last hydration. Called from python.execute before
+    /// the first ensure_for so the kernel can immediately read
+    /// user-supplied files.
+    ///
+    /// Watermark strategy: on each call we run a cheap
+    /// `SELECT MAX(received_at)` against `state_attachments` for
+    /// the conversation, compare against the cached value, and
+    /// short-circuit when they match. A mismatch (or absent
+    /// cache entry) triggers the full `list_for_conversation` +
+    /// `hydrate_uploads` walk. This costs one indexed query per
+    /// execute when the cache is warm (~100 µs) but the upside
+    /// is that the cache self-heals on ANY new attachment
+    /// regardless of which code path wrote it (web composer,
+    /// transport-inbound, `web_fetch(as_attachment: true)`).
+    ///
+    /// Pre-2026-05-25 the cache was a boolean `HashSet<convo>`;
+    /// once a conversation hydrated once, subsequent executes
+    /// skipped hydration entirely. That hid newly-arrived
+    /// attachments and broke the `web_fetch → python.execute`
+    /// bridge that lets the agent ingest remote datasets.
     pub async fn hydrate_if_needed(
         &self,
         convo: &ConversationId,
     ) -> Result<(), HydrateOnExecuteError> {
+        // 1. Watermark probe — one cheap indexed read. `COALESCE`
+        //    so an empty attachment set returns 0 instead of NULL.
+        let convo_for_max = convo.clone();
+        let db_for_max = self.db.clone();
+        let current_max: i64 = tokio::task::spawn_blocking(move || {
+            let cid = convo_for_max.as_str().to_owned();
+            db_for_max.with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT COALESCE(MAX(received_at), 0) \
+                     FROM state_attachments WHERE conversation_id = ?1",
+                    rusqlite::params![cid],
+                    |r| r.get::<_, i64>(0),
+                )?)
+            })
+        })
+        .await
+        .map_err(|e| HydrateOnExecuteError::Db {
+            convo: convo.as_str().to_string(),
+            source: execlaw_core::DbError::Migration(format!("watermark join: {e}")),
+        })?
+        .map_err(|e| HydrateOnExecuteError::Db {
+            convo: convo.as_str().to_string(),
+            source: e,
+        })?;
+
+        // 2. Compare against cached watermark. Match → skip.
         {
             let cache = self.hydrated_convos.lock().await;
-            if cache.contains(convo) {
+            if cache.get(convo).copied() == Some(current_max) {
                 return Ok(());
             }
         }
+
+        // 3. Mismatch (or first-time): walk the full attachment set.
         let convo_owned = convo.clone();
         let db = self.db.clone();
         let rows = tokio::task::spawn_blocking(move || {
@@ -241,7 +296,7 @@ impl PythonSandboxService {
         .await
         .map_err(|e| HydrateOnExecuteError::Db {
             convo: convo.as_str().to_string(),
-            source: execlaw_core::DbError::Migration(format!("join: {e}")),
+            source: execlaw_core::DbError::Migration(format!("list join: {e}")),
         })?
         .map_err(|e| HydrateOnExecuteError::Db {
             convo: convo.as_str().to_string(),
@@ -249,9 +304,13 @@ impl PythonSandboxService {
         })?;
 
         if rows.is_empty() {
-            // Still mark hydrated so we don't redo the DB query on
-            // every execute for an attachment-less conversation.
-            self.hydrated_convos.lock().await.insert(convo.clone());
+            // Still cache the watermark (0) so we don't redo the
+            // SELECT MAX on every execute for an attachment-less
+            // conversation.
+            self.hydrated_convos
+                .lock()
+                .await
+                .insert(convo.clone(), current_max);
             return Ok(());
         }
 
@@ -291,9 +350,13 @@ impl PythonSandboxService {
         tracing::info!(
             convo = %convo,
             files = result.len(),
+            watermark = current_max,
             "python_sandbox hydrated conversation uploads"
         );
-        self.hydrated_convos.lock().await.insert(convo.clone());
+        self.hydrated_convos
+            .lock()
+            .await
+            .insert(convo.clone(), current_max);
         Ok(())
     }
 
@@ -593,6 +656,140 @@ mod tests {
             derive_default_filename("totally/made-up", "12345678"),
             "attachment-12345678.bin"
         );
+    }
+
+    // ===== Hydration watermark query (Slice F, 2026-05-25) =========
+    //
+    // `hydrate_if_needed` short-circuits when the cached
+    // `MAX(received_at)` for a conversation matches the current
+    // database value. The SQL below is the load-bearing piece —
+    // pin it directly so a regression in the COALESCE / index hint
+    // doesn't silently start returning NULL and crashing the
+    // sandbox path.
+    #[tokio::test]
+    async fn watermark_query_returns_zero_for_empty_conversation_and_moves_up_on_insert() {
+        use execlaw_core::DbConfig;
+        use execlaw_core::MigrationRunner;
+        use execlaw_core::attachments::{AttachmentRow, AttachmentStore};
+        use execlaw_core::conversation::{
+            ConversationKind, ConversationRow, ConversationStore, Modality, Phase,
+        };
+        use execlaw_core::ids::{AttachmentId, EventSeq};
+
+        let db = Database::open(&DbConfig::in_memory_unencrypted()).unwrap();
+        MigrationRunner::new(&db).apply_all().unwrap();
+        let cid = ConversationId::from("c-watermark");
+        ConversationStore::new(&db)
+            .upsert(&ConversationRow {
+                conversation_id: cid.clone(),
+                kind: ConversationKind::ControllerDM,
+                last_seq: EventSeq(0),
+                phase: Phase::Idle,
+                controller_id: None,
+                trust_class: "Controller".into(),
+                snapshot_blob: None,
+                snapshot_seq: None,
+                lease_owner: None,
+                lease_expires: None,
+                modality: Modality::Text,
+                display_name: None,
+                display_name_source: "auto".into(),
+                is_pinned: false,
+                is_ephemeral: false,
+                ephemeral_expires_at: None,
+                last_activity_at: 0,
+            })
+            .unwrap();
+
+        // The same query `hydrate_if_needed` runs.
+        let probe = |cid: &ConversationId| -> i64 {
+            let cid_owned = cid.as_str().to_owned();
+            db.with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT COALESCE(MAX(received_at), 0) \
+                     FROM state_attachments WHERE conversation_id = ?1",
+                    rusqlite::params![cid_owned],
+                    |r| r.get::<_, i64>(0),
+                )?)
+            })
+            .unwrap()
+        };
+
+        // Empty → 0 (not NULL — COALESCE is doing its job).
+        assert_eq!(probe(&cid), 0);
+
+        // First attachment lands at received_at=100.
+        AttachmentStore::new(&db)
+            .insert(&AttachmentRow {
+                id: AttachmentId::new(),
+                conversation_id: cid.clone(),
+                mime_type: "text/csv".into(),
+                path: "/tmp/a.csv".into(),
+                sha256: "aa".into(),
+                received_at: 100,
+                filename: Some("a.csv".into()),
+            })
+            .unwrap();
+        assert_eq!(probe(&cid), 100);
+
+        // Second attachment at received_at=200 — watermark moves up.
+        // This is the case web_fetch(as_attachment: true) exercises:
+        // a previously-hydrated conversation gets a new file mid-turn.
+        AttachmentStore::new(&db)
+            .insert(&AttachmentRow {
+                id: AttachmentId::new(),
+                conversation_id: cid.clone(),
+                mime_type: "text/csv".into(),
+                path: "/tmp/b.csv".into(),
+                sha256: "bb".into(),
+                received_at: 200,
+                filename: Some("b.csv".into()),
+            })
+            .unwrap();
+        assert_eq!(probe(&cid), 200);
+
+        // Older attachment (received_at < current max) does NOT move
+        // the watermark down — MAX semantics. Belt-and-suspenders
+        // assert so a future cache-fix that switches to LAST(...) or
+        // count() trips the test.
+        AttachmentStore::new(&db)
+            .insert(&AttachmentRow {
+                id: AttachmentId::new(),
+                conversation_id: cid.clone(),
+                mime_type: "text/csv".into(),
+                path: "/tmp/c.csv".into(),
+                sha256: "cc".into(),
+                received_at: 50,
+                filename: Some("c.csv".into()),
+            })
+            .unwrap();
+        assert_eq!(probe(&cid), 200);
+
+        // Different conversation has its own watermark — no
+        // cross-conversation bleed.
+        let other = ConversationId::from("c-other");
+        ConversationStore::new(&db)
+            .upsert(&ConversationRow {
+                conversation_id: other.clone(),
+                kind: ConversationKind::ControllerDM,
+                last_seq: EventSeq(0),
+                phase: Phase::Idle,
+                controller_id: None,
+                trust_class: "Controller".into(),
+                snapshot_blob: None,
+                snapshot_seq: None,
+                lease_owner: None,
+                lease_expires: None,
+                modality: Modality::Text,
+                display_name: None,
+                display_name_source: "auto".into(),
+                is_pinned: false,
+                is_ephemeral: false,
+                ephemeral_expires_at: None,
+                last_activity_at: 0,
+            })
+            .unwrap();
+        assert_eq!(probe(&other), 0);
     }
 
     #[test]

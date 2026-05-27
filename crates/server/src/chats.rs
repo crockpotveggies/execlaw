@@ -34,14 +34,17 @@ use crate::state::AppState;
 mod attachments;
 mod helpers;
 mod prompt;
-mod types;
+pub(crate) mod types;
 
 // 2026-05-16 — types lifted into `chats/types.rs`. Re-exported
 // here so external callers (and the OpenAPI generator) keep
 // resolving them at `crate::chats::X`. The persisted-payload
 // structs stay crate-private; they're the chats module's contract
 // with the event log, not part of the public surface.
-pub use prompt::{GroupTurnContext, build_turn_context_prose, resolve_group_turn_context};
+pub use prompt::{
+    GroupTurnContext, assemble_system_prompt, build_turn_context_prose,
+    resolve_group_turn_context,
+};
 pub use types::{
     IncognitoTurnMessage, InlineAttachmentRequest, ListQuery, MessageAttachmentView, MessageView,
     MessagesListResponse, PatchThreadRequest, PatchThreadResponse, SendMessageRequest,
@@ -56,7 +59,7 @@ pub(crate) use attachments::{
     extract_attachment_ids, extract_channel_origin, extract_text, fetch_data_ref,
     hydrate_message_attachments, persist_inbound_attachments,
 };
-pub(crate) use prompt::{assemble_system_prompt, build_tool_routing_prose, humanise_tool_call};
+pub(crate) use prompt::{build_tool_routing_prose, humanise_tool_call};
 // 2026-05-16 — small utilities split out into `chats/helpers.rs`.
 // `ensure_conversation_for` and `apply_auto_display_name` are
 // consumed by `crate::generic_inbound`; `rewrite_url_for_container`
@@ -136,8 +139,51 @@ pub async fn send_message(
             }
         };
 
+    // 2026-05-22 — Flows middleware (Phase A + B). Run matching
+    // `chat.prompt` flows synchronously BEFORE skill resolution
+    // and turn dispatch. The middleware can:
+    //   * RewritePrompt — replace the user-facing text the model sees
+    //   * SetSkills    — append to the skill list (composer + flow merge)
+    //   * SetTools     — add capabilities to caller_caps
+    //   * SetTrust     — override the policy engine's sender_trust
+    //   * AddAttachment — append attachment IDs
+    //   * AddMemory    — prepend `<memory>...</memory>` to the user text
+    //
+    // Skipped for incognito (no persistent state, no flow eval).
+    //
+    // Performance: zero enabled flows → one indexed SELECT against
+    // `state_automations` + immediate return (~4µs measured on warm
+    // SQLite). One flow + RewritePrompt → ~125µs measured. Rhai
+    // is sandboxed at RHAI_MAX_OPS (100k) so a pathological flow
+    // can't hang the chat handler.
+    //
+    // Failure mode: any middleware error logs WARN and the chat
+    // proceeds with un-mutated inputs. Flows are best-effort
+    // customization, never a gate on the turn.
+    let flow_outcome = if req.incognito {
+        crate::flow_middleware::FlowOutcome::default()
+    } else {
+        let flow_event = crate::flow_middleware::build_chat_prompt_event(
+            cid.as_str(),
+            &req.text,
+            req.sender_principal_id.as_deref(),
+            // No transport bridge metadata on this code path → "web".
+            // Channel-plugin inbound paths (Signal, WhatsApp) pass their
+            // own value once they're wired through generic_inbound.
+            "web",
+            &Vec::<String>::new(),
+        );
+        crate::flow_middleware::evaluate(&state, &flow_event)
+    };
+    // `flow_outcome.dropped` is observed but Phases A/B do NOT
+    // short-circuit the turn on it — that semantic lands once the
+    // operator UX for "your message was filtered" is designed. For
+    // now a Filter-drop is informational only.
+    let _ = flow_outcome.dropped;
+
     // 2026-05-15 — operator-picked skills (composer `+` menu, second
-    // item). Resolve every name to its current body and build the
+    // item) + flow-injected skills (Phase B SetSkills mutator).
+    // Resolve the merged list to its current bodies and build the
     // `<skill name="...">...</skill>\n\n` prepend block. Validation
     // failures (unknown / archived / prepend too large) short-circuit
     // BEFORE any event-log write so a typo'd skill name doesn't
@@ -146,12 +192,23 @@ pub async fn send_message(
     // regardless of which runtime answers. Skipped for incognito
     // (no DB read against the transient session) and for non-web
     // inbounds (transports don't surface a skill picker today).
+    let merged_skill_names: Vec<String> = if req.incognito {
+        Vec::new()
+    } else {
+        let mut merged = req.skill_names.clone();
+        for s in &flow_outcome.appended_skills {
+            if !merged.contains(s) {
+                merged.push(s.clone());
+            }
+        }
+        merged
+    };
     let (skill_prepend, applied_skill_names): (String, Vec<String>) =
-        if req.incognito || req.skill_names.is_empty() {
+        if merged_skill_names.is_empty() {
             (String::new(), Vec::new())
         } else {
-            match resolve_skill_prepend(&state.db, &req.skill_names) {
-                Ok(block) => (block, req.skill_names.clone()),
+            match resolve_skill_prepend(&state.db, &merged_skill_names) {
+                Ok(block) => (block, merged_skill_names.clone()),
                 Err((status, code, message)) => {
                     return (
                         status,
@@ -163,11 +220,30 @@ pub async fn send_message(
                 }
             }
         };
-    let effective_user_text: String = if skill_prepend.is_empty() {
-        req.text.clone()
-    } else {
-        format!("{skill_prepend}{}", req.text)
+
+    // Compose the effective user text. Order:
+    //   <memory>…</memory>\n\n   ← Phase B AddMemory aggregation
+    //   <skill name="…">…</skill>\n\n  ← composer + Phase B SetSkills
+    //   <body>                    ← RewritePrompt result OR raw req.text
+    let memory_prepend = crate::flow_middleware::render_memory_prepend(
+        &flow_outcome.injected_memory,
+    );
+    let base_text: String = match &flow_outcome.rewritten_prompt {
+        Some(rewritten) if !rewritten.is_empty() => {
+            tracing::debug!(
+                target: "flow_middleware",
+                conversation_id = %cid.as_str(),
+                original_len = req.text.len(),
+                rewritten_len = rewritten.len(),
+                "flow middleware rewrote prompt for this turn",
+            );
+            rewritten.clone()
+        }
+        _ => req.text.clone(),
     };
+    let effective_user_text: String = format!(
+        "{memory_prepend}{skill_prepend}{base_text}"
+    );
 
     // 2026-04-28 — incognito short-circuit. We branch BEFORE
     // identity resolution / policy evaluation / event-log writes
@@ -201,11 +277,30 @@ pub async fn send_message(
     // per §2.14). Otherwise persist as UnknownPending so the
     // cold-contact flow below can park the conversation.
     let principals = PrincipalStore::new(&state.db);
-    let (principal, sender_trust) =
+    let (principal, sender_trust_raw) =
         match resolve_sender(&state, &principals, &req.sender_principal_id).await {
             Ok(pair) => pair,
             Err(e) => return err_500(&format!("identity resolution: {e}")),
         };
+    // 2026-05-22 — Phase B SetTrust override. The flow-authored
+    // override takes precedence when set. Maps the operator-facing
+    // `TrustClass` onto the flat policy `TrustLevel` the policy
+    // engine matches on. Ignored when no flow set a trust.
+    let sender_trust = match flow_outcome.trust_override {
+        Some(class) => {
+            let overridden =
+                crate::flow_middleware::trust_class_to_policy_level(class);
+            tracing::debug!(
+                target: "flow_middleware",
+                conversation_id = %cid.as_str(),
+                original = %sender_trust_raw.as_str(),
+                overridden = %overridden.as_str(),
+                "flow middleware overrode sender trust",
+            );
+            overridden
+        }
+        None => sender_trust_raw,
+    };
     // §2.6: re-derive ConversationKind from participants. Phase 3
     // single-participant chat: the conversation kind reflects the
     // sender's trust class. Group + multi-transport derivation
@@ -293,11 +388,18 @@ pub async fn send_message(
     let registry_for_tools = state.plugin_host.registry();
     let has_plugin_tools =
         !registry_for_tools.all_tools().is_empty() || !registry_for_tools.all_builtins().is_empty();
-    let caller_caps: Vec<String> = policy
+    // Start from the policy engine's cap set, then extend with any
+    // tools flow-injected via SetTools. Dedupes additively.
+    let mut caller_caps: Vec<String> = policy
         .capability_set
         .iter()
         .map(|s| (*s).to_owned())
         .collect();
+    for tool in &flow_outcome.added_tools {
+        if !caller_caps.contains(tool) {
+            caller_caps.push(tool.clone());
+        }
+    }
     let spotlight_content = policy.spotlighting;
     // Planner/executor containment (§9.2): when `policy.planner_executor`
     // fires — i.e. effective_trust < KnownTrusted — the model that sees
@@ -388,7 +490,7 @@ pub async fn send_message(
     // write the blobs + `state_attachments` rows. Failure surfaces
     // as a 500 — there's nothing useful the caller can do besides
     // retry.
-    let persisted_attachments: Vec<String> = if decoded_attachments.is_empty() {
+    let mut persisted_attachments: Vec<String> = if decoded_attachments.is_empty() {
         Vec::new()
     } else {
         match crate::chats::attachments::commit_decoded_attachments(
@@ -402,9 +504,22 @@ pub async fn send_message(
     };
     drop(decoded_attachments);
 
+    // 2026-05-22 — Phase B AddAttachment mutator. Flow-added IDs
+    // append to the persisted list (deduped). The chat handler's
+    // attachment-decode step doesn't re-validate existence here;
+    // the turn driver consumes IDs as-is and surfaces missing-blob
+    // errors at use time. Flows should reference IDs already
+    // persisted to `state_attachments` (e.g. uploaded earlier in
+    // the conversation).
+    for id in &flow_outcome.added_attachment_ids {
+        if !persisted_attachments.contains(id) {
+            persisted_attachments.push(id.clone());
+        }
+    }
+
     let (user_msg_seq, assistant_text, assistant_seq) =
         match (inference_for_turn, runner_routed.as_deref()) {
-            (Some(_inference), Some(group_id)) => {
+            (Some(inference), Some(group_id)) => {
                 // The supervisor is fetched from `state` inside
                 // `run_runner_turn` now (the prior signature passed it
                 // redundantly). We still gate the branch on
@@ -428,6 +543,7 @@ pub async fn send_message(
                     group_context: group_context_for_turn.clone(),
                     attachment_ids: persisted_attachments.clone(),
                     applied_skill_names: applied_skill_names.clone(),
+                    resolved_inference: inference,
                 })
                 .await
                 {
@@ -807,7 +923,7 @@ async fn run_real_turn(
         turn_context.push_str(&block);
     }
     let composed_system = assemble_system_prompt(
-        &state.db,
+        state,
         Some(cid.as_str()),
         &state.config.system_prompt,
         "",
@@ -1248,6 +1364,14 @@ pub(crate) struct RunnerTurnCtx<'a> {
     /// by the send-handler upstream; the runner doesn't need to
     /// re-resolve them.
     pub applied_skill_names: Vec<String>,
+    /// 2026-05-26 — already-resolved inference target for this turn.
+    /// Every caller of `run_runner_turn` already calls
+    /// `state.inference.resolve(...)` upstream to gate the runner
+    /// branch (`runner_eligible = ... && inference_for_turn.is_some()`).
+    /// Threading the value through avoids a second indexed
+    /// `BackendStore::get()` read inside the runner path — small win
+    /// per turn (~50-100 us) but the right shape.
+    pub resolved_inference: crate::inference_resolver::ResolvedInference,
 }
 
 /// Build the `tool_catalog` the runner advertises to the model for one
@@ -1643,6 +1767,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         group_context,
         attachment_ids,
         applied_skill_names,
+        resolved_inference,
     } = ctx;
     let supervisor = state
         .runner_supervisor
@@ -1726,7 +1851,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         turn_context.push_str(&block);
     }
     let composed_system = assemble_system_prompt(
-        &state.db,
+        state,
         Some(cid.as_str()),
         &state.config.system_prompt,
         &routing_prose,
@@ -1768,15 +1893,17 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
 
     // Step 3 — build TurnRequest.
     let turn_id = supervisor.mint_turn_id();
-    // Resolve client + model id from the SAME backend-row read so
-    // they can't drift (cf. the 2026-05-13 regression where the chat
-    // path sent `model=Qwen3.5` to a vLLM container loaded with
-    // `model=Qwen3.6`, because the URL came from the DB and the
-    // model id came from a stale `state.config.model_id` constant).
-    let resolved = state
-        .inference
-        .resolve(&state.db, BackendPurpose::Standard)
-        .ok_or_else(|| "no inference backend configured".to_owned())?;
+    // Inference target was resolved ONCE by the caller (every
+    // `run_runner_turn` callsite already gates the runner branch on
+    // `inference_for_turn.is_some()`) and threaded in via the ctx;
+    // re-resolving here would burn a second `BackendStore::get()`
+    // SQLite read per turn for no benefit. Client + model id still
+    // travel together from the SAME backend-row read so they can't
+    // drift (cf. the 2026-05-13 regression where the chat path sent
+    // `model=Qwen3.5` to a vLLM container loaded with `model=Qwen3.6`
+    // because the URL came from the DB and the model id came from a
+    // stale `state.config.model_id` constant).
+    let resolved = resolved_inference;
     let inference_client_for_subagents = resolved.client.clone();
     let resolved_model_id = resolved.model_id.clone();
     let inference_url = resolved.endpoint.clone();
@@ -1880,7 +2007,22 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
             state.research_supervisor.as_ref().map(|s| s.wake.clone()),
         )
         .with_signal_transport_opt::<()>(None, None)
-        .with_host_transports(state.host_transports.clone()),
+        .with_host_transports(state.host_transports.clone())
+        // 2026-05-25 — wire the blob dir so
+        // `web_fetch(as_attachment: true)` →
+        // `AttachmentApi::create_conversation_attachment` can land
+        // remote-fetched bytes as a conversation attachment that the
+        // python sandbox hydrator picks up on the next execute.
+        // Same `<data_dir>/blobs/` the web composer writes to.
+        .with_blobs_root(
+            state
+                .db_config
+                .path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("blobs"),
+        ),
     );
 
     // Step 3.5 — lazy-spawn the runner if it's not registered yet.
@@ -1888,8 +2030,22 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
     // other group spawns on first inbound turn. `ensure_for_group`
     // returns the existing handle when one's already up so this
     // costs ~50µs in the hot path.
+    //
+    // Spawn deadline. Raised from 30s → 90s 2026-05-21 because cold
+    // starts that include image pulls or the python-sandbox sidecar
+    // bring-up routinely exceed 30s on real Docker installs, causing
+    // a confusing `runner turn failed: operation timed out` error
+    // for the operator on what should be a routine first-turn.
+    // EXECLAW_RUNNER_SPAWN_TIMEOUT_SECS lets power users tune it
+    // without a SPA setting + migration round-trip (proper Settings
+    // surface lives behind a longer-tail cleanup).
+    let spawn_deadline_secs: u64 = std::env::var("EXECLAW_RUNNER_SPAWN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&v: &u64| (5..=600).contains(&v))
+        .unwrap_or(90);
     supervisor
-        .ensure_for_group(group_id, std::time::Duration::from_secs(30))
+        .ensure_for_group(group_id, std::time::Duration::from_secs(spawn_deadline_secs))
         .await
         .map_err(|e| format!("ensure runner: {e}"))?;
 
@@ -1965,8 +2121,16 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
 
     while let Some(ev) = rx.recv().await {
         match ev {
-            TurnEvent::TokenDelta { .. } => {
-                // Already on the EventBus via supervisor.handle_inbound.
+            TurnEvent::TokenDelta { text } => {
+                // Already on the EventBus via supervisor.handle_inbound
+                // for live UI streaming. ALSO accumulate locally so the
+                // abnormal-end branch below can commit whatever the
+                // agent produced before the failure — without this,
+                // refresh-after-timeout shows the placeholder
+                // "(turn errored before completion)" and the streamed
+                // text the operator already saw is lost. (2026-05-21
+                // triage C: streaming text disappears on refresh.)
+                assistant_text.push_str(&text);
             }
             TurnEvent::Phase { .. } => {
                 // Same.
@@ -2158,7 +2322,14 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
     //      audit-relevant to record and the user_msg already in the
     //      log keeps the prior SPA contract.
     let abnormal_end = !got_complete && error_message.is_some();
-    if abnormal_end && pending.is_empty() && !was_cancelled {
+    // 2026-05-21 (triage C): also commit when the agent streamed some
+    // text before the error/timeout, even if no tools executed. Prior
+    // logic returned Err without committing whenever `pending` was
+    // empty + not a cancel, which meant a "spawn timed out mid-stream"
+    // sequence dropped the streamed text on the floor — the operator
+    // saw the text live, refreshed, and it was gone.
+    let have_streamed_text = !assistant_text.is_empty();
+    if abnormal_end && pending.is_empty() && !was_cancelled && !have_streamed_text {
         return Err(error_message.unwrap_or_else(|| "runner error".into()));
     }
     if abnormal_end {
@@ -2343,7 +2514,22 @@ async fn run_tool_capable_turn(
             state.research_supervisor.as_ref().map(|s| s.wake.clone()),
         )
         .with_signal_transport_opt::<()>(None, None)
-        .with_host_transports(state.host_transports.clone()),
+        .with_host_transports(state.host_transports.clone())
+        // 2026-05-25 — wire the blob dir so
+        // `web_fetch(as_attachment: true)` →
+        // `AttachmentApi::create_conversation_attachment` can land
+        // remote-fetched bytes as a conversation attachment that the
+        // python sandbox hydrator picks up on the next execute.
+        // Same `<data_dir>/blobs/` the web composer writes to.
+        .with_blobs_root(
+            state
+                .db_config
+                .path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("blobs"),
+        ),
     );
     let exec = TurnExecutor::new((*inference).clone(), dispatch);
     // Phase 11.A — wire a phase observer that fans the runner's
@@ -2398,7 +2584,7 @@ async fn run_tool_capable_turn(
     // message — system+tools stay byte-identical across turns,
     // prefix cache amortises, follow-up turns drop to <1 s prefill.
     let composed_system_prompt = assemble_system_prompt(
-        &state.db,
+        state,
         Some(cid.as_str()),
         &state.config.system_prompt,
         &routing_prose,
@@ -2808,7 +2994,7 @@ pub async fn dispatch_routine_turn(
         };
 
     let result = match (inference_for_turn, runner_routed_group.as_deref()) {
-        (Some(_inference), Some(group_id)) => {
+        (Some(inference), Some(group_id)) => {
             let cancel_guard = crate::turn_cancel::TurnCancelGuard::new(
                 state.turn_cancel.clone(),
                 cid.as_str().to_owned(),
@@ -2834,6 +3020,7 @@ pub async fn dispatch_routine_turn(
                 attachment_ids: Vec::new(),
                 // Routines don't surface a skill picker.
                 applied_skill_names: Vec::new(),
+                resolved_inference: inference,
             })
             .await;
             drop(cancel_guard);
@@ -3100,6 +3287,109 @@ pub async fn dispatch_external_turn(
     ensure_conversation(&store, cid);
     refresh_conversation_kind(&store, cid, principal.trust_level.class_tag());
 
+    // 2026-05-22 — Phase C of the Flows middleware redesign. Run
+    // matching `chat.prompt` flows before policy + turn dispatch on
+    // the channel-plugin inbound path (Signal, WhatsApp, …) — the
+    // same evaluation `send_message` runs for the web composer.
+    // The `event.payload.channel` field carries the plugin id
+    // (e.g. `"signal"`) so per-channel Filter Rhai (`event.payload
+    // .channel == "signal"`) narrows the flow set.
+    //
+    // Skipped mutations on this path: SetSkills (channel plugins
+    // don't carry the composer's `+` skill picker; resolving an
+    // unknown skill would error out the inbound which is
+    // user-hostile — skip silently here, surface in the run trace).
+    //
+    // Failure mode + perf budget identical to send_message: any
+    // middleware error logs WARN and the turn proceeds unmutated.
+    let flow_outcome = {
+        let flow_event = crate::flow_middleware::build_chat_prompt_event(
+            cid.as_str(),
+            text,
+            Some(principal.id.as_str()),
+            inbound_channel_origin.unwrap_or("unknown"),
+            &attachment_ids,
+        );
+        crate::flow_middleware::evaluate(state, &flow_event)
+    };
+    if !flow_outcome.appended_skills.is_empty() {
+        // Document the skip in the trace (single WARN per turn at
+        // most — flows that touch SetSkills on a transport-bridged
+        // inbound are operator-authored mistakes, not normal flow).
+        tracing::warn!(
+            target: "flow_middleware",
+            conversation_id = %cid.as_str(),
+            channel = %inbound_channel_origin.unwrap_or("unknown"),
+            skipped_count = flow_outcome.appended_skills.len(),
+            "SetSkills flow mutation ignored on plugin-inbound turn: transports don't carry a skill resolver",
+        );
+    }
+    let _ = flow_outcome.dropped; // Phase A/B decision: observe but don't short-circuit.
+
+    // Apply trust override BEFORE evaluate_turn so the policy
+    // engine's spotlighting + planner/executor split engage on
+    // demotion. SetTrust → Blocked / UnknownPending takes the
+    // inbound out of the routable path — surface as an alert
+    // (same shape as the rule-of-two breach below) and bail.
+    let mut sender_trust = sender_trust;
+    if let Some(class) = flow_outcome.trust_override {
+        let overridden = crate::flow_middleware::trust_class_to_policy_level(class);
+        tracing::debug!(
+            target: "flow_middleware",
+            conversation_id = %cid.as_str(),
+            channel = %inbound_channel_origin.unwrap_or("unknown"),
+            original = %sender_trust.as_str(),
+            overridden = %overridden.as_str(),
+            "flow middleware overrode sender trust on plugin inbound",
+        );
+        sender_trust = overridden;
+    }
+    if matches!(
+        sender_trust,
+        TrustLevel::Blocked | TrustLevel::UnknownPending
+    ) {
+        // SetTrust pushed this inbound out of the routable set
+        // post-flow. Surface as a Warning alert so the operator
+        // sees the override took effect; same shape as the
+        // rule-of-two alert below.
+        state.events.publish(UiEvent::AlertFired {
+            alert_id: format!("appr-{}", uuid::Uuid::new_v4()),
+            severity: "Warning".into(),
+            source: "core.flow_trust_override".into(),
+            title: format!(
+                "Flow override demoted inbound from {} to {} — turn dropped",
+                principal.id.as_str(),
+                sender_trust.as_str(),
+            ),
+        });
+        return Ok(());
+    }
+
+    // Compose the effective text: memory_prepend +
+    // (rewritten_prompt || raw text). No skill_prepend on this
+    // path — channel plugins don't carry the composer's skill
+    // picker. Owned String so downstream borrows survive.
+    let memory_prepend = crate::flow_middleware::render_memory_prepend(
+        &flow_outcome.injected_memory,
+    );
+    let base_text: String = match &flow_outcome.rewritten_prompt {
+        Some(rewritten) if !rewritten.is_empty() => rewritten.clone(),
+        _ => text.to_owned(),
+    };
+    let effective_text: String = format!("{memory_prepend}{base_text}");
+    let text: &str = &effective_text;
+
+    // AddAttachment merges into the inbound's attachment_ids
+    // (deduped, additive). Owned Vec — shadows the parameter so
+    // downstream `attachment_ids.clone()` picks up the merged
+    // version.
+    let mut attachment_ids = attachment_ids;
+    for id in &flow_outcome.added_attachment_ids {
+        if !attachment_ids.contains(id) {
+            attachment_ids.push(id.clone());
+        }
+    }
+
     let policy = evaluate_turn(TurnPolicyInput {
         effective_trust: sender_trust,
         sender_trust,
@@ -3144,11 +3434,19 @@ pub async fn dispatch_external_turn(
     let _typing_guard = TypingIndicatorGuard::for_conversation(state, cid).await;
 
     let sender = Some(principal.id.as_str().to_owned());
-    let caller_caps: Vec<String> = policy
+    // Phase B SetTools mutator applied on the plugin-inbound path
+    // too — additive, deduped against the policy-engine's natural
+    // cap set.
+    let mut caller_caps: Vec<String> = policy
         .capability_set
         .iter()
         .map(|s| (*s).to_owned())
         .collect();
+    for tool in &flow_outcome.added_tools {
+        if !caller_caps.contains(tool) {
+            caller_caps.push(tool.clone());
+        }
+    }
     let caller_trust = sender_trust;
 
     let has_plugin_tools = !state.plugin_host.registry().all_tools().is_empty();
@@ -3198,7 +3496,7 @@ pub async fn dispatch_external_turn(
         };
 
     let result = match (inference_for_turn, runner_routed_group.as_deref()) {
-        (Some(_inference), Some(group_id)) => {
+        (Some(inference), Some(group_id)) => {
             let cancel_guard = crate::turn_cancel::TurnCancelGuard::new(
                 state.turn_cancel.clone(),
                 cid_str.clone(),
@@ -3221,6 +3519,7 @@ pub async fn dispatch_external_turn(
                 attachment_ids: attachment_ids.clone(),
                 // Transports don't surface a skill picker.
                 applied_skill_names: Vec::new(),
+                resolved_inference: inference,
             })
             .await;
             drop(cancel_guard);
@@ -3735,7 +4034,7 @@ pub async fn dispatch_clarification_turn(
             None
         };
     let result = match (inference_for_turn, runner_routed_group.as_deref()) {
-        (Some(_inference), Some(group_id)) => {
+        (Some(inference), Some(group_id)) => {
             let cancel_guard = crate::turn_cancel::TurnCancelGuard::new(
                 state.turn_cancel.clone(),
                 cid.as_str().to_owned(),
@@ -3760,6 +4059,7 @@ pub async fn dispatch_clarification_turn(
                 group_context: synth_group_ctx.clone(),
                 attachment_ids: Vec::new(),
                 applied_skill_names: Vec::new(),
+                resolved_inference: inference,
             })
             .await;
             drop(cancel_guard);
@@ -4878,6 +5178,442 @@ mod tests {
         );
     }
 
+    /// Phase A of the Flows middleware redesign (2026-05-22):
+    /// end-to-end proof that an enabled `RewritePrompt` flow mutates
+    /// what the chat turn driver sees.
+    ///
+    /// Setup: insert a `chat.prompt` flow that prepends `[FLOW] ` to
+    /// the user text. Send `"hi"` (2 chars) through the chat
+    /// handler. The stub turn driver echoes back `"received N chars"`
+    /// where N is the length of `effective_user_text` — so if the
+    /// rewrite landed, N == 8 (`[FLOW] hi`), not 2. The persisted
+    /// `user_msg` event also reflects the rewrite (matches the
+    /// existing `effective_user_text` → log contract).
+    #[tokio::test]
+    async fn flow_middleware_rewrite_prompt_mutates_turn_text() {
+        use execlaw_core::automations::{
+            AutomationDef, AutomationStore, AutomationUpsert,
+        };
+        let state = crate::routes::test_app_state();
+
+        // Insert an enabled RewritePrompt flow.
+        let def: AutomationDef = serde_json::from_value(serde_json::json!({
+            "trigger": {"kind": "chat.prompt", "when": null},
+            "nodes": [{
+                "id": "rw",
+                "kind": "RewritePrompt",
+                "config": {"expr": "\"[FLOW] \" + event.payload.text"}
+            }],
+            "edges": [
+                {"from": "trigger", "to": "rw", "when": null},
+                {"from": "rw", "to": "END", "when": null}
+            ]
+        }))
+        .unwrap();
+        AutomationStore::new(&state.db)
+            .upsert(
+                &AutomationUpsert {
+                    id: None,
+                    name: "test-rewrite".into(),
+                    enabled: true,
+                    definition: def,
+                },
+                1000,
+            )
+            .unwrap();
+
+        let app = crate::routes::build_router(state);
+        let (status, body) = send(app, "hi").await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The stub turn driver returns "(execlaw dev stub) received N chars …"
+        // where N is the byte/char count of the text it received.
+        // Original input "hi" = 2 chars. Rewritten "[FLOW] hi" = 9 chars.
+        let reply = body["assistant_text"].as_str().unwrap();
+        assert!(
+            reply.contains("received 9 chars"),
+            "stub reply must reflect the rewritten char count (got: {reply})",
+        );
+    }
+
+    /// Same setup as the rewrite test, but with the flow DISABLED.
+    /// Confirms the hot path doesn't fire the flow and the original
+    /// text is what the turn driver sees.
+    #[tokio::test]
+    async fn flow_middleware_disabled_flow_does_not_rewrite() {
+        use execlaw_core::automations::{
+            AutomationDef, AutomationStore, AutomationUpsert,
+        };
+        let state = crate::routes::test_app_state();
+
+        let def: AutomationDef = serde_json::from_value(serde_json::json!({
+            "trigger": {"kind": "chat.prompt", "when": null},
+            "nodes": [{
+                "id": "rw",
+                "kind": "RewritePrompt",
+                "config": {"expr": "\"[FLOW] \" + event.payload.text"}
+            }],
+            "edges": [
+                {"from": "trigger", "to": "rw", "when": null},
+                {"from": "rw", "to": "END", "when": null}
+            ]
+        }))
+        .unwrap();
+        AutomationStore::new(&state.db)
+            .upsert(
+                &AutomationUpsert {
+                    id: None,
+                    name: "disabled-flow".into(),
+                    enabled: false,
+                    definition: def,
+                },
+                1000,
+            )
+            .unwrap();
+
+        let app = crate::routes::build_router(state);
+        let (status, body) = send(app, "hi").await;
+        assert_eq!(status, StatusCode::OK);
+        let reply = body["assistant_text"].as_str().unwrap();
+        assert!(
+            reply.contains("received 2 chars"),
+            "disabled flow must not rewrite; reply should reflect the original 2-char input (got: {reply})",
+        );
+    }
+
+    // ---- Phase B end-to-end mutator tests ----
+
+    /// Helper: insert an enabled flow with the given graph JSON.
+    fn install_flow(state: &AppState, name: &str, def_json: serde_json::Value) {
+        use execlaw_core::automations::{AutomationStore, AutomationUpsert};
+        let def: execlaw_core::automations::AutomationDef =
+            serde_json::from_value(def_json).expect("flow def must parse");
+        AutomationStore::new(&state.db)
+            .upsert(
+                &AutomationUpsert {
+                    id: None,
+                    name: name.into(),
+                    enabled: true,
+                    definition: def,
+                },
+                1000,
+            )
+            .unwrap();
+    }
+
+    fn simple_node_flow(node_kind: &str, config: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "trigger": {"kind": "chat.prompt", "when": null},
+            "nodes": [
+                {"id": "n", "kind": node_kind, "config": config}
+            ],
+            "edges": [
+                {"from": "trigger", "to": "n", "when": null},
+                {"from": "n", "to": "END", "when": null}
+            ]
+        })
+    }
+
+    /// SetTrust → Blocked: the chat handler's policy gate returns
+    /// 403 sender_blocked when the override demotes the controller
+    /// all the way down. Proves the override reaches `evaluate_turn`.
+    #[tokio::test]
+    async fn flow_set_trust_blocked_returns_403() {
+        let state = crate::routes::test_app_state();
+        install_flow(
+            &state,
+            "block-all",
+            simple_node_flow("SetTrust", serde_json::json!({"trust": "blocked"})),
+        );
+        let app = crate::routes::build_router(state);
+        let (status, body) = send(app, "hi").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["code"], "sender_blocked");
+    }
+
+    /// AddMemory prepends a `<memory>...</memory>` block to the user
+    /// text. The stub turn driver echoes back `received N chars` so
+    /// we can verify the prepend landed by char-counting.
+    ///
+    /// Memory wrapper layout: `<memory>\n<body>\n</memory>\n\n`
+    /// → 8 + 1 + len(body) + 1 + 9 + 2 = 21 + len(body) chars
+    /// added on top of the user text.
+    #[tokio::test]
+    async fn flow_add_memory_prepends_block_to_user_text() {
+        let state = crate::routes::test_app_state();
+        // body = "ctx" → 3 chars. Wrapper = 21. Total prepend = 24.
+        // Plus "hi" (2) = 26 chars.
+        install_flow(
+            &state,
+            "memory-ctx",
+            simple_node_flow("AddMemory", serde_json::json!({"text": "ctx"})),
+        );
+        let app = crate::routes::build_router(state);
+        let (status, body) = send(app, "hi").await;
+        assert_eq!(status, StatusCode::OK);
+        let reply = body["assistant_text"].as_str().unwrap();
+        assert!(
+            reply.contains("received 26 chars"),
+            "AddMemory must prepend a memory block; expected 26 chars (got: {reply})",
+        );
+    }
+
+    /// SetSkills appends to the skill list; the merged list flows
+    /// into `resolve_skill_prepend`. Sending a request that doesn't
+    /// pre-name any skills + a flow that injects an unknown skill
+    /// must trip the skill-prepend resolver's "unknown skill" 400.
+    /// That proves the merged list reached the resolver.
+    #[tokio::test]
+    async fn flow_set_skills_merges_into_skill_resolver() {
+        let state = crate::routes::test_app_state();
+        install_flow(
+            &state,
+            "inject-skill",
+            simple_node_flow(
+                "SetSkills",
+                serde_json::json!({"skills": ["nonexistent_skill_xyz"]}),
+            ),
+        );
+        let app = crate::routes::build_router(state);
+        let (status, body) = send(app, "hi").await;
+        // resolve_skill_prepend returns 404 for unknown skill names.
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("nonexistent_skill_xyz"),
+            "error must reference the unknown skill name (got: {body})",
+        );
+    }
+
+    /// AddAttachment appends IDs to `persisted_attachments` which
+    /// the stub turn writes into the `user_msg` event payload. The
+    /// list-messages hydration filters unknown IDs (no row in
+    /// state_attachments), so we go straight to the event log and
+    /// decode the user_msg payload to verify the id landed.
+    #[tokio::test]
+    async fn flow_add_attachment_appends_to_user_msg_payload() {
+        use execlaw_core::events::{EventKind, EventLog};
+        use execlaw_core::ids::{ConversationId, EventSeq};
+        let state = crate::routes::test_app_state();
+        install_flow(
+            &state,
+            "att-tag",
+            simple_node_flow(
+                "AddAttachment",
+                serde_json::json!({"attachment_ids": ["att-flow-injected-1"]}),
+            ),
+        );
+        let app = crate::routes::build_router(state.clone());
+        let (status, _body) = send(app, "hi").await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Pull the raw user_msg event payload from the durable log.
+        let log = EventLog::new(&state.db);
+        let cid = ConversationId::from("conv1");
+        let events = log.replay_since(&cid, EventSeq(0)).unwrap();
+        let user_msg = events
+            .iter()
+            .find(|e| e.kind == EventKind::UserMsg)
+            .expect("a user_msg row should have been committed");
+        let payload: crate::chats::types::UserMessagePayload =
+            user_msg.decode_payload().unwrap();
+        assert!(
+            payload.attachment_ids.contains(&"att-flow-injected-1".to_owned()),
+            "flow-added attachment id must land in user_msg.attachment_ids (got: {:?})",
+            payload.attachment_ids,
+        );
+    }
+
+    // SetTools: coverage by `evaluate_harvests_set_tools` (unit test
+    // in flow_middleware) + the chats apply path's direct
+    // `caller_caps.push(tool)` is visible-by-grep. There's no stub
+    // surface that echoes caller_caps to assert against; an end-to-
+    // end SetTools test would need a real tool to call, which sits
+    // beyond Phase B's scope.
+
+    // ---- Phase C end-to-end: plugin-inbound flow evaluation ----
+
+    /// Build a controller-class Principal that mirrors the
+    /// `resolve_sender("controller")` fast-path. Lets tests call
+    /// `dispatch_external_turn` directly without needing a real
+    /// channel-plugin inbound.
+    fn controller_principal() -> Principal {
+        Principal {
+            id: execlaw_core::ids::PrincipalId::from("controller"),
+            identifiers: vec![],
+            trust_level: CoreTrustLevel::Controller,
+            resolved_by: vec![],
+            metadata: serde_json::json!({}),
+            first_seen: 0,
+            last_seen: Some(0),
+            controller_notes: None,
+        }
+    }
+
+    /// Phase C: a flow with `event.payload.channel == "signal"`
+    /// fires on a Signal-source inbound (RewritePrompt mutates the
+    /// persisted user_msg text) but does NOT fire on a web
+    /// composer send (same flow, different channel).
+    #[tokio::test]
+    async fn flow_per_channel_filter_only_fires_on_matching_channel() {
+        use execlaw_core::events::{EventKind, EventLog};
+        use execlaw_core::ids::EventSeq;
+
+        let state = crate::routes::test_app_state();
+        // Flow rewrites prompt to "[SIG] <text>" only when
+        // payload.channel == "signal".
+        install_flow(
+            &state,
+            "signal-only-prefix",
+            serde_json::json!({
+                "trigger": {
+                    "kind": "chat.prompt",
+                    "when": "event.payload.channel == \"signal\""
+                },
+                "nodes": [{
+                    "id": "rw",
+                    "kind": "RewritePrompt",
+                    "config": {"expr": "\"[SIG] \" + event.payload.text"}
+                }],
+                "edges": [
+                    {"from": "trigger", "to": "rw", "when": null},
+                    {"from": "rw", "to": "END", "when": null}
+                ]
+            }),
+        );
+
+        // 1. Plugin inbound (channel = "signal") → flow fires.
+        let cid_signal = ConversationId::from("conv-signal");
+        crate::chats::dispatch_external_turn(
+            &state,
+            &cid_signal,
+            &controller_principal(),
+            TrustLevel::Controller,
+            "hello",
+            Some("signal"),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+        let log = EventLog::new(&state.db);
+        let evts = log.replay_since(&cid_signal, EventSeq(0)).unwrap();
+        let user_msg = evts
+            .iter()
+            .find(|e| e.kind == EventKind::UserMsg)
+            .expect("signal inbound should commit a user_msg event");
+        let p: crate::chats::types::UserMessagePayload = user_msg.decode_payload().unwrap();
+        assert_eq!(
+            p.text, "[SIG] hello",
+            "signal-channel flow should fire and rewrite text",
+        );
+
+        // 2. Web composer (channel = "web") → flow's `when`
+        // predicate is false, no mutation.
+        let app = crate::routes::build_router(state);
+        let (status, body) = send(app, "hi").await;
+        assert_eq!(status, StatusCode::OK);
+        let reply = body["assistant_text"].as_str().unwrap();
+        assert!(
+            reply.contains("received 2 chars"),
+            "web composer should NOT trigger signal-only flow (expected 2-char input, got: {reply})",
+        );
+    }
+
+    /// Phase C: AddMemory + RewritePrompt on a plugin inbound both
+    /// land. The persisted user_msg text reflects the composed
+    /// `<memory>...</memory>` + rewritten body.
+    #[tokio::test]
+    async fn flow_memory_and_rewrite_apply_to_plugin_inbound() {
+        use execlaw_core::events::{EventKind, EventLog};
+        use execlaw_core::ids::EventSeq;
+
+        let state = crate::routes::test_app_state();
+        install_flow(
+            &state,
+            "memory-plus-rewrite",
+            serde_json::json!({
+                "trigger": {"kind": "chat.prompt", "when": null},
+                "nodes": [
+                    {"id": "m", "kind": "AddMemory", "config": {"text": "ctx"}},
+                    {"id": "rw", "kind": "RewritePrompt", "config": {"expr": "\"BODY\""}}
+                ],
+                "edges": [
+                    {"from": "trigger", "to": "m", "when": null},
+                    {"from": "m", "to": "rw", "when": null},
+                    {"from": "rw", "to": "END", "when": null}
+                ]
+            }),
+        );
+
+        let cid = ConversationId::from("conv-plugin");
+        crate::chats::dispatch_external_turn(
+            &state,
+            &cid,
+            &controller_principal(),
+            TrustLevel::Controller,
+            "ignored",
+            Some("signal"),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let log = EventLog::new(&state.db);
+        let evts = log.replay_since(&cid, EventSeq(0)).unwrap();
+        let user_msg = evts
+            .iter()
+            .find(|e| e.kind == EventKind::UserMsg)
+            .expect("plugin inbound should commit a user_msg event");
+        let p: crate::chats::types::UserMessagePayload = user_msg.decode_payload().unwrap();
+        assert_eq!(
+            p.text, "<memory>\nctx\n</memory>\n\nBODY",
+            "memory block must prepend rewritten body",
+        );
+    }
+
+    /// Phase C: SetTrust → Blocked on a plugin-inbound flow drops
+    /// the turn at the post-override gate and fires a
+    /// `core.flow_trust_override` alert (mirrors the rule-of-two
+    /// alert shape). The conversation log stays empty of user_msg.
+    #[tokio::test]
+    async fn flow_set_trust_blocked_on_plugin_inbound_drops_turn() {
+        use execlaw_core::events::{EventKind, EventLog};
+        use execlaw_core::ids::EventSeq;
+
+        let state = crate::routes::test_app_state();
+        install_flow(
+            &state,
+            "demote-to-blocked",
+            simple_node_flow("SetTrust", serde_json::json!({"trust": "blocked"})),
+        );
+
+        let cid = ConversationId::from("conv-blocked");
+        let result = crate::chats::dispatch_external_turn(
+            &state,
+            &cid,
+            &controller_principal(),
+            TrustLevel::Controller,
+            "should not land",
+            Some("signal"),
+            None,
+            vec![],
+        )
+        .await;
+        assert!(result.is_ok(), "drop-turn returns Ok(()) (the inbound was processed, just not dispatched)");
+
+        let log = EventLog::new(&state.db);
+        let evts = log.replay_since(&cid, EventSeq(0)).unwrap();
+        let user_msg = evts.iter().find(|e| e.kind == EventKind::UserMsg);
+        assert!(
+            user_msg.is_none(),
+            "Blocked override must drop the turn; no user_msg should be committed",
+        );
+    }
+
     #[tokio::test]
     async fn send_message_rejects_empty_text() {
         let (status, _) = send(build_app(), "   ").await;
@@ -5604,7 +6340,7 @@ mod tests {
         // can refine the routing hints without contradicting them.
         let state = test_app_state();
         let prompt = super::assemble_system_prompt(
-            &state.db,
+            &state,
             None,
             "STATIC BASE GOES HERE",
             "ROUTING PROSE GOES HERE",
@@ -5624,7 +6360,7 @@ mod tests {
         // (time, sender, trust) sit closest to the user message.
         let state = test_app_state();
         let prompt =
-            super::assemble_system_prompt(&state.db, None, "BASE", "ROUTING", "TURN_CONTEXT_HERE");
+            super::assemble_system_prompt(&state, None, "BASE", "ROUTING", "TURN_CONTEXT_HERE");
         let routing_at = prompt.find("ROUTING").unwrap();
         let ctx_at = prompt.find("TURN_CONTEXT_HERE").unwrap();
         assert!(
@@ -6085,7 +6821,7 @@ mod tests {
         // produces an Identity section.
         let state = test_app_state();
         let prompt = super::assemble_system_prompt(
-            &state.db,
+            &state,
             None, // no per-conversation override
             "You are a helpful agent. Refuse unsafe requests.",
             "",
@@ -6147,7 +6883,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        let prompt = super::assemble_system_prompt(&state.db, None, "STATIC ONLY", "", "");
+        let prompt = super::assemble_system_prompt(&state, None, "STATIC ONLY", "", "");
         assert_eq!(prompt, "STATIC ONLY");
     }
 
@@ -6179,8 +6915,8 @@ mod tests {
             )
             .unwrap();
 
-        let pirate = super::assemble_system_prompt(&state.db, Some("conv-pirate"), "BASE", "", "");
-        let plain = super::assemble_system_prompt(&state.db, None, "BASE", "", "");
+        let pirate = super::assemble_system_prompt(&state, Some("conv-pirate"), "BASE", "", "");
+        let plain = super::assemble_system_prompt(&state, None, "BASE", "", "");
         assert!(pirate.contains("# Tone\nPirate"));
         assert!(!plain.contains("Pirate"));
     }

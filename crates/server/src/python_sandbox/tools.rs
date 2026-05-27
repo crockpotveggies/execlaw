@@ -93,11 +93,24 @@ impl PythonExecuteTool {
                 "python.execute",
                 "Execute Python in a persistent per-conversation sandbox. State \
                  (variables, dataframes, imports) survives across turns. \
-                 Files in /work/<convo>/uploads/ are user-supplied (read-only); \
-                 write user-facing outputs to /work/<convo>/outputs/. \
-                 Pre-installed: pandas, polars, duckdb, pyarrow, numpy, openpyxl, \
-                 ipython, httpx. For charts call chart.render — matplotlib is \
-                 not installed.",
+                 \n\nFILES: anything that arrives via the conversation's \
+                 attachment list (user-uploaded files OR results from \
+                 `web_fetch(url, as_attachment: true)`) is auto-mounted at \
+                 /work/<convo>/uploads/<filename> before this tool runs. Write \
+                 user-facing outputs to /work/<convo>/outputs/ — anything \
+                 written there is auto-published as a chat attachment chip. \
+                 \n\nNETWORK: the sandbox runs --network none. Python CANNOT \
+                 fetch URLs (`pd.read_csv('https://…')` will hang and time out). \
+                 To ingest a remote dataset: first call \
+                 `web_fetch(url, as_attachment: true)` — that lands the bytes \
+                 as an attachment which auto-hydrates into \
+                 /work/<convo>/uploads/<filename> for the NEXT execute call. \
+                 Then `pd.read_csv('/work/uploads/<filename>')` reads it locally. \
+                 \n\nPACKAGES: pandas, polars, duckdb, pyarrow, numpy, openpyxl, \
+                 ipython, httpx. Matplotlib is NOT installed — for charts, \
+                 compute the aggregated data in Python (e.g. \
+                 `df.groupby('species').size().to_dict()`) then call \
+                 chart.render with the resulting series.",
                 schema,
                 ToolLatency::High,
                 vec![Capability::AttachmentSend],

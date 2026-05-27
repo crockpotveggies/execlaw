@@ -733,6 +733,81 @@ impl HookRegistry {
         Ok(())
     }
 
+    /// Idempotent variant. Used by live-toggle paths (operator
+    /// flips a feature on after boot) that can't easily know
+    /// whether the boot path already registered. If a sidecar with
+    /// the same `name` exists and matches `plugin_id` + `image` it
+    /// counts as a no-op success; otherwise (name collision with
+    /// different specs) the call returns an error so unrelated
+    /// registrations don't get clobbered.
+    pub fn register_native_sidecar_idempotent(
+        &self,
+        sidecar: RegisteredSidecar,
+    ) -> Result<(), String> {
+        let mut w = self.inner.write().unwrap();
+        if let Some(existing) = w.sidecars_by_name.get(&sidecar.name) {
+            if existing.plugin_id == sidecar.plugin_id && existing.image == sidecar.image {
+                return Ok(());
+            }
+            return Err(format!(
+                "sidecar '{}' is already registered with a different spec \
+                 (existing plugin_id='{}', image='{}'; new plugin_id='{}', image='{}')",
+                sidecar.name, existing.plugin_id, existing.image, sidecar.plugin_id, sidecar.image,
+            ));
+        }
+        w.sidecars_by_name.insert(sidecar.name.clone(), sidecar);
+        Ok(())
+    }
+
+    /// Remove a native-registered sidecar by `name`. Returns `true`
+    /// if a slot was dropped. The supervisor's next reconcile tick
+    /// observes the removed slot and stops the container.
+    ///
+    /// Plugin-owned sidecars (registered via `enable_with_stage`)
+    /// are NOT addressable here — they're scoped to the owning
+    /// plugin's lifecycle via [`Self::disable`]. This method only
+    /// removes the slot from the in-memory registry; it doesn't
+    /// touch the container directly (that's the supervisor's job).
+    pub fn unregister_native_sidecar(&self, name: &str) -> bool {
+        let mut w = self.inner.write().unwrap();
+        w.sidecars_by_name.remove(name).is_some()
+    }
+
+    /// Drop the named builtins from the registry. Returns the count
+    /// of entries actually removed (useful for "did anything change"
+    /// log breadcrumbs). Used by feature-toggle paths to tear down a
+    /// tool surface without taking the whole process down.
+    pub fn unregister_builtins(&self, names: &[&str]) -> usize {
+        let mut w = self.inner.write().unwrap();
+        let mut removed = 0;
+        for name in names {
+            if w.builtins_by_name.remove(*name).is_some() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    /// Drop every builtin whose name starts with `prefix`. Used by
+    /// feature-toggle paths that registered a family of tools (e.g.,
+    /// `python.execute` / `python.reset_kernel` / `python.read_file`)
+    /// and want to unregister all of them on disable. Returns the
+    /// count actually removed.
+    pub fn unregister_builtins_by_prefix(&self, prefix: &str) -> usize {
+        let mut w = self.inner.write().unwrap();
+        let to_drop: Vec<String> = w
+            .builtins_by_name
+            .keys()
+            .filter(|n| n.starts_with(prefix))
+            .cloned()
+            .collect();
+        let removed = to_drop.len();
+        for name in to_drop {
+            w.builtins_by_name.remove(&name);
+        }
+        removed
+    }
+
     /// Look up a built-in by name. `None` if no built-in owns this
     /// name (it might be a plugin tool — use [`Self::tool`] for that).
     pub fn builtin(&self, name: &str) -> Option<Arc<dyn ToolImpl>> {
@@ -1166,6 +1241,80 @@ rpc_port = {port}
             .unwrap();
         let names: Vec<String> = reg.all_sidecars().into_iter().map(|b| b.name).collect();
         assert_eq!(names, vec!["a-sidecar", "z-sidecar"]);
+    }
+
+    fn native_sidecar_spec(name: &str, image: &str) -> RegisteredSidecar {
+        RegisteredSidecar {
+            plugin_id: "native-feature".into(),
+            name: name.into(),
+            image: image.into(),
+            rpc_port: 8888,
+            rpc_health_path: "/health".into(),
+            env: Vec::new(),
+            mounts: Vec::new(),
+            entrypoint: None,
+            stage_path: None,
+        }
+    }
+
+    #[test]
+    fn register_native_sidecar_idempotent_swallows_identical_re_register() {
+        let reg = HookRegistry::new();
+        let spec = native_sidecar_spec("kernel-gateway", "execlaw/kernel-gateway:0.1");
+        reg.register_native_sidecar_idempotent(spec.clone()).unwrap();
+        // Second identical call should succeed (no-op).
+        reg.register_native_sidecar_idempotent(spec.clone()).unwrap();
+        assert_eq!(reg.all_sidecars().len(), 1);
+    }
+
+    #[test]
+    fn register_native_sidecar_idempotent_rejects_spec_mismatch() {
+        let reg = HookRegistry::new();
+        reg.register_native_sidecar_idempotent(native_sidecar_spec(
+            "kernel-gateway",
+            "execlaw/kernel-gateway:0.1",
+        ))
+        .unwrap();
+        // Same name, different image → reject.
+        let err = reg
+            .register_native_sidecar_idempotent(native_sidecar_spec(
+                "kernel-gateway",
+                "evil/imposter:1.0",
+            ))
+            .unwrap_err();
+        assert!(err.contains("different spec"), "got: {err}");
+    }
+
+    #[test]
+    fn unregister_native_sidecar_drops_slot() {
+        let reg = HookRegistry::new();
+        reg.register_native_sidecar(native_sidecar_spec(
+            "kernel-gateway",
+            "execlaw/kernel-gateway:0.1",
+        ))
+        .unwrap();
+        assert!(reg.sidecar("kernel-gateway").is_some());
+        assert!(reg.unregister_native_sidecar("kernel-gateway"));
+        assert!(reg.sidecar("kernel-gateway").is_none());
+        // Idempotent — second call returns false.
+        assert!(!reg.unregister_native_sidecar("kernel-gateway"));
+    }
+
+    #[test]
+    fn unregister_builtins_by_prefix_drops_matching_family() {
+        let reg = HookRegistry::new();
+        for name in [
+            "python.execute",
+            "python.reset_kernel",
+            "python.list_files",
+            "memory.write", // unrelated family — must survive
+        ] {
+            reg.register_builtin(arc_dummy(name)).unwrap();
+        }
+        let removed = reg.unregister_builtins_by_prefix("python.");
+        assert_eq!(removed, 3, "should drop python.* family but not memory.*");
+        assert!(reg.builtin("memory.write").is_some());
+        assert!(reg.builtin("python.execute").is_none());
     }
 
     #[test]

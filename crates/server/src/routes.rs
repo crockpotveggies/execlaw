@@ -934,24 +934,14 @@ pub fn test_app_state() -> AppState {
         // resolve `<data_dir>/bundled-plugins/...` deterministically
         // without writing into a real user dir.
         data_dir: std::env::temp_dir().join(format!("execlaw-test-data-{}", uuid::Uuid::new_v4())),
-        // M1 of Automations — stub bus that writes durably but doesn't
-        // dispatch. Tests exercising end-to-end dispatch should use
-        // `AutomationBus::spawn` inside a `#[tokio::test]` (the
-        // automation_bus module's own tests do this).
-        automation_bus: crate::automation_bus::AutomationBus::stub(db.clone()),
-        // M3 + M4c — test-fixture agent pool. The invoker returns an
-        // error for any AskAgent invocation, which is what we want
-        // in tests that don't exercise the LLM path. Tests that DO
-        // exercise AskAgent construct their own pool inline.
-        automation_agent_pool: crate::automation_agent::AutomationsAgentPool::new(
-            std::sync::Arc::new(crate::automation_agent::StubAgentInvoker::err(
-                "test fixture pool: no LLM wired",
-            )),
-        ),
         // M5 — empty metrics handle. Tests that exercise the metrics
         // page can pre-populate this via `state.inference_metrics
         // .observe(...)` and snapshot.
         inference_metrics: crate::inference_metrics::InferenceMetrics::new(),
+        // Per-turn personality-chunk cache. Empty at construction;
+        // first compose call warms the default chunk and seeds the
+        // override-cid set from the DB.
+        personality_cache: Arc::new(crate::personality_cache::PersonalityCache::new()),
     }
 }
 

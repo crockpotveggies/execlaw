@@ -775,6 +775,422 @@ fn bench_build_turn_context_prose(c: &mut Criterion) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Flows pre-turn middleware (Phase A, 2026-05-22).
+//
+// Budgets (§0 axiom #14):
+//   * `flow_middleware::evaluate` with zero enabled flows must run in
+//     under 100µs — this fires on every chat turn, so any regression
+//     is felt instantly.
+//   * `flow_middleware::evaluate` with one enabled flow + one
+//     RewritePrompt node must run in under 2ms. Rhai eval dominates;
+//     this number sets the budget for the per-turn overhead of a
+//     trivial flow.
+// ---------------------------------------------------------------------------
+
+fn bench_flow_middleware(c: &mut Criterion) {
+    use execlaw_core::Database;
+    use execlaw_core::automations::{AutomationStore, AutomationUpsert};
+    use execlaw_core::db::DbConfig;
+    use execlaw_core::migrations::MigrationRunner;
+    use execlaw_server::flow_middleware::{build_chat_prompt_event, evaluate};
+    use execlaw_server::routes::test_app_state;
+
+    let state_empty = test_app_state();
+    let evt = build_chat_prompt_event("conv-bench", "hello world", Some("op"), "web", &[]);
+
+    c.bench_function("flow_middleware/evaluate_zero_flows", |b| {
+        b.iter(|| {
+            let outcome = evaluate(black_box(&state_empty), black_box(&evt));
+            black_box(outcome);
+        });
+    });
+
+    // Populate one enabled RewritePrompt flow against a fresh state.
+    let state_one = test_app_state();
+    let def: execlaw_core::automations::AutomationDef = serde_json::from_value(serde_json::json!({
+        "trigger": {"kind": "chat.prompt", "when": null},
+        "nodes": [{
+            "id": "rw",
+            "kind": "RewritePrompt",
+            "config": {"expr": "\"[bench] \" + event.payload.text"}
+        }],
+        "edges": [
+            {"from": "trigger", "to": "rw", "when": null},
+            {"from": "rw", "to": "END", "when": null}
+        ]
+    }))
+    .unwrap();
+    AutomationStore::new(&state_one.db)
+        .upsert(
+            &AutomationUpsert {
+                id: None,
+                name: "bench-rewrite".into(),
+                enabled: true,
+                definition: def,
+            },
+            1000,
+        )
+        .unwrap();
+
+    c.bench_function("flow_middleware/evaluate_one_rewrite_prompt", |b| {
+        b.iter(|| {
+            let outcome = evaluate(black_box(&state_one), black_box(&evt));
+            black_box(outcome);
+        });
+    });
+
+    // Phase B perf gate: a realistic chat-prompt flow exercising
+    // three mutator nodes in sequence (SetSkills + AddMemory +
+    // RewritePrompt). Each adds a small amount of Rhai + JSON
+    // shuffling on top of the per-node baseline. Budget: under 500µs
+    // measured.
+    let state_three = test_app_state();
+    let def_three: execlaw_core::automations::AutomationDef = serde_json::from_value(serde_json::json!({
+        "trigger": {"kind": "chat.prompt", "when": null},
+        "nodes": [
+            {"id": "s", "kind": "SetSkills", "config": {"skills": ["calendar"]}},
+            {"id": "m", "kind": "AddMemory", "config": {"text": "ctx: {{event.payload.text}}"}},
+            {"id": "rw", "kind": "RewritePrompt", "config": {"expr": "\"[p] \" + event.payload.text"}}
+        ],
+        "edges": [
+            {"from": "trigger", "to": "s", "when": null},
+            {"from": "s", "to": "m", "when": null},
+            {"from": "m", "to": "rw", "when": null},
+            {"from": "rw", "to": "END", "when": null}
+        ]
+    })).unwrap();
+    AutomationStore::new(&state_three.db)
+        .upsert(
+            &AutomationUpsert {
+                id: None,
+                name: "three-mutator-bench".into(),
+                enabled: true,
+                definition: def_three,
+            },
+            1000,
+        )
+        .unwrap();
+
+    c.bench_function("flow_middleware/evaluate_three_mutator_flow", |b| {
+        b.iter(|| {
+            let outcome = evaluate(black_box(&state_three), black_box(&evt));
+            black_box(outcome);
+        });
+    });
+
+    // Phase E perf gate (2026-05-25): the user reported "a small but
+    // noticeable delay" on a plain "hi" prompt after the 9 plugin
+    // [[default_automations]] flows shipped on top of the 1 existing
+    // default web flow. This bench mirrors that reality:
+    //
+    //   * 10 enabled flows on `chat.prompt`.
+    //   * Mix of channel-narrowed (trigger.when checks
+    //     event.payload.channel) and keyword-gated (trigger.when=null
+    //     but edge.when does string.contains on event.payload.text).
+    //   * Event: channel="web", text="hi" — so MOST flows should
+    //     evaluate trigger.when or edge.when to false and skip cheap.
+    //
+    // The hypothesis under test: `automation_runtime::make_engine()`
+    // is called inside every `eval_bool` / `eval_value`, so 10 flows
+    // pay 10+ `Engine::new()` allocations per turn. If true, this
+    // bench should regress dramatically vs the zero-flows baseline.
+    let state_ten = test_app_state();
+    let ten_flows: Vec<(String, serde_json::Value)> = vec![
+        // 5 channel-narrowed flows (trigger.when filters by channel).
+        // Each targets a non-web channel, so trigger_matches() returns
+        // false on a web prompt — one Rhai eval each, no node executes.
+        (
+            "signal-only".into(),
+            serde_json::json!({
+                "trigger": {
+                    "kind": "chat.prompt",
+                    "when": "event.payload.channel == \"signal\""
+                },
+                "nodes": [{"id": "rw", "kind": "RewritePrompt",
+                    "config": {"expr": "\"[sig] \" + event.payload.text"}}],
+                "edges": [
+                    {"from": "trigger", "to": "rw", "when": null},
+                    {"from": "rw", "to": "END", "when": null}
+                ]
+            }),
+        ),
+        (
+            "whatsapp-only".into(),
+            serde_json::json!({
+                "trigger": {
+                    "kind": "chat.prompt",
+                    "when": "event.payload.channel == \"whatsapp\""
+                },
+                "nodes": [{"id": "rw", "kind": "RewritePrompt",
+                    "config": {"expr": "\"[wa] \" + event.payload.text"}}],
+                "edges": [
+                    {"from": "trigger", "to": "rw", "when": null},
+                    {"from": "rw", "to": "END", "when": null}
+                ]
+            }),
+        ),
+        (
+            "calendar-only".into(),
+            serde_json::json!({
+                "trigger": {
+                    "kind": "chat.prompt",
+                    "when": "event.payload.channel == \"calendar\""
+                },
+                "nodes": [{"id": "rw", "kind": "RewritePrompt",
+                    "config": {"expr": "\"[cal] \" + event.payload.text"}}],
+                "edges": [
+                    {"from": "trigger", "to": "rw", "when": null},
+                    {"from": "rw", "to": "END", "when": null}
+                ]
+            }),
+        ),
+        (
+            "voice-only".into(),
+            serde_json::json!({
+                "trigger": {
+                    "kind": "chat.prompt",
+                    "when": "event.payload.channel == \"voice\""
+                },
+                "nodes": [{"id": "rw", "kind": "RewritePrompt",
+                    "config": {"expr": "\"[v] \" + event.payload.text"}}],
+                "edges": [
+                    {"from": "trigger", "to": "rw", "when": null},
+                    {"from": "rw", "to": "END", "when": null}
+                ]
+            }),
+        ),
+        (
+            "matrix-only".into(),
+            serde_json::json!({
+                "trigger": {
+                    "kind": "chat.prompt",
+                    "when": "event.payload.channel == \"matrix\""
+                },
+                "nodes": [{"id": "rw", "kind": "RewritePrompt",
+                    "config": {"expr": "\"[mx] \" + event.payload.text"}}],
+                "edges": [
+                    {"from": "trigger", "to": "rw", "when": null},
+                    {"from": "rw", "to": "END", "when": null}
+                ]
+            }),
+        ),
+        // 4 keyword-gated flows (trigger.when=null so the matcher
+        // ALWAYS picks them up; the edge.when on the trigger→node
+        // edge does the string.contains gate which is false on "hi").
+        // These force the executor to actually walk the graph one
+        // hop, paying an `eval_bool` for the edge.when check.
+        (
+            "remind-keyword".into(),
+            serde_json::json!({
+                "trigger": {"kind": "chat.prompt", "when": null},
+                "nodes": [{"id": "rw", "kind": "RewritePrompt",
+                    "config": {"expr": "\"[remind] \" + event.payload.text"}}],
+                "edges": [
+                    {"from": "trigger", "to": "rw",
+                     "when": "event.payload.text.contains(\"remind\")"},
+                    {"from": "rw", "to": "END", "when": null}
+                ]
+            }),
+        ),
+        (
+            "calendar-keyword".into(),
+            serde_json::json!({
+                "trigger": {"kind": "chat.prompt", "when": null},
+                "nodes": [{"id": "rw", "kind": "RewritePrompt",
+                    "config": {"expr": "\"[cal] \" + event.payload.text"}}],
+                "edges": [
+                    {"from": "trigger", "to": "rw",
+                     "when": "event.payload.text.contains(\"calendar\")"},
+                    {"from": "rw", "to": "END", "when": null}
+                ]
+            }),
+        ),
+        (
+            "weather-keyword".into(),
+            serde_json::json!({
+                "trigger": {"kind": "chat.prompt", "when": null},
+                "nodes": [{"id": "rw", "kind": "RewritePrompt",
+                    "config": {"expr": "\"[wx] \" + event.payload.text"}}],
+                "edges": [
+                    {"from": "trigger", "to": "rw",
+                     "when": "event.payload.text.contains(\"weather\")"},
+                    {"from": "rw", "to": "END", "when": null}
+                ]
+            }),
+        ),
+        (
+            "search-keyword".into(),
+            serde_json::json!({
+                "trigger": {"kind": "chat.prompt", "when": null},
+                "nodes": [{"id": "rw", "kind": "RewritePrompt",
+                    "config": {"expr": "\"[search] \" + event.payload.text"}}],
+                "edges": [
+                    {"from": "trigger", "to": "rw",
+                     "when": "event.payload.text.contains(\"search\")"},
+                    {"from": "rw", "to": "END", "when": null}
+                ]
+            }),
+        ),
+        // 1 always-fires flow (the existing default web flow). This
+        // one actually executes the RewritePrompt node (eval_value
+        // for the expr).
+        (
+            "web-default".into(),
+            serde_json::json!({
+                "trigger": {"kind": "chat.prompt", "when": null},
+                "nodes": [{"id": "rw", "kind": "RewritePrompt",
+                    "config": {"expr": "event.payload.text"}}],
+                "edges": [
+                    {"from": "trigger", "to": "rw", "when": null},
+                    {"from": "rw", "to": "END", "when": null}
+                ]
+            }),
+        ),
+    ];
+    for (name, def_json) in &ten_flows {
+        let def: execlaw_core::automations::AutomationDef =
+            serde_json::from_value(def_json.clone()).unwrap();
+        AutomationStore::new(&state_ten.db)
+            .upsert(
+                &AutomationUpsert {
+                    id: None,
+                    name: name.clone(),
+                    enabled: true,
+                    definition: def,
+                },
+                1000,
+            )
+            .unwrap();
+    }
+
+    c.bench_function(
+        "flow_middleware/evaluate_ten_default_flows_on_web_hi",
+        |b| {
+            b.iter(|| {
+                let outcome = evaluate(black_box(&state_ten), black_box(&evt));
+                black_box(outcome);
+            });
+        },
+    );
+
+    // Silence unused-import warnings on the helper imports above when
+    // run with `--no-run`.
+    let _ = (Database::open, DbConfig::in_memory_unencrypted, MigrationRunner::new);
+}
+
+// ---------------------------------------------------------------------------
+// Personality cache (Phase E audit closure, 2026-05-26).
+//
+// Background: `assemble_system_prompt` was doing two indexed SQLite
+// reads under the synchronous Database mutex on every chat turn —
+// once for the default personality row, once for the optional
+// per-conversation override. The default row only changes when an
+// operator edits Settings → Personality (rare) and 99% of
+// conversations have no override, so we cache the composed default
+// chunk + a HashSet of cids known to have an override. See
+// [`execlaw_server::personality_cache::PersonalityCache`].
+//
+// Budgets:
+//   * cold (first call) → dominated by the SQLite default fetch
+//     + the personality-prompt render (~few hundred µs).
+//   * warm, no override → cache hit on default chunk, no DB read.
+//     Sub-µs target — basically a String clone + a RwLock read.
+//   * warm, with override → one SQLite override fetch + full
+//     compose. Similar to cold but persists across calls.
+// ---------------------------------------------------------------------------
+
+fn bench_assemble_system_prompt(c: &mut Criterion) {
+    use execlaw_server::chats::assemble_system_prompt;
+    use execlaw_server::routes::test_app_state;
+
+    let state = test_app_state();
+    // Pre-seed an override for the warm-with-override case so its
+    // cid is in the cache's override set after the first call.
+    let store =
+        execlaw_core::personality::PersonalityStore::new(&state.db);
+    let mut over_fields = std::collections::HashSet::new();
+    over_fields.insert(execlaw_core::personality::PersonalityField::Tone);
+    store
+        .upsert(
+            &execlaw_core::personality::PersonalityUpsert {
+                scope_kind:
+                    execlaw_core::personality::PersonalityScopeKind::Conversation,
+                scope_ref: "conv-bench-override".into(),
+                display_name: "".into(),
+                role: "".into(),
+                tone: "Pirate".into(),
+                communication_style: "".into(),
+                initiative: "".into(),
+                about_agent: "".into(),
+                about_controller: "".into(),
+                custom_instructions: "".into(),
+                voice_id: None,
+                override_fields: over_fields,
+            },
+            100,
+        )
+        .unwrap();
+
+    // Cold path: invalidate the cache before every iteration so each
+    // call pays the SQLite default-fetch + render cost. This is the
+    // boot-time / post-edit cost — represents the worst case but
+    // runs at most once per default edit.
+    c.bench_function("personality/assemble_system_prompt/cold_no_override", |b| {
+        b.iter(|| {
+            state.personality_cache.invalidate_default();
+            let out = assemble_system_prompt(
+                black_box(&state),
+                black_box(None),
+                black_box("STATIC BASE"),
+                black_box(""),
+                black_box(""),
+            );
+            black_box(out);
+        })
+    });
+
+    // Warm path, no override: 99% of real-world turns. Cache hit
+    // on the default chunk; no SQLite read should occur.
+    // First call warms the cache + lazy-seeds the override set.
+    let _ = assemble_system_prompt(&state, None, "STATIC BASE", "", "");
+    c.bench_function(
+        "personality/assemble_system_prompt/warm_no_override",
+        |b| {
+            b.iter(|| {
+                let out = assemble_system_prompt(
+                    black_box(&state),
+                    black_box(Some("conv-no-override-here")),
+                    black_box("STATIC BASE"),
+                    black_box(""),
+                    black_box(""),
+                );
+                black_box(out);
+            })
+        },
+    );
+
+    // Warm path WITH a per-conversation override: the rare case.
+    // Cache hit short-circuits to a full compose against the DB
+    // (one override-fetch + merge + render). Establishes the
+    // ceiling for "is the override path itself acceptable?"
+    c.bench_function(
+        "personality/assemble_system_prompt/warm_with_override",
+        |b| {
+            b.iter(|| {
+                let out = assemble_system_prompt(
+                    black_box(&state),
+                    black_box(Some("conv-bench-override")),
+                    black_box("STATIC BASE"),
+                    black_box(""),
+                    black_box(""),
+                );
+                black_box(out);
+            })
+        },
+    );
+}
+
 criterion_group!(
     benches,
     bench_jwt_access,
@@ -792,5 +1208,7 @@ criterion_group!(
     // benches when that surface is ready.
     bench_group_addressing_name_in_text,
     bench_build_turn_context_prose,
+    bench_flow_middleware,
+    bench_assemble_system_prompt,
 );
 criterion_main!(benches);

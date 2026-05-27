@@ -1,7 +1,7 @@
 [plugin]
 id = "whatsapp"
 name = "WhatsApp"
-version = "0.2.0"
+version = "0.2.1"
 description = "WhatsApp Multi-Device transport via wuzapi (whatsmeow-backed). Mirrors the Signal plugin shape: 6 agent-callable tools (send_message, reply, list_groups, create_group, add_group_members, leave_group) + 3 host-internal convention tools (set_typing, send_with_attachments, fetch_attachment), inbound WS consumer, QR-pairing admin flow."
 author = "execlaw"
 license = "Apache-2.0"
@@ -198,3 +198,43 @@ entry = "ui/panel.js"
 [runtime]
 tier = "script"
 source = "main.rhai"
+
+# ===== M6 event-driven architecture =================================
+
+[[bus_events]]
+kind = "whatsapp.message.received"
+description = "Inbound WhatsApp message (DM or group)."
+expects_reply = true
+default_origin_kind = "plugin_channel"
+
+[[bus_events]]
+kind = "whatsapp.delivery.failed"
+description = "WhatsApp reported a delivery failure for a previously sent message."
+expects_reply = false
+
+[[reply_handlers]]
+name = "whatsapp"
+description = "Send agent text back to the originating WhatsApp chat via the wuzapi sidecar."
+supports_streaming = false
+supports_attachments = true
+supports_markdown = true
+max_attachment_size_bytes = 16777216
+max_attachments_per_message = 1
+max_text_length = 4096
+allowed_mime_prefixes = ["image/", "video/", "audio/", "application/pdf"]
+
+# ===== Phase E (Flows middleware) — default flow ====================
+#
+# Ships one chat.prompt flow narrowed to `event.payload.channel ==
+# "whatsapp"`. Injects channel-aware reply guidance (concise, plain
+# text, WhatsApp's tiny markdown subset only). The importer in
+# plugin-host stamps `source = "plugin:whatsapp"` so the operator
+# can disable it via the Enabled toggle but cannot delete it
+# (uninstalling the plugin removes the row). Operator edits are
+# preserved on re-install because the importer is name-keyed.
+[[default_automations]]
+name = "WhatsApp channel guidance"
+flow_path = "flows/default.json"
+enabled = true
+description = "Pre-turn middleware: when a chat.prompt arrives via the WhatsApp channel, inject reply guidance (concise, plain text, WhatsApp's tiny markdown subset only)."
+

@@ -17,7 +17,7 @@ name = "Slack"
 #        conversations.info (channels) or users.info (DMs) on
 #        first inbound; result is cached in vault under
 #        `channel_labels`.
-version = "0.3.2"
+version = "0.3.3"
 description = "Slack transport via Socket Mode (no public URL needed). Multi-workspace from day 1: each workspace contributes its own bot+app token pair and runs its own Socket Mode connection. Mirrors the Signal/WhatsApp tool surface but is sidecar-free — pure-Rhai over the host's http_post + ws_subscribe + ws_send bindings."
 author = "execlaw"
 license = "Apache-2.0"
@@ -142,3 +142,19 @@ entry = "ui/panel.js"
 [runtime]
 tier = "script"
 source = "main.rhai"
+
+# ===== Phase E (Flows middleware) — default flow ====================
+#
+# Ships one chat.prompt flow narrowed to `event.payload.channel ==
+# "slack"`. Injects channel-aware reply guidance (professional
+# tone, Slack mrkdwn — `*bold*` not `**bold**`, no Markdown
+# headings). The importer in plugin-host stamps `source =
+# "plugin:slack"` so the operator can disable it via the Enabled
+# toggle but cannot delete it. Operator edits are preserved on
+# re-install because the importer is name-keyed.
+[[default_automations]]
+name = "Slack channel guidance"
+flow_path = "flows/default.json"
+enabled = true
+description = "Pre-turn middleware: when a chat.prompt arrives via the Slack channel, inject reply guidance (professional tone, Slack mrkdwn formatting only)."
+

@@ -329,6 +329,10 @@ pub async fn delete_conversation_handler(
             message: format!("no personality override for conversation '{conversation_id}'"),
         });
     }
+    // Drop the cid from the override-presence set so the next chat
+    // turn for this conversation stops paying the override-merge
+    // cost and serves the cached default chunk instead.
+    state.personality_cache.drop_override(&conversation_id);
     if let Some(prior) = prior {
         let _ = AuditStore::new(&state.db).insert(
             &user.user_id,
@@ -410,6 +414,21 @@ fn do_upsert(
             now,
         )
         .map_err(ApiError::from)?;
+
+    // Keep the per-turn personality cache aligned with the write.
+    // Default-scope edits drop the cached composed chunk so the
+    // next chat turn re-composes against the new row; conversation
+    // overrides flip the cid into the cache's "has override" set so
+    // turns for this conversation start paying the override-merge
+    // cost. See [`crate::personality_cache::PersonalityCache`].
+    match scope_kind {
+        PersonalityScopeKind::Default => {
+            state.personality_cache.invalidate_default();
+        }
+        PersonalityScopeKind::Conversation => {
+            state.personality_cache.note_override(&scope_ref);
+        }
+    }
 
     let row_id = match scope_kind {
         PersonalityScopeKind::Default => "default".to_owned(),

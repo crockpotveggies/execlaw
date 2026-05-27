@@ -1,0 +1,19 @@
+{
+  "trigger": {
+    "kind": "chat.prompt",
+    "when": "event.payload.channel == \"sms\""
+  },
+  "nodes": [
+    {
+      "id": "ctx",
+      "kind": "AddMemory",
+      "config": {
+        "text": "Channel: SMS (cellular text message). Reply guidance: extreme brevity — aim for under 160 characters per message so it fits a single SMS segment. Plain ASCII only — no Markdown, no emoji-as-formatting, no bullet lists, no headings, no code blocks. One thought per message; if you need more space, send a follow-up rather than padding a single oversized text. Skip filler (\"Sure!\", \"Of course!\"). Long-form research belongs in an attached PDF, not in the message body."
+      }
+    }
+  ],
+  "edges": [
+    {"from": "trigger", "to": "ctx", "when": null},
+    {"from": "ctx", "to": "END", "when": null}
+  ]
+}

@@ -1,4 +1,4 @@
-//! Phase 2 plugin-lifecycle integration tests.
+﻿//! Phase 2 plugin-lifecycle integration tests.
 //!
 //! Covers:
 //! - `POST /api/admin/plugins/install` end-to-end with a ZIP built in
@@ -82,14 +82,12 @@ fn build_app(stage_root: std::path::PathBuf) -> (axum::Router, AppState) {
         host_transports: execlaw_server::transport_registry::HostTransportRegistry::new(),
         skill_capture: execlaw_skills::AutoCaptureSink::noop(),
         reuse_update: execlaw_skills::ReuseUpdateSink::noop(),
-        automation_bus: execlaw_server::automation_bus::AutomationBus::stub(db),
-        automation_agent_pool: execlaw_server::automation_agent::AutomationsAgentPool::new(
-            std::sync::Arc::new(execlaw_server::automation_agent::StubAgentInvoker::err(
-                "test pool: no LLM",
-            )),
-        ),
+
         data_dir: std::env::temp_dir().join(format!("execlaw-test-{}", uuid::Uuid::new_v4())),
         inference_metrics: execlaw_server::inference_metrics::InferenceMetrics::new(),
+        personality_cache: std::sync::Arc::new(
+            execlaw_server::personality_cache::PersonalityCache::new(),
+        ),
     };
     (execlaw_server::routes::build_router(state.clone()), state)
 }
@@ -125,7 +123,7 @@ async fn get_json(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Valu
 
 // ---- test plugin manifests -------------------------------------------------
 
-/// A minimal manifest with NO tools — no subprocess needed, so this
+/// A minimal manifest with NO tools â€” no subprocess needed, so this
 /// tests the bare-bones install/list/disable/enable/uninstall path
 /// without depending on a working `sh` binary.
 fn manifest_no_tools(id: &str) -> String {
@@ -262,7 +260,7 @@ async fn missing_manifest_rejected() {
     assert_eq!(body["error"]["code"], "stage_failed");
 }
 
-/// Installing the same plugin twice must fail with 409 — the second
+/// Installing the same plugin twice must fail with 409 â€” the second
 /// install detects the existing DB row (and staged dir) and refuses.
 #[tokio::test]
 async fn duplicate_install_rejected() {
@@ -283,7 +281,7 @@ async fn duplicate_install_rejected() {
 /// same tool name) is covered by `hook_registry::tests::
 /// partial_conflict_leaves_registry_clean`. This integration test
 /// covers the HTTP-path version: install plugin A via the registry
-/// directly, then try to install plugin B via HTTP — the second
+/// directly, then try to install plugin B via HTTP â€” the second
 /// install returns 409 with `hook_conflict`.
 #[tokio::test]
 async fn hook_conflict_rejected_via_http() {
@@ -308,7 +306,7 @@ required_capabilities = []
         .enable(&execlaw_plugin_sdk::PluginManifest::parse(m_a).unwrap())
         .unwrap();
 
-    // Now try to install plugin B via HTTP — it also declares
+    // Now try to install plugin B via HTTP â€” it also declares
     // "dup-tool" and must be rejected at hook-registration time,
     // BEFORE any subprocess spawn attempt.
     let m_b = r#"[plugin]
@@ -331,7 +329,7 @@ required_capabilities = []
 /// Unsupported runtime tier (e.g. "wasm") must be rejected. With
 /// the script-tier addition, validation now catches unknown tiers
 /// at manifest-parse time rather than during the host's install
-/// step — the surface error code shifts from "unsupported_tier" to
+/// step â€” the surface error code shifts from "unsupported_tier" to
 /// the parse-failure variant ("stage_failed"), but the contract is
 /// unchanged: a 4xx, no half-installed plugin, no leaked hooks.
 #[tokio::test]
@@ -413,7 +411,7 @@ async fn capability_enforcement_blocks_missing_cap() {
     let host = PluginHost::new(db, HookRegistry::new(), stage_root.clone());
 
     // Register a tool that requires "admin" via a no-subprocess path
-    // — the tool-call path runs cap check BEFORE attempting to reach
+    // â€” the tool-call path runs cap check BEFORE attempting to reach
     // the subprocess, so we only need the hook to be registered.
     // We do that by manually enabling a manifest via the registry.
     let m = r#"[plugin]
@@ -431,7 +429,7 @@ required_capabilities = ["admin"]
         .enable(&execlaw_plugin_sdk::PluginManifest::parse(m).unwrap())
         .unwrap();
 
-    // Caller only has "tools.safe" — not "admin".
+    // Caller only has "tools.safe" â€” not "admin".
     let err = host
         .call_tool("dangerous", serde_json::json!({}), &["tools.safe"], None)
         .await
@@ -439,7 +437,7 @@ required_capabilities = ["admin"]
     assert!(err.contains("requires capability 'admin'"), "err: {err}");
 }
 
-/// Wildcard capability "*" satisfies any requirement — used by
+/// Wildcard capability "*" satisfies any requirement â€” used by
 /// Controller turns.
 #[tokio::test]
 async fn wildcard_capability_satisfies_any_requirement() {
@@ -463,7 +461,7 @@ required_capabilities = ["admin", "vault.write"]
         .enable(&execlaw_plugin_sdk::PluginManifest::parse(m).unwrap())
         .unwrap();
 
-    // Caller has ONLY wildcard — capability check passes; the call
+    // Caller has ONLY wildcard â€” capability check passes; the call
     // then fails because no runtime (subprocess OR script) is
     // actually loaded for this plugin, but for a DIFFERENT reason
     // than cap-missing.
@@ -528,13 +526,13 @@ async fn empty_body_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// Subprocess E2E (Unix only — relies on `sh -c`).
+// Subprocess E2E (Unix only â€” relies on `sh -c`).
 // ---------------------------------------------------------------------------
 
 /// End-to-end install + tool call against the in-tree reference
 /// plugin (`plugins/hello`). Exercises the full path: manifest parse
-/// → hook registration → subprocess spawn → JSON-RPC tool call →
-/// capability check → response round-trip.
+/// â†’ hook registration â†’ subprocess spawn â†’ JSON-RPC tool call â†’
+/// capability check â†’ response round-trip.
 ///
 /// This test compiles the reference binary on-demand via `cargo
 /// build -p plugin-hello` so CI doesn't need a pre-built artifact.
@@ -610,7 +608,7 @@ async fn reference_hello_plugin_roundtrips_end_to_end() {
         .await
         .expect("install reference plugin");
 
-    // Caller with "tools.safe" — matches the manifest's required_capabilities.
+    // Caller with "tools.safe" â€” matches the manifest's required_capabilities.
     let got = host
         .call_tool(
             "hello.echo",
@@ -624,7 +622,7 @@ async fn reference_hello_plugin_roundtrips_end_to_end() {
     assert!(got["greeting"].as_str().unwrap().contains("Hello"));
 
     // Caller WITHOUT "tools.safe" gets rejected at the capability
-    // check — the subprocess never sees the args.
+    // check â€” the subprocess never sees the args.
     let err = host
         .call_tool(
             "hello.echo",

@@ -1,0 +1,23 @@
+{
+  "trigger": {
+    "kind": "chat.prompt",
+    "when": null
+  },
+  "nodes": [
+    {
+      "id": "ctx",
+      "kind": "AddMemory",
+      "config": {
+        "text": "Google Places tools are installed. When the user asks about a physical place — a business, restaurant, café, hotel, park, store, landmark, address, or anything \"nearby\" — call `google_places.search` (text query), `google_places.nearby` (lat/lng + radius), or `google_places.details` (resolve a place_id to hours/phone/rating/reviews) instead of guessing or refusing for lack of local data. Always show the place's name, address, and rating in your reply when available."
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "trigger",
+      "to": "ctx",
+      "when": "let t = event.payload.text.to_lower(); t.contains(\"restaurant\") || t.contains(\"cafe\") || t.contains(\"coffee\") || t.contains(\"hotel\") || t.contains(\"nearby\") || t.contains(\"near me\") || t.contains(\"address\") || t.contains(\"directions\") || t.contains(\"place\") || t.contains(\"store\") || t.contains(\"shop\") || t.contains(\"open now\") || t.contains(\"hours\") || t.contains(\"map\") || t.contains(\"location\")"
+    },
+    {"from": "ctx", "to": "END", "when": null}
+  ]
+}

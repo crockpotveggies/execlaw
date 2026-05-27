@@ -1,15 +1,15 @@
-//! Automation runtime â€” matcher + executor (M2 of Automations).
+﻿//! Automation runtime Ã¢â‚¬â€ matcher + executor (M2 of Automations).
 //!
 //! Plugs into the M1 bus by providing an [`EventHandler`] that
 //! `cmd_serve` installs in place of [`noop_handler`]. For each
 //! delivered event, the handler:
 //!
 //!   1. Looks up enabled automations whose `trigger.kind` matches the
-//!      event's kind ([`AutomationStore::list_enabled_for_kind`] â€”
+//!      event's kind ([`AutomationStore::list_enabled_for_kind`] Ã¢â‚¬â€
 //!      indexed lookup).
 //!   2. Evaluates each automation's optional `trigger.when` Rhai
-//!      predicate against the event context. Predicate `false` â†’
-//!      skip; `true` (or absent) â†’ schedule a run.
+//!      predicate against the event context. Predicate `false` Ã¢â€ â€™
+//!      skip; `true` (or absent) Ã¢â€ â€™ schedule a run.
 //!   3. Mints a pending [`AutomationRunRow`] and walks the typed
 //!      graph node-by-node, checkpointing each step via
 //!      [`AutomationRunStore::append_trace`] before advancing.
@@ -21,7 +21,7 @@
 //! mean the run is over.
 //!
 //! Expression evaluation uses a freshly-constructed [`rhai::Engine`]
-//! per call with tight sandbox limits â€” no host capabilities, no I/O.
+//! per call with tight sandbox limits Ã¢â‚¬â€ no host capabilities, no I/O.
 //! Filter/Transform/Branch are the only kinds that exercise it in M2.
 //!
 //! Concurrency: the handler runs on the bus's worker pool. Each
@@ -29,32 +29,44 @@
 //! so we shuttle the work onto a `spawn_blocking` thread to avoid
 //! parking the tokio runtime on SQLite writes.
 
-use crate::automation_agent::{AskAgentRequest, AutomationsAgentPool};
-use crate::automation_bus::EventHandler;
 use execlaw_core::Database;
 use execlaw_core::alerts::{AlertRow, AlertStatus, AlertStore, Severity};
-use execlaw_core::automation_bus::BusEventRow;
 use execlaw_core::automation_runs::{AutomationRunStatus, AutomationRunStore, StepTrace};
 use execlaw_core::automations::{
     AutomationDef, AutomationRow, AutomationStore, END_SENTINEL, NodeDef, NodeKind,
-    TRIGGER_SENTINEL, TriggerDef, parse_ask_agent_config,
+    TRIGGER_SENTINEL, TriggerDef,
 };
+use execlaw_core::event_envelope::EventEnvelope;
 use execlaw_core::ids::AlertId;
 use execlaw_plugin_host::PluginHost;
 use rhai::{Dynamic, Engine, Scope};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, warn};
 
+/// Input event to the flow executor. Replaces the prior
+/// `execlaw_core::automation_bus::FlowEventInput` (deleted with the bus
+/// itself in Rip 3) with just the fields the test-run path actually
+/// reads. Field names + JSON shape are preserved so saved test-run
+/// payloads still deserialize unchanged.
+#[derive(Debug, Clone)]
+pub struct FlowEventInput {
+    pub id: String,
+    pub kind: String,
+    pub source: String,
+    pub received_at: i64,
+    pub payload: serde_json::Value,
+    pub internal: bool,
+    pub envelope: EventEnvelope,
+}
+
 /// Per-run handles for the side-effect executors. Threaded into
-/// [`execute_node`] so M4-and-beyond kinds (Notify, CallPlugin, …)
+/// [`execute_node`] so M4-and-beyond kinds (Notify, CallPlugin, â€¦)
 /// can reach the relevant subsystem without us re-plumbing every
 /// signature each time we land a new kind.
 #[derive(Clone)]
 pub struct ExecutorContext {
     pub db: Database,
-    pub pool: AutomationsAgentPool,
     /// Optional so tests that don't exercise CallPlugin can wire the
     /// runtime without spinning up a full plugin host. A `None` here
     /// turns CallPlugin into a clean per-node error rather than a
@@ -63,60 +75,39 @@ pub struct ExecutorContext {
 }
 
 impl ExecutorContext {
-    pub fn new(db: Database, pool: AutomationsAgentPool, plugin_host: Option<PluginHost>) -> Self {
+    pub fn new(db: Database, plugin_host: Option<PluginHost>) -> Self {
         Self {
             db,
-            pool,
             plugin_host,
         }
     }
 }
 
-/// Construct an [`EventHandler`] that drives the automation matcher
-/// + executor against `db`. Drop this into `AutomationBus::spawn` in
-/// place of `noop_handler`.
-///
-/// The `agent_pool` is the seam that lets cmd_serve plug in the real
-/// LLM-backed `InferenceAgentInvoker` while tests use a
-/// `StubAgentInvoker`. Without an `AskAgent` node in a flow, the pool
-/// is never invoked â€” but it must always be present so the runtime
-/// has a well-defined behavior for AskAgent regardless of LLM
-/// availability.
-pub fn build_handler(ctx: ExecutorContext) -> EventHandler {
-    Arc::new(move |row: BusEventRow| {
-        let ctx = ctx.clone();
-        Box::pin(async move {
-            // SQLite + Rhai are sync; the agent pool's invocation is
-            // async but we bridge across `block_on` inside the
-            // spawn_blocking thread (cheap â€” the only awaiting work
-            // is the semaphore acquire + the model HTTP round-trip,
-            // both of which we want to serialize per-run anyway).
-            if let Err(e) = tokio::task::spawn_blocking(move || {
-                run_matching_automations(&ctx, &row);
-            })
-            .await
-            {
-                warn!(error = %e, "automation runtime: spawn_blocking failed");
-            }
-        })
-    })
-}
 
 /// Top-level matcher: list enabled automations for the event's kind,
-/// filter by trigger predicate, run each that matches.
-fn run_matching_automations(ctx: &ExecutorContext, evt: &BusEventRow) {
+/// filter by trigger predicate, run each that matches. Each match
+/// produces an `AutomationRunRow` so the SPA's "recent runs" tab
+/// has a record.
+///
+/// 2026-05-22: currently unused — Phase A of the Flows middleware
+/// uses [`dry_run`] for the hot path (no run persistence) and the
+/// bus dispatcher that previously called this is gone. Phase B will
+/// switch flow_middleware to drive this so chat-prompt flow runs
+/// show up in the SPA. Annotated `dead_code` until that lands.
+#[allow(dead_code)]
+pub(crate) fn run_matching_automations(ctx: &ExecutorContext, evt: &FlowEventInput) {
     let store = AutomationStore::new(&ctx.db);
-    let matched = match store.list_enabled_for_kind(evt.kind) {
+    let matched = match store.list_enabled_for_kind(&evt.kind) {
         Ok(rows) => rows,
         Err(e) => {
-            warn!(error = %e, kind = %evt.kind.as_str(), "automation runtime: list_enabled_for_kind failed");
+            warn!(error = %e, kind = %evt.kind, "automation runtime: list_enabled_for_kind failed");
             return;
         }
     };
     if matched.is_empty() {
         debug!(
             event_id = %evt.id,
-            kind = %evt.kind.as_str(),
+            kind = %evt.kind,
             "automation runtime: no automations match event kind",
         );
         return;
@@ -138,17 +129,24 @@ fn run_matching_automations(ctx: &ExecutorContext, evt: &BusEventRow) {
 /// Build the Rhai-facing event-shape map. We mirror the
 /// [`BusEvent`] envelope so flow authors write `event.payload.foo`
 /// without having to think about persistence shape.
-fn event_context(evt: &BusEventRow) -> serde_json::Value {
+pub(crate) fn event_context(evt: &FlowEventInput) -> serde_json::Value {
+    // The Rhai scope sees one object: `event`. Anything not exposed here
+    // is invisible to trigger.when / edge.when expressions, which is
+    // why the envelope is included verbatim — flows need to discriminate
+    // between operator-internal events and external traffic, and need
+    // sender identity for routing decisions. See audit fix #2.
     serde_json::json!({
         "id": evt.id,
-        "kind": evt.kind.as_str(),
+        "kind": evt.kind,
         "source": evt.source,
         "received_at": evt.received_at,
         "payload": evt.payload,
+        "envelope": evt.envelope,
+        "internal": evt.internal,
     })
 }
 
-fn trigger_matches(trigger: &TriggerDef, event_ctx: &serde_json::Value) -> bool {
+pub(crate) fn trigger_matches(trigger: &TriggerDef, event_ctx: &serde_json::Value) -> bool {
     let Some(expr) = trigger.when.as_ref() else {
         return true;
     };
@@ -166,10 +164,11 @@ fn trigger_matches(trigger: &TriggerDef, event_ctx: &serde_json::Value) -> bool 
     }
 }
 
+#[allow(dead_code)]
 fn run_one(
     ctx: &ExecutorContext,
     automation: &AutomationRow,
-    evt: &BusEventRow,
+    evt: &FlowEventInput,
     event_ctx: &serde_json::Value,
 ) {
     let run_store = AutomationRunStore::new(&ctx.db);
@@ -207,7 +206,14 @@ fn run_one(
             );
         }
     };
-    let outcome = execute_graph(&automation.definition, &mut state, ctx, &mut trace_sink);
+    let outcome = execute_graph(
+        &automation.definition,
+        &mut state,
+        ctx,
+        &evt.envelope,
+        &run_id,
+        &mut trace_sink,
+    );
     let finished_at = chrono::Utc::now().timestamp_millis();
     let final_status = match outcome {
         ExecOutcome::Success => AutomationRunStatus::Success,
@@ -221,9 +227,10 @@ fn run_one(
             "automation runtime: failed to finalize run row",
         );
     }
+    let _ = (run_id, outcome);
 }
 
-/// Result of a [`dry_run`] â€” outcome + captured per-node trace.
+/// Result of a [`dry_run`] Ã¢â‚¬â€ outcome + captured per-node trace.
 /// The HTTP `POST /test-run` endpoint serializes this directly.
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 pub struct DryRunResult {
@@ -233,26 +240,29 @@ pub struct DryRunResult {
 
 /// Run the executor against an automation + a synthetic / captured
 /// event, capturing per-node traces in memory. Does NOT persist a
-/// run row â€” used by the editor's "Test run" button so the operator
+/// run row Ã¢â‚¬â€ used by the editor's "Test run" button so the operator
 /// can iterate on a definition without polluting `state_automation_runs`.
 ///
 /// The agent pool is reused, so an `AskAgent` node in a test run will
 /// actually invoke the LLM through the same path as live dispatch.
 /// Callers that don't want to hit the model should swap the pool's
-/// invoker (the M3 test fixtures show how â€” `StubAgentInvoker`).
+/// invoker (the M3 test fixtures show how Ã¢â‚¬â€ `StubAgentInvoker`).
 pub fn dry_run(
     ctx: &ExecutorContext,
     automation: &AutomationRow,
-    sample: &BusEventRow,
+    sample: &FlowEventInput,
 ) -> DryRunResult {
     let event_ctx = event_context(sample);
     let mut state: HashMap<String, serde_json::Value> = HashMap::new();
     state.insert("event".to_string(), event_ctx);
     let mut traces: Vec<StepTrace> = Vec::new();
+    let dry_run_id = format!("dry-{}", uuid::Uuid::new_v4());
     let outcome = execute_graph(
         &automation.definition,
         &mut state,
         ctx,
+        &sample.envelope,
+        &dry_run_id,
         &mut |t: StepTrace| traces.push(t),
     );
     DryRunResult {
@@ -286,10 +296,12 @@ fn execute_graph(
     def: &AutomationDef,
     state: &mut HashMap<String, serde_json::Value>,
     ctx: &ExecutorContext,
+    envelope: &execlaw_core::event_envelope::EventEnvelope,
+    run_id: &str,
     trace_sink: &mut dyn FnMut(StepTrace),
 ) -> ExecOutcome {
     let mut current = TRIGGER_SENTINEL.to_string();
-    // Defense in depth â€” refuse to walk pathologically long graphs.
+    // Defense in depth Ã¢â‚¬â€ refuse to walk pathologically long graphs.
     // The validator should already reject cycles in M3+, but for
     // now we cap at 256 hops.
     let max_hops = 256;
@@ -320,7 +332,7 @@ fn execute_graph(
 
         let start = Instant::now();
         let input_snapshot = snapshot_state(state);
-        let exec_result = execute_node(node, state, ctx);
+        let exec_result = execute_node(node, state, ctx, envelope, run_id);
         let ms = start.elapsed().as_millis() as u64;
 
         match exec_result {
@@ -371,7 +383,7 @@ fn execute_graph(
             }
         }
     }
-    // Hit the hop cap â€” record a failure and bail.
+    // Hit the hop cap Ã¢â‚¬â€ record a failure and bail.
     let trace = StepTrace {
         node_id: "(executor)".into(),
         input: serde_json::Value::Null,
@@ -421,11 +433,11 @@ fn pick_next_edge(
 enum NodeOutcome {
     /// Node produced a value; bind under the node's id and advance.
     Output(serde_json::Value),
-    /// Filter said no â€” terminate the run as `Skipped`.
+    /// Filter said no Ã¢â‚¬â€ terminate the run as `Skipped`.
     Drop,
-    /// Explicit Terminal node â€” terminate as `Success`.
+    /// Explicit Terminal node Ã¢â‚¬â€ terminate as `Success`.
     Terminal,
-    /// Node failed at runtime â€” terminate as `Failed`.
+    /// Node failed at runtime Ã¢â‚¬â€ terminate as `Failed`.
     Error(String),
 }
 
@@ -433,29 +445,60 @@ fn execute_node(
     node: &NodeDef,
     state: &HashMap<String, serde_json::Value>,
     ctx: &ExecutorContext,
+    _envelope: &execlaw_core::event_envelope::EventEnvelope,
+    _run_id: &str,
 ) -> NodeOutcome {
     match node.kind {
         NodeKind::Filter => execute_filter(node, state),
         NodeKind::Transform => execute_transform(node, state),
         NodeKind::Branch => {
-            // Branch is a no-op routing junction â€” outputs an empty
+            // Branch is a no-op routing junction Ã¢â‚¬â€ outputs an empty
             // map so downstream `{{branch.*}}` references resolve
             // without surprises. The actual branching lives in the
             // outgoing edges' `when` clauses.
             NodeOutcome::Output(serde_json::json!({}))
         }
         NodeKind::Terminal => NodeOutcome::Terminal,
-        NodeKind::AskAgent => execute_ask_agent(node, state, &ctx.pool),
+        NodeKind::RewritePrompt => execute_rewrite_prompt(node, state),
+        NodeKind::SetSkills => execute_set_skills(node, state),
+        NodeKind::SetTools => execute_set_tools(node, state),
+        NodeKind::SetTrust => execute_set_trust(node, state),
+        NodeKind::AddAttachment => execute_add_attachment(node, state),
+        NodeKind::AddMemory => execute_add_memory(node, state),
         NodeKind::Notify => execute_notify(node, state, &ctx.db),
         NodeKind::CallPlugin => execute_call_plugin(node, state, ctx.plugin_host.as_ref()),
+        // 2026-05-22 — AskAgent + SendReply executors removed in the
+        // M6 rip-out. Their NodeKind variants remain so saved flows
+        // deserialize cleanly, but execution returns a clean,
+        // operator-actionable error. Reintroduce as the middleware
+        // redesign (pre-turn flow mutators) lands.
+        NodeKind::AskAgent => NodeOutcome::Error(
+            "AskAgent: not supported in this build — the M6 single-shot \
+             agent invoker was removed pending the middleware redesign. \
+             Use the legacy chat path or rebuild a middleware-aware \
+             AskAgent."
+                .into(),
+        ),
+        NodeKind::SendReply => NodeOutcome::Error(
+            "SendReply: not supported in this build — the ReplyRouter \
+             was removed in the M6 rip-out. Future flows will mutate the \
+             chat turn pre-execution; SendReply is no longer the delivery \
+             abstraction."
+                .into(),
+        ),
         _ => NodeOutcome::Error(format!(
             "node kind '{}' not implemented in this milestone",
             node.kind.as_str()
         )),
     }
+    // `envelope` + `run_id` retained on the signature for future use
+    // (middleware redesign), but currently consumed only by the
+    // surviving Filter/Transform/Branch/Terminal/Notify/CallPlugin
+    // executors that don't need them.
 }
 
-/// Notify (M6) â€” insert a row into `state_alerts` via
+
+/// Notify (M6) Ã¢â‚¬â€ insert a row into `state_alerts` via
 /// [`AlertStore::insert_firing`]. The alert's `source` defaults to
 /// `automation:<node_id>` so operators can fingerprint-dedup against
 /// the producing flow.
@@ -472,7 +515,7 @@ fn execute_node(
 /// [`render_template`] so the alert can reference `{{event.payload.x}}`
 /// and upstream node outputs.
 ///
-/// Output: `{ "alert_id": "<id>" }` â€” downstream nodes can route on
+/// Output: `{ "alert_id": "<id>" }` Ã¢â‚¬â€ downstream nodes can route on
 /// alert_id presence if they want to ack the notification.
 fn execute_notify(
     node: &NodeDef,
@@ -545,7 +588,7 @@ fn execute_notify(
     }
 }
 
-/// CallPlugin (M6) â€” dispatch to a plugin-registered tool by name.
+/// CallPlugin (M6) Ã¢â‚¬â€ dispatch to a plugin-registered tool by name.
 /// Reuses [`PluginHost::call_tool`] which is the same path the
 /// LLM-callable tool registry uses.
 ///
@@ -560,7 +603,7 @@ fn execute_notify(
 /// `trust="Controller"`. This is consistent with the routine
 /// subsystem's auth posture.
 ///
-/// Output: the tool's raw return value â€” downstream nodes can pluck
+/// Output: the tool's raw return value Ã¢â‚¬â€ downstream nodes can pluck
 /// fields out via `{{node_id.field}}`.
 fn execute_call_plugin(
     node: &NodeDef,
@@ -587,7 +630,7 @@ fn execute_call_plugin(
     let Some(host) = plugin_host else {
         return NodeOutcome::Error(
             "CallPlugin: no plugin host wired into the runtime (tests without plugin support \
-             reach this branch â€” production builds always have one)"
+             reach this branch Ã¢â‚¬â€ production builds always have one)"
                 .into(),
         );
     };
@@ -635,64 +678,6 @@ fn render_template_in_value(
     }
 }
 
-/// AskAgent (M3) â€” delegates to the [`AutomationsAgentPool`]. The
-/// pool's semaphore bounds in-flight invocations; the invoker
-/// translates the request into a single chat-completion call
-/// (production) or a scripted reply (tests).
-///
-/// Node output shape: `{ "tool": "<exit-tool-name>", "args": {...} }`.
-/// Downstream edges route on `<node_id>.tool`; downstream nodes can
-/// read `<node_id>.args.*` for the structured payload the agent
-/// produced.
-///
-/// Template substitution: `prompt` and each entry of `attachments`
-/// pass through [`render_template`] before reaching the invoker, so
-/// authors can write `{{event.payload.image_url}}` in the JSON
-/// definition and have it resolved against the run's state map.
-///
-/// M3a single-turn limitation: `max_turns` â‰¥ 1 is treated as 1.
-/// The framework is sized for multi-turn (the invoker exposes the
-/// effective turn count) but the loop body is a follow-up.
-fn execute_ask_agent(
-    node: &NodeDef,
-    state: &HashMap<String, serde_json::Value>,
-    pool: &AutomationsAgentPool,
-) -> NodeOutcome {
-    let mut cfg = match parse_ask_agent_config(&node.config) {
-        Ok(c) => c,
-        Err(msg) => return NodeOutcome::Error(msg),
-    };
-    // Substitute `{{path.to.field}}` references in prompt + each
-    // attachment URL using the current state. Filter/Transform's
-    // Rhai expressions already access state via field syntax; this
-    // is the string-substitution analog for free-text fields.
-    cfg.prompt = render_template(&cfg.prompt, state);
-    cfg.attachments = cfg
-        .attachments
-        .into_iter()
-        .map(|a| render_template(&a, state))
-        .collect();
-    let req = AskAgentRequest { config: cfg };
-    // We're inside a `spawn_blocking` thread; `Handle::current()`
-    // gives us the calling tokio runtime so we can drive the async
-    // invocation to completion without holding a worker.
-    let handle = match tokio::runtime::Handle::try_current() {
-        Ok(h) => h,
-        Err(_) => {
-            return NodeOutcome::Error(
-                "AskAgent: no tokio runtime in scope (executor must run under spawn_blocking)"
-                    .into(),
-            );
-        }
-    };
-    match handle.block_on(pool.invoke(&req)) {
-        Ok(call) => NodeOutcome::Output(serde_json::json!({
-            "tool": call.name,
-            "args": call.args,
-        })),
-        Err(e) => NodeOutcome::Error(format!("{e}")),
-    }
-}
 
 /// Replace `{{path.to.field}}` tokens with the corresponding value
 /// from `state`. Unresolved paths are preserved verbatim (so the
@@ -725,7 +710,7 @@ pub(crate) fn render_template(s: &str, state: &HashMap<String, serde_json::Value
                         out.push_str(&value_to_string(&v));
                     }
                     None => {
-                        // Preserve the literal â€” visible breakage is
+                        // Preserve the literal Ã¢â‚¬â€ visible breakage is
                         // better than silent dropping.
                         out.push_str(&s[i..end + 2]);
                     }
@@ -802,6 +787,157 @@ fn execute_transform(node: &NodeDef, state: &HashMap<String, serde_json::Value>)
     }
 }
 
+/// Phase A of the Flows middleware redesign — emit a typed
+/// rewritten-prompt mutation as the node's output. The
+/// `flow_middleware` harvester reads `state[node_id].text` and feeds
+/// it back to the chat handler as the effective user text. Validator
+/// already guarantees `config.expr` is a non-empty string; runtime
+/// failures (bad Rhai, non-string result, sandbox cap hit) land in
+/// the per-step trace and the chat handler falls through to the
+/// original user text untouched.
+fn execute_rewrite_prompt(
+    node: &NodeDef,
+    state: &HashMap<String, serde_json::Value>,
+) -> NodeOutcome {
+    let Some(expr) = node.config.get("expr").and_then(|v| v.as_str()) else {
+        return NodeOutcome::Error(
+            "RewritePrompt node missing config.expr (must be Rhai expression returning a string)"
+                .into(),
+        );
+    };
+    let mut scope = build_scope_from_state(state);
+    let value = match eval_value(expr, &mut scope) {
+        Ok(v) => v,
+        Err(e) => return NodeOutcome::Error(format!("RewritePrompt expr rhai eval failed: {e}")),
+    };
+    // Must reduce to a JSON string. Numbers, bools, objects, nulls
+    // all reject — the harvester needs an unambiguous string.
+    let text = match value {
+        serde_json::Value::String(s) => s,
+        other => {
+            return NodeOutcome::Error(format!(
+                "RewritePrompt expr returned non-string value (got {}): the Rhai expression \
+                 must evaluate to a string",
+                match other {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "bool",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::Object(_) => "object",
+                    serde_json::Value::String(_) => unreachable!(),
+                }
+            ));
+        }
+    };
+    NodeOutcome::Output(serde_json::json!({ "text": text }))
+}
+
+// ---------------------------------------------------------------------------
+// Phase B mutators — emit typed JSON outputs for the flow_middleware
+// harvester to pick up. Each refuses bad config defensively even
+// though the validator already enforces shape at save time (defense
+// in depth: someone could insert a row via raw SQL).
+// ---------------------------------------------------------------------------
+
+/// Helper: pull a list-of-strings from `node.config[key]`. Validator
+/// guarantees presence/non-empty + per-element non-blankness; this
+/// re-checks because the executor is the only thing standing between
+/// a malformed row and a panic in the harvester.
+fn extract_string_list(
+    node: &NodeDef,
+    key: &'static str,
+    label: &'static str,
+) -> Result<Vec<String>, String> {
+    let arr = node
+        .config
+        .get(key)
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| format!("{label} node missing config.{key} (must be a JSON array of strings)"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, v) in arr.iter().enumerate() {
+        let s = v
+            .as_str()
+            .ok_or_else(|| format!("{label} node config.{key}[{i}] is not a string"))?
+            .trim();
+        if s.is_empty() {
+            return Err(format!("{label} node config.{key}[{i}] is empty"));
+        }
+        out.push(s.to_owned());
+    }
+    Ok(out)
+}
+
+fn execute_set_skills(
+    node: &NodeDef,
+    _state: &HashMap<String, serde_json::Value>,
+) -> NodeOutcome {
+    match extract_string_list(node, "skills", "SetSkills") {
+        Ok(skills) => NodeOutcome::Output(serde_json::json!({ "skills": skills })),
+        Err(e) => NodeOutcome::Error(e),
+    }
+}
+
+fn execute_set_tools(
+    node: &NodeDef,
+    _state: &HashMap<String, serde_json::Value>,
+) -> NodeOutcome {
+    match extract_string_list(node, "tools", "SetTools") {
+        Ok(tools) => NodeOutcome::Output(serde_json::json!({ "tools": tools })),
+        Err(e) => NodeOutcome::Error(e),
+    }
+}
+
+fn execute_set_trust(
+    node: &NodeDef,
+    _state: &HashMap<String, serde_json::Value>,
+) -> NodeOutcome {
+    let raw = match node.config.get("trust").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return NodeOutcome::Error("SetTrust node missing config.trust".into()),
+    };
+    // Normalize through TrustClass::parse so PascalCase + snake_case
+    // both round-trip to the canonical Serialize form. The harvester
+    // re-parses on the chat side to apply.
+    let class = match execlaw_core::event_envelope::TrustClass::parse(raw) {
+        Some(c) => c,
+        None => {
+            return NodeOutcome::Error(format!(
+                "SetTrust: unknown trust class '{raw}' (expected Controller | Delegated | KnownTrusted | KnownLimited | UnknownPending | ColdContact | Blocked, or their snake_case aliases)"
+            ));
+        }
+    };
+    NodeOutcome::Output(serde_json::json!({ "trust": class.as_str() }))
+}
+
+fn execute_add_attachment(
+    node: &NodeDef,
+    _state: &HashMap<String, serde_json::Value>,
+) -> NodeOutcome {
+    match extract_string_list(node, "attachment_ids", "AddAttachment") {
+        Ok(ids) => NodeOutcome::Output(serde_json::json!({ "attachment_ids": ids })),
+        Err(e) => NodeOutcome::Error(e),
+    }
+}
+
+fn execute_add_memory(
+    node: &NodeDef,
+    state: &HashMap<String, serde_json::Value>,
+) -> NodeOutcome {
+    let raw = match node.config.get("text").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return NodeOutcome::Error("AddMemory node missing config.text".into()),
+    };
+    let rendered = render_template(raw, state);
+    if rendered.trim().is_empty() {
+        return NodeOutcome::Error(
+            "AddMemory: rendered memory text is empty (template tokens may have stripped it; \
+             check `event.payload.*` references)"
+                .into(),
+        );
+    }
+    NodeOutcome::Output(serde_json::json!({ "text": rendered }))
+}
+
 // ---------------------------------------------------------------------------
 // Rhai expression evaluation. Sandbox is intentionally tight: no
 // modules, no eval, no globals beyond a small set of helpers, hard
@@ -809,7 +945,7 @@ fn execute_transform(node: &NodeDef, state: &HashMap<String, serde_json::Value>)
 // only need pure expressions.
 // ---------------------------------------------------------------------------
 
-/// Sandbox limits â€” same shape as the script-tier plugin engine but
+/// Sandbox limits Ã¢â‚¬â€ same shape as the script-tier plugin engine but
 /// halved (we're evaluating one-line predicates, not whole plugins).
 const RHAI_MAX_OPS: u64 = 100_000;
 const RHAI_MAX_CALL_DEPTH: usize = 32;
@@ -818,15 +954,37 @@ const RHAI_MAX_STRING_LEN: usize = 65_536;
 const RHAI_MAX_ARRAY_LEN: usize = 10_000;
 const RHAI_MAX_MAP_LEN: usize = 10_000;
 
-fn make_engine() -> Engine {
-    let mut engine = Engine::new();
-    engine.set_max_operations(RHAI_MAX_OPS);
-    engine.set_max_call_levels(RHAI_MAX_CALL_DEPTH);
-    engine.set_max_expr_depths(RHAI_MAX_EXPR_DEPTH, RHAI_MAX_EXPR_DEPTH);
-    engine.set_max_string_size(RHAI_MAX_STRING_LEN);
-    engine.set_max_array_size(RHAI_MAX_ARRAY_LEN);
-    engine.set_max_map_size(RHAI_MAX_MAP_LEN);
-    engine
+// 2026-05-25 — Phase E shipped 9 default plugin flows on top of the
+// existing 1 web default; every chat turn now fires the matcher
+// against ~10 enabled chat.prompt flows. Profiling caught a
+// >300x regression vs. the zero-flow baseline (3.8µs → 1.15ms per
+// `flow_middleware::evaluate` call on a "hi" prompt). The dominant
+// cost was `Engine::new()` running ~14 times per turn — once per
+// `eval_bool` / `eval_value`. The engine's configuration is
+// stateless across evals (every call configured it identically),
+// so a single shared engine is correct: Rhai 1.21 with the `sync`
+// feature ships an `Engine: Send + Sync` and `eval_expression_*`
+// takes `&self`, so the global engine is safe to share across
+// every chat-turn worker thread.
+//
+// Cache the configured engine in a `OnceLock` so the parser tables,
+// function registry, and type registry are built exactly once for
+// the lifetime of the process. The sandbox-cap values are
+// compile-time constants so the init closure has no runtime
+// dependencies.
+static SHARED_ENGINE: std::sync::OnceLock<Engine> = std::sync::OnceLock::new();
+
+fn shared_engine() -> &'static Engine {
+    SHARED_ENGINE.get_or_init(|| {
+        let mut engine = Engine::new();
+        engine.set_max_operations(RHAI_MAX_OPS);
+        engine.set_max_call_levels(RHAI_MAX_CALL_DEPTH);
+        engine.set_max_expr_depths(RHAI_MAX_EXPR_DEPTH, RHAI_MAX_EXPR_DEPTH);
+        engine.set_max_string_size(RHAI_MAX_STRING_LEN);
+        engine.set_max_array_size(RHAI_MAX_ARRAY_LEN);
+        engine.set_max_map_size(RHAI_MAX_MAP_LEN);
+        engine
+    })
 }
 
 fn build_scope_with_event(event_ctx: &serde_json::Value) -> Scope<'static> {
@@ -915,8 +1073,7 @@ fn dynamic_to_json(d: Dynamic) -> serde_json::Value {
 }
 
 fn eval_bool(expr: &str, scope: &mut Scope<'static>) -> Result<bool, String> {
-    let engine = make_engine();
-    engine
+    shared_engine()
         .eval_expression_with_scope::<Dynamic>(scope, expr)
         .map_err(|e| e.to_string())
         .and_then(|d| {
@@ -926,8 +1083,7 @@ fn eval_bool(expr: &str, scope: &mut Scope<'static>) -> Result<bool, String> {
 }
 
 fn eval_value(expr: &str, scope: &mut Scope<'static>) -> Result<serde_json::Value, String> {
-    let engine = make_engine();
-    let dyn_val = engine
+    let dyn_val = shared_engine()
         .eval_expression_with_scope::<Dynamic>(scope, expr)
         .map_err(|e| e.to_string())?;
     Ok(dynamic_to_json(dyn_val))
@@ -940,15 +1096,9 @@ fn eval_value(expr: &str, scope: &mut Scope<'static>) -> Result<serde_json::Valu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::automation_agent::{
-        AskAgentError, AutomationsAgentPool, ExitToolCall, StubAgentInvoker,
-    };
-    use execlaw_core::Database;
-    use execlaw_core::automation_bus::{BusEventKind, BusEventStore, Event as BusEvent};
-    use execlaw_core::automations::{
-        AutomationDef, AutomationStore, AutomationUpsert, EdgeDef, NodeDef, NodeKind, TriggerDef,
-    };
+    use execlaw_core::automations::{AutomationStore, AutomationUpsert};
     use execlaw_core::db::DbConfig;
+    use execlaw_core::event_envelope::EventEnvelope;
     use execlaw_core::migrations::MigrationRunner;
 
     fn fresh_db() -> Database {
@@ -957,49 +1107,26 @@ mod tests {
         db
     }
 
-    /// Pool used by tests that don't exercise AskAgent. Calling
-    /// `invoke` on it returns an error â€” fine, no test reaches that
-    /// path. Keeps the runtime signature uniform.
-    fn noop_pool() -> AutomationsAgentPool {
-        AutomationsAgentPool::new(Arc::new(StubAgentInvoker::err(
-            "noop pool â€” test should not exercise AskAgent",
-        )))
-    }
-
-    /// Executor context for tests that don't exercise CallPlugin â€”
-    /// i.e., the default for Filter/Transform/Branch/Terminal/Notify
-    /// flows. `Notify` writes through the wired DB; CallPlugin tests
-    /// supply a plugin host via [`ExecutorContext::new`] directly.
     fn noop_ctx(db: &Database) -> ExecutorContext {
-        ExecutorContext::new(db.clone(), noop_pool(), None)
+        ExecutorContext::new(db.clone(), None)
     }
 
-    /// Context with a specific agent pool wired (for AskAgent tests).
-    fn agent_ctx(db: &Database, pool: AutomationsAgentPool) -> ExecutorContext {
-        ExecutorContext::new(db.clone(), pool, None)
-    }
-
-    fn stub_pool(call: ExitToolCall) -> AutomationsAgentPool {
-        AutomationsAgentPool::new(Arc::new(StubAgentInvoker::ok(call)))
-    }
-
-    fn seed_bus_event(db: &Database, id: &str, payload: serde_json::Value) -> BusEventRow {
-        let store = BusEventStore::new(db);
-        let evt = BusEvent {
-            id: id.into(),
-            kind: BusEventKind::WebhookReceived,
+    fn sample_event(kind: &str, payload: serde_json::Value) -> FlowEventInput {
+        FlowEventInput {
+            id: "e-test".into(),
+            kind: kind.into(),
             source: "test".into(),
-            received_at: 100,
+            received_at: 0,
             payload,
-        };
-        store.publish(&evt, false).unwrap();
-        store.get(id).unwrap().unwrap()
+            internal: false,
+            envelope: EventEnvelope::system_internal(),
+        }
     }
 
     #[test]
     fn rhai_eval_bool_simple() {
         let mut scope = Scope::new();
-        scope.push_dynamic("x", Dynamic::from(5_i64));
+        scope.push_dynamic("x", Dynamic::from(7_i64));
         assert!(eval_bool("x > 3", &mut scope).unwrap());
         assert!(!eval_bool("x < 3", &mut scope).unwrap());
     }
@@ -1018,1221 +1145,396 @@ mod tests {
     }
 
     #[test]
-    fn rhai_eval_value_returns_serializable_object() {
-        let event = serde_json::json!({"payload": {"a": 1, "b": 2}});
-        let mut scope = build_scope_with_event(&event);
-        let v = eval_value(r#"#{ sum: event.payload.a + event.payload.b }"#, &mut scope).unwrap();
-        assert_eq!(v, serde_json::json!({"sum": 3}));
-    }
-
-    #[test]
     fn rhai_eval_returns_error_for_bad_expression() {
         let mut scope = Scope::new();
         assert!(eval_bool("this is not valid rhai 1 + +", &mut scope).is_err());
     }
 
-    /// Build a definition: trigger â†’ filter â†’ terminal.
-    fn def_filter_pass(filter_expr: &str) -> AutomationDef {
-        AutomationDef {
-            trigger: TriggerDef {
-                kind: BusEventKind::WebhookReceived,
-                when: None,
-            },
-            nodes: vec![
-                NodeDef {
-                    id: "f1".into(),
-                    kind: NodeKind::Filter,
-                    config: serde_json::json!({"expr": filter_expr}),
-                    position: None,
-                },
-                NodeDef {
-                    id: "end".into(),
-                    kind: NodeKind::Terminal,
-                    config: serde_json::json!({}),
-                    position: None,
-                },
+    /// Filter → Terminal: trivial happy-path graph. Confirms dry_run
+    /// drives the surviving executor end-to-end against the new
+    /// FlowEventInput shape.
+    #[test]
+    fn dry_run_filter_pass_then_terminal_succeeds() {
+        let db = fresh_db();
+        let store = AutomationStore::new(&db);
+        let def: AutomationDef = serde_json::from_value(serde_json::json!({
+            "trigger": {"kind": "webhook.received", "when": null},
+            "nodes": [
+                {"id": "f1", "kind": "Filter", "config": {"expr": "true"}},
+                {"id": "end", "kind": "Terminal", "config": {}},
             ],
-            edges: vec![
-                EdgeDef {
-                    from: TRIGGER_SENTINEL.into(),
-                    to: "f1".into(),
-                    when: None,
-                },
-                EdgeDef {
-                    from: "f1".into(),
-                    to: "end".into(),
-                    when: None,
-                },
+            "edges": [
+                {"from": "trigger", "to": "f1", "when": null},
+                {"from": "f1", "to": "end", "when": null},
             ],
-        }
-    }
-
-    #[test]
-    fn execute_filter_pass_runs_to_success() {
-        let db = fresh_db();
-        let auto_store = AutomationStore::new(&db);
-        let run_store = AutomationRunStore::new(&db);
-        let evt = seed_bus_event(&db, "e1", serde_json::json!({"x": 5}));
-
-        let row = auto_store
+        })).unwrap();
+        let row = store
             .upsert(
                 &AutomationUpsert {
                     id: None,
-                    name: "pass".into(),
-                    enabled: true,
-                    definition: def_filter_pass("event.payload.x > 0"),
-                },
-                1000,
-            )
-            .unwrap();
-
-        run_matching_automations(&noop_ctx(&db), &evt);
-
-        let runs = run_store.list_for_automation(&row.id, 10).unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].status, AutomationRunStatus::Success);
-        // Trace records the filter step.
-        assert!(runs[0].step_traces.iter().any(|t| t.node_id == "f1"));
-    }
-
-    #[test]
-    fn execute_filter_drop_marks_run_skipped() {
-        let db = fresh_db();
-        let auto_store = AutomationStore::new(&db);
-        let run_store = AutomationRunStore::new(&db);
-        let evt = seed_bus_event(&db, "e1", serde_json::json!({"x": -1}));
-
-        let row = auto_store
-            .upsert(
-                &AutomationUpsert {
-                    id: None,
-                    name: "drop".into(),
-                    enabled: true,
-                    definition: def_filter_pass("event.payload.x > 0"),
-                },
-                1000,
-            )
-            .unwrap();
-
-        run_matching_automations(&noop_ctx(&db), &evt);
-
-        let runs = run_store.list_for_automation(&row.id, 10).unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].status, AutomationRunStatus::Skipped);
-    }
-
-    #[test]
-    fn trigger_when_predicate_filters_events() {
-        let db = fresh_db();
-        let auto_store = AutomationStore::new(&db);
-        let run_store = AutomationRunStore::new(&db);
-
-        // Two events: one with source=ring, one with source=slack.
-        let store = BusEventStore::new(&db);
-        for (id, source) in [("e-ring", "ring"), ("e-slack", "slack")] {
-            store
-                .publish(
-                    &BusEvent {
-                        id: id.into(),
-                        kind: BusEventKind::WebhookReceived,
-                        source: source.into(),
-                        received_at: 100,
-                        payload: serde_json::json!({}),
-                    },
-                    false,
-                )
-                .unwrap();
-        }
-
-        // Automation only matches ring.
-        let mut def = def_filter_pass("true");
-        def.trigger.when = Some(r#"event.source == "ring""#.into());
-        let row = auto_store
-            .upsert(
-                &AutomationUpsert {
-                    id: None,
-                    name: "ring-only".into(),
+                    name: "test".into(),
                     enabled: true,
                     definition: def,
                 },
                 1000,
             )
             .unwrap();
-
-        for id in ["e-ring", "e-slack"] {
-            let evt = store.get(id).unwrap().unwrap();
-            run_matching_automations(&noop_ctx(&db), &evt);
-        }
-        let _ = run_store;
-
-        let runs = run_store.list_for_automation(&row.id, 10).unwrap();
-        // Only the ring event should have produced a run.
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].event_id, "e-ring");
+        let ctx = noop_ctx(&db);
+        let evt = sample_event("webhook.received", serde_json::json!({}));
+        let result = dry_run(&ctx, &row, &evt);
+        assert_eq!(result.outcome, ExecOutcome::Success);
     }
 
+    /// Filter falsy → Skipped (validates the Drop outcome path).
     #[test]
-    fn transform_node_output_visible_to_downstream_edges() {
+    fn dry_run_filter_drop_marks_run_skipped() {
         let db = fresh_db();
-        let auto_store = AutomationStore::new(&db);
-        let run_store = AutomationRunStore::new(&db);
-        let evt = seed_bus_event(&db, "e1", serde_json::json!({"n": 10}));
-
-        // trigger â†’ transform (doubles event.payload.n) â†’ branch on result
-        // â†’ terminal-a if doubled > 15 else terminal-b
-        let def = AutomationDef {
-            trigger: TriggerDef {
-                kind: BusEventKind::WebhookReceived,
-                when: None,
-            },
-            nodes: vec![
-                NodeDef {
-                    id: "double".into(),
-                    kind: NodeKind::Transform,
-                    config: serde_json::json!({"expr": "#{ doubled: event.payload.n * 2 }"}),
-                    position: None,
-                },
-                NodeDef {
-                    id: "branch".into(),
-                    kind: NodeKind::Branch,
-                    config: serde_json::json!({}),
-                    position: None,
-                },
-                NodeDef {
-                    id: "big".into(),
-                    kind: NodeKind::Terminal,
-                    config: serde_json::json!({}),
-                    position: None,
-                },
-                NodeDef {
-                    id: "small".into(),
-                    kind: NodeKind::Terminal,
-                    config: serde_json::json!({}),
-                    position: None,
-                },
+        let store = AutomationStore::new(&db);
+        let def: AutomationDef = serde_json::from_value(serde_json::json!({
+            "trigger": {"kind": "webhook.received", "when": null},
+            "nodes": [
+                {"id": "f1", "kind": "Filter", "config": {"expr": "false"}},
+                {"id": "end", "kind": "Terminal", "config": {}},
             ],
-            edges: vec![
-                EdgeDef {
-                    from: TRIGGER_SENTINEL.into(),
-                    to: "double".into(),
-                    when: None,
-                },
-                EdgeDef {
-                    from: "double".into(),
-                    to: "branch".into(),
-                    when: None,
-                },
-                EdgeDef {
-                    from: "branch".into(),
-                    to: "big".into(),
-                    when: Some("double.doubled > 15".into()),
-                },
-                EdgeDef {
-                    from: "branch".into(),
-                    to: "small".into(),
-                    when: None, // default
-                },
+            "edges": [
+                {"from": "trigger", "to": "f1", "when": null},
+                {"from": "f1", "to": "end", "when": null},
             ],
-        };
-        let row = auto_store
+        })).unwrap();
+        let row = store
             .upsert(
                 &AutomationUpsert {
                     id: None,
-                    name: "branchy".into(),
+                    name: "test".into(),
                     enabled: true,
                     definition: def,
                 },
                 1000,
             )
             .unwrap();
-
-        run_matching_automations(&noop_ctx(&db), &evt);
-        let runs = run_store.list_for_automation(&row.id, 10).unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].status, AutomationRunStatus::Success);
-        // event.payload.n = 10, doubled = 20 > 15, so we hit `big` not `small`.
-        let trace_ids: Vec<_> = runs[0]
-            .step_traces
-            .iter()
-            .map(|t| t.node_id.clone())
-            .collect();
-        assert!(trace_ids.contains(&"big".to_string()));
-        assert!(!trace_ids.contains(&"small".to_string()));
-        // Check the transform output landed in state for the edge predicate.
-        let double_trace = runs[0]
-            .step_traces
-            .iter()
-            .find(|t| t.node_id == "double")
-            .unwrap();
-        assert_eq!(double_trace.output, serde_json::json!({"doubled": 20}));
+        let ctx = noop_ctx(&db);
+        let evt = sample_event("webhook.received", serde_json::json!({}));
+        let result = dry_run(&ctx, &row, &evt);
+        assert_eq!(result.outcome, ExecOutcome::Skipped);
     }
 
+    /// AskAgent node returns a clean "not supported" error after the
+    /// M6 rip-out. Saved flows containing the variant still
+    /// deserialize; execution surfaces the error in the step trace.
     #[test]
-    fn missing_filter_expr_fails_the_run() {
+    fn ask_agent_node_returns_unsupported_error() {
         let db = fresh_db();
-        let auto_store = AutomationStore::new(&db);
-        let run_store = AutomationRunStore::new(&db);
-        let evt = seed_bus_event(&db, "e1", serde_json::json!({}));
-
-        let mut def = def_filter_pass("true");
-        def.nodes[0].config = serde_json::json!({}); // missing expr
-        let row = auto_store
+        let store = AutomationStore::new(&db);
+        let def: AutomationDef = serde_json::from_value(serde_json::json!({
+            "trigger": {"kind": "webhook.received", "when": null},
+            "nodes": [
+                {"id": "ask", "kind": "AskAgent", "config": {
+                    "prompt": "x",
+                    "exit_tools": [{"name": "ok", "description": "", "args_schema": {"type":"object"}}]
+                }},
+                {"id": "end", "kind": "Terminal", "config": {}},
+            ],
+            "edges": [
+                {"from": "trigger", "to": "ask", "when": null},
+                {"from": "ask", "to": "end", "when": null},
+            ],
+        })).unwrap();
+        let row = store
             .upsert(
                 &AutomationUpsert {
                     id: None,
-                    name: "missing-expr".into(),
+                    name: "test".into(),
                     enabled: true,
                     definition: def,
                 },
                 1000,
             )
             .unwrap();
-
-        run_matching_automations(&noop_ctx(&db), &evt);
-        let runs = run_store.list_for_automation(&row.id, 10).unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].status, AutomationRunStatus::Failed);
-        let trace = &runs[0].step_traces[0];
-        assert!(
-            trace
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("missing config.expr")
-        );
-    }
-
-    #[test]
-    fn disabled_automation_is_not_run() {
-        let db = fresh_db();
-        let auto_store = AutomationStore::new(&db);
-        let run_store = AutomationRunStore::new(&db);
-        let evt = seed_bus_event(&db, "e1", serde_json::json!({"x": 5}));
-
-        let row = auto_store
-            .upsert(
-                &AutomationUpsert {
-                    id: None,
-                    name: "off".into(),
-                    enabled: false,
-                    definition: def_filter_pass("true"),
-                },
-                1000,
-            )
-            .unwrap();
-
-        run_matching_automations(&noop_ctx(&db), &evt);
-        assert!(
-            run_store
-                .list_for_automation(&row.id, 10)
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn rhai_sandbox_blocks_runaway_loops() {
-        let mut scope = Scope::new();
-        // Multiplicative cost expression â€” the operator-set limit
-        // (`set_max_operations`) should abort this.
-        let result = eval_value("let s = 0; for i in 0..1_000_000 { s += i; } s", &mut scope);
-        assert!(result.is_err(), "runaway expression must be rejected");
-    }
-
-    /// End-to-end: publish through the live `AutomationBus` (real
-    /// dispatcher + poller + handler) and verify the matcher fires
-    /// the configured automation and persists a run. This is the
-    /// integration test that validates M1 + M2 wired together.
-    #[tokio::test]
-    async fn end_to_end_publish_triggers_matcher_and_runs_automation() {
-        use crate::automation_bus::AutomationBus;
-        use std::time::Duration;
-        use tokio::sync::Notify;
-
-        let db = fresh_db();
-        let auto_store = AutomationStore::new(&db);
-        let run_store = AutomationRunStore::new(&db);
-
-        // Define + save an automation triggered by webhook events
-        // from the "ring" source, with a transform that records
-        // event.payload.zone into its output.
-        let mut def = def_filter_pass("event.payload.zone == \"driveway\"");
-        // Replace filter with transform so we can also assert on
-        // output.
-        def.nodes[0] = NodeDef {
-            id: "f1".into(),
-            kind: NodeKind::Transform,
-            config: serde_json::json!({"expr": "#{ zone: event.payload.zone }"}),
-            position: None,
-        };
-        def.trigger.when = Some(r#"event.source == "ring""#.into());
-        let row = auto_store
-            .upsert(
-                &AutomationUpsert {
-                    id: None,
-                    name: "ring-zone".into(),
-                    enabled: true,
-                    definition: def,
-                },
-                1000,
-            )
-            .unwrap();
-
-        // Spawn the bus with the REAL matcher handler.
-        let stop = std::sync::Arc::new(Notify::new());
-        let (bus, tasks) =
-            AutomationBus::spawn(db.clone(), build_handler(noop_ctx(&db)), stop.clone());
-
-        // Publish a matching event through the bus.
-        let evt = BusEvent {
-            id: "e-ring-1".into(),
-            kind: BusEventKind::WebhookReceived,
-            source: "ring".into(),
-            received_at: 100,
-            payload: serde_json::json!({"zone": "driveway"}),
-        };
-        bus.publish(evt).await.unwrap();
-
-        // Poll for the run row â€” handler runs on spawn_blocking, so
-        // we allow a generous deadline.
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        let mut found = None;
-        while std::time::Instant::now() < deadline {
-            let runs = run_store.list_for_automation(&row.id, 10).unwrap();
-            if !runs.is_empty() {
-                found = Some(runs);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let runs = found.expect("expected the matcher to produce a run within 3s");
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].status, AutomationRunStatus::Success);
-        // The Transform node's output must have made it to the trace.
-        let f1 = runs[0]
-            .step_traces
-            .iter()
-            .find(|t| t.node_id == "f1")
-            .expect("transform step trace");
-        assert_eq!(f1.output, serde_json::json!({"zone": "driveway"}));
-
-        stop.notify_waiters();
-        tasks.join().await;
-    }
-
-    fn ask_agent_def_two_outcomes() -> AutomationDef {
-        AutomationDef {
-            trigger: TriggerDef {
-                kind: BusEventKind::WebhookReceived,
-                when: None,
-            },
-            nodes: vec![
-                NodeDef {
-                    id: "ask".into(),
-                    kind: NodeKind::AskAgent,
-                    config: serde_json::json!({
-                        "prompt": "Decide notify or ignore",
-                        "attachments": [],
-                        "reasoning_tools": [],
-                        "exit_tools": [
-                            {
-                                "name": "notify",
-                                "description": "Call on detection",
-                                "args_schema": {"type": "object"}
-                            },
-                            {
-                                "name": "ignore",
-                                "description": "Call otherwise",
-                                "args_schema": {"type": "object"}
-                            }
-                        ]
-                    }),
-                    position: None,
-                },
-                NodeDef {
-                    id: "did-notify".into(),
-                    kind: NodeKind::Terminal,
-                    config: serde_json::json!({}),
-                    position: None,
-                },
-                NodeDef {
-                    id: "did-ignore".into(),
-                    kind: NodeKind::Terminal,
-                    config: serde_json::json!({}),
-                    position: None,
-                },
-            ],
-            edges: vec![
-                EdgeDef {
-                    from: TRIGGER_SENTINEL.into(),
-                    to: "ask".into(),
-                    when: None,
-                },
-                EdgeDef {
-                    from: "ask".into(),
-                    to: "did-notify".into(),
-                    when: Some(r#"ask.tool == "notify""#.into()),
-                },
-                EdgeDef {
-                    from: "ask".into(),
-                    to: "did-ignore".into(),
-                    when: None, // fallback
-                },
-            ],
-        }
-    }
-
-    #[tokio::test]
-    async fn ask_agent_notify_outcome_routes_to_notify_branch() {
-        let db = fresh_db();
-        let auto_store = AutomationStore::new(&db);
-        let run_store = AutomationRunStore::new(&db);
-        let evt = seed_bus_event(&db, "e-notify", serde_json::json!({}));
-
-        let row = auto_store
-            .upsert(
-                &AutomationUpsert {
-                    id: None,
-                    name: "stub-notify".into(),
-                    enabled: true,
-                    definition: ask_agent_def_two_outcomes(),
-                },
-                1000,
-            )
-            .unwrap();
-
-        // Stub the pool to ALWAYS return `notify`.
-        let pool = stub_pool(ExitToolCall {
-            name: "notify".into(),
-            args: serde_json::json!({"species": "cat", "confidence": 0.91}),
-        });
-        // Drive the executor synchronously via spawn_blocking (matches
-        // production code path).
-        let db_for_blocking = db.clone();
-        let evt_for_blocking = evt.clone();
-        tokio::task::spawn_blocking(move || {
-            let ctx = agent_ctx(&db_for_blocking, pool);
-            run_matching_automations(&ctx, &evt_for_blocking);
-        })
-        .await
-        .unwrap();
-
-        let runs = run_store.list_for_automation(&row.id, 10).unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].status, AutomationRunStatus::Success);
-        let trace_ids: Vec<_> = runs[0]
-            .step_traces
-            .iter()
-            .map(|t| t.node_id.clone())
-            .collect();
-        assert!(trace_ids.contains(&"did-notify".to_string()));
-        assert!(!trace_ids.contains(&"did-ignore".to_string()));
-        // The AskAgent step's output carries the chosen tool + args
-        // for downstream nodes to read.
-        let ask_trace = runs[0]
-            .step_traces
-            .iter()
-            .find(|t| t.node_id == "ask")
-            .unwrap();
-        assert_eq!(ask_trace.output["tool"], "notify");
-        assert_eq!(ask_trace.output["args"]["species"], "cat");
-    }
-
-    #[tokio::test]
-    async fn ask_agent_ignore_outcome_routes_to_fallback_branch() {
-        let db = fresh_db();
-        let auto_store = AutomationStore::new(&db);
-        let run_store = AutomationRunStore::new(&db);
-        let evt = seed_bus_event(&db, "e-ignore", serde_json::json!({}));
-
-        let row = auto_store
-            .upsert(
-                &AutomationUpsert {
-                    id: None,
-                    name: "stub-ignore".into(),
-                    enabled: true,
-                    definition: ask_agent_def_two_outcomes(),
-                },
-                1000,
-            )
-            .unwrap();
-
-        let pool = stub_pool(ExitToolCall {
-            name: "ignore".into(),
-            args: serde_json::json!({}),
-        });
-        let db_for_blocking = db.clone();
-        let evt_for_blocking = evt.clone();
-        tokio::task::spawn_blocking(move || {
-            let ctx = agent_ctx(&db_for_blocking, pool);
-            run_matching_automations(&ctx, &evt_for_blocking);
-        })
-        .await
-        .unwrap();
-
-        let runs = run_store.list_for_automation(&row.id, 10).unwrap();
-        let trace_ids: Vec<_> = runs[0]
-            .step_traces
-            .iter()
-            .map(|t| t.node_id.clone())
-            .collect();
-        assert!(trace_ids.contains(&"did-ignore".to_string()));
-        assert!(!trace_ids.contains(&"did-notify".to_string()));
-    }
-
-    #[tokio::test]
-    async fn ask_agent_invoker_error_marks_run_failed_with_clear_message() {
-        let db = fresh_db();
-        let auto_store = AutomationStore::new(&db);
-        let run_store = AutomationRunStore::new(&db);
-        let evt = seed_bus_event(&db, "e1", serde_json::json!({}));
-
-        let row = auto_store
-            .upsert(
-                &AutomationUpsert {
-                    id: None,
-                    name: "stub-err".into(),
-                    enabled: true,
-                    definition: ask_agent_def_two_outcomes(),
-                },
-                1000,
-            )
-            .unwrap();
-
-        // Pool that always errors.
-        let pool =
-            AutomationsAgentPool::new(Arc::new(StubAgentInvoker::err("simulated llm timeout")));
-        let db_for_blocking = db.clone();
-        let evt_for_blocking = evt.clone();
-        tokio::task::spawn_blocking(move || {
-            let ctx = agent_ctx(&db_for_blocking, pool);
-            run_matching_automations(&ctx, &evt_for_blocking);
-        })
-        .await
-        .unwrap();
-
-        let runs = run_store.list_for_automation(&row.id, 10).unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].status, AutomationRunStatus::Failed);
-        let ask_trace = runs[0]
-            .step_traces
-            .iter()
-            .find(|t| t.node_id == "ask")
-            .unwrap();
-        assert!(
-            ask_trace
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("simulated llm timeout"),
-            "error message must surface invoker failure verbatim",
-        );
-    }
-
-    #[test]
-    fn render_template_substitutes_dotted_paths() {
-        let mut state = HashMap::new();
-        state.insert(
-            "event".to_string(),
-            serde_json::json!({
-                "id": "evt-1",
-                "payload": {"zone": "driveway", "n": 7, "active": true}
-            }),
-        );
-        assert_eq!(
-            render_template("zone={{event.payload.zone}}", &state),
-            "zone=driveway"
-        );
-        assert_eq!(render_template("n={{event.payload.n}}", &state), "n=7");
-        assert_eq!(
-            render_template("on={{event.payload.active}}", &state),
-            "on=true"
-        );
-        assert_eq!(
-            render_template("id={{ event.id }} n={{event.payload.n}}", &state),
-            "id=evt-1 n=7"
-        );
-    }
-
-    #[test]
-    fn render_template_preserves_unresolved_paths() {
-        let mut state = HashMap::new();
-        state.insert("event".to_string(), serde_json::json!({"id": "x"}));
-        // Unknown root.
-        assert_eq!(render_template("hi {{nope.x}}", &state), "hi {{nope.x}}");
-        // Known root, unknown leaf.
-        assert_eq!(
-            render_template("hi {{event.missing}}", &state),
-            "hi {{event.missing}}"
-        );
-    }
-
-    #[test]
-    fn render_template_handles_unterminated_braces() {
-        let state = HashMap::new();
-        // Unterminated `{{` must not crash; we just preserve the input.
-        assert_eq!(render_template("hi {{ event.x", &state), "hi {{ event.x");
-        assert_eq!(render_template("plain text", &state), "plain text");
-    }
-
-    #[tokio::test]
-    async fn ask_agent_prompt_templating_substitutes_event_payload() {
-        // Verifies the Ring-style usage: prompt + attachments are
-        // rendered against state at execute time. We use a stub
-        // invoker that captures the rendered request so the
-        // assertion is direct.
-        use crate::automation_agent::{AgentInvoker, AskAgentRequest};
-        use async_trait::async_trait;
-        use std::sync::Mutex;
-
-        struct CapturingInvoker {
-            captured: Arc<Mutex<Option<AskAgentRequest>>>,
-        }
-        #[async_trait]
-        impl AgentInvoker for CapturingInvoker {
-            async fn invoke(&self, req: &AskAgentRequest) -> Result<ExitToolCall, AskAgentError> {
-                *self.captured.lock().unwrap() = Some(req.clone());
-                Ok(ExitToolCall {
-                    name: "notify".into(),
-                    args: serde_json::json!({}),
-                })
-            }
-        }
-        let captured = Arc::new(Mutex::new(None));
-        let pool = AutomationsAgentPool::new(Arc::new(CapturingInvoker {
-            captured: captured.clone(),
-        }));
-
-        let db = fresh_db();
-        let auto_store = AutomationStore::new(&db);
-        let evt = seed_bus_event(
-            &db,
-            "e-tmpl",
-            serde_json::json!({
-                "zone": "driveway",
-                "image_url": "data:image/png;base64,AAAA"
-            }),
-        );
-        let def = AutomationDef {
-            trigger: TriggerDef {
-                kind: BusEventKind::WebhookReceived,
-                when: None,
-            },
-            nodes: vec![
-                NodeDef {
-                    id: "ask".into(),
-                    kind: NodeKind::AskAgent,
-                    config: serde_json::json!({
-                        "prompt": "Animal in {{event.payload.zone}}?",
-                        "attachments": ["{{event.payload.image_url}}"],
-                        "exit_tools": [
-                            {"name": "notify", "description": "yes", "args_schema": {"type":"object"}},
-                            {"name": "ignore", "description": "no",  "args_schema": {"type":"object"}}
-                        ]
-                    }),
-                    position: None,
-                },
-                NodeDef {
-                    id: "end".into(),
-                    kind: NodeKind::Terminal,
-                    config: serde_json::json!({}),
-                    position: None,
-                },
-            ],
-            edges: vec![
-                EdgeDef {
-                    from: TRIGGER_SENTINEL.into(),
-                    to: "ask".into(),
-                    when: None,
-                },
-                EdgeDef {
-                    from: "ask".into(),
-                    to: "end".into(),
-                    when: None,
-                },
-            ],
-        };
-        auto_store
-            .upsert(
-                &AutomationUpsert {
-                    id: None,
-                    name: "tmpl".into(),
-                    enabled: true,
-                    definition: def,
-                },
-                1000,
-            )
-            .unwrap();
-
-        let db_for_blocking = db.clone();
-        let evt_for_blocking = evt.clone();
-        tokio::task::spawn_blocking(move || {
-            let ctx = agent_ctx(&db_for_blocking, pool);
-            run_matching_automations(&ctx, &evt_for_blocking);
-        })
-        .await
-        .unwrap();
-
-        let req = captured
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("invoker should have been called");
-        assert_eq!(req.config.prompt, "Animal in driveway?");
-        assert_eq!(
-            req.config.attachments,
-            vec!["data:image/png;base64,AAAA".to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn ring_use_case_with_text_only_model_fails_with_clear_error() {
-        // The locked Ring use case: webhook with image â†’ AskAgent
-        // with attachments â†’ text-only model in inference resolver â†’
-        // VisionRequiredButTextOnlyModel surfaces in the run trace
-        // with operator-actionable guidance.
-        use crate::automation_agent::InferenceAgentInvoker;
-        use execlaw_inference_api::InferenceClient;
-
-        let db = fresh_db();
-        let auto_store = AutomationStore::new(&db);
-        let run_store = AutomationRunStore::new(&db);
-        let evt = seed_bus_event(
-            &db,
-            "e-ring",
-            serde_json::json!({"image_url": "data:image/png;base64,iVBORw0KGgo"}),
-        );
-
-        // Ring-style definition: pass the event's image through the
-        // attachments list. The capability check fires before any
-        // HTTP request, so the URL is dummy.
-        let def = AutomationDef {
-            trigger: TriggerDef {
-                kind: BusEventKind::WebhookReceived,
-                when: None,
-            },
-            nodes: vec![
-                NodeDef {
-                    id: "ask".into(),
-                    kind: NodeKind::AskAgent,
-                    config: serde_json::json!({
-                        "prompt": "Is there an animal in this image?",
-                        // The locked design routes attachments through
-                        // payload templating; M3a hardcodes the path
-                        // for the capability-check test.
-                        "attachments": ["data:image/png;base64,iVBORw0KGgo"],
-                        "exit_tools": [
-                            {"name": "notify", "description": "Animal", "args_schema": {"type":"object"}},
-                            {"name": "ignore", "description": "No animal", "args_schema": {"type":"object"}}
-                        ]
-                    }),
-                    position: None,
-                },
-                NodeDef {
-                    id: "end".into(),
-                    kind: NodeKind::Terminal,
-                    config: serde_json::json!({}),
-                    position: None,
-                },
-            ],
-            edges: vec![
-                EdgeDef {
-                    from: TRIGGER_SENTINEL.into(),
-                    to: "ask".into(),
-                    when: None,
-                },
-                EdgeDef {
-                    from: "ask".into(),
-                    to: "end".into(),
-                    when: None,
-                },
-            ],
-        };
-        let row = auto_store
-            .upsert(
-                &AutomationUpsert {
-                    id: None,
-                    name: "ring".into(),
-                    enabled: true,
-                    definition: def,
-                },
-                1000,
-            )
-            .unwrap();
-
-        // Configure a resolver that returns the current text-only
-        // default model â€” the capability check should reject the
-        // request before the bogus URL is ever contacted.
-        let bootstrap = Arc::new(InferenceClient::new("http://127.0.0.1:1"));
-        let mut resolver = crate::inference_resolver::InferenceResolver::new(Some(bootstrap));
-        resolver.bootstrap_model = Some("QuantTrio/Qwen3.5-27B-AWQ".into());
-        let pool = AutomationsAgentPool::new(Arc::new(InferenceAgentInvoker::new(
-            db.clone(),
-            Arc::new(resolver),
-        )));
-
-        let db_for_blocking = db.clone();
-        let evt_for_blocking = evt.clone();
-        tokio::task::spawn_blocking(move || {
-            let ctx = agent_ctx(&db_for_blocking, pool);
-            run_matching_automations(&ctx, &evt_for_blocking);
-        })
-        .await
-        .unwrap();
-
-        let runs = run_store.list_for_automation(&row.id, 10).unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].status, AutomationRunStatus::Failed);
-        let ask_trace = runs[0]
+        let ctx = noop_ctx(&db);
+        let evt = sample_event("webhook.received", serde_json::json!({}));
+        let result = dry_run(&ctx, &row, &evt);
+        assert_eq!(result.outcome, ExecOutcome::Failed);
+        let ask_trace = result
             .step_traces
             .iter()
             .find(|t| t.node_id == "ask")
             .unwrap();
         let err = ask_trace.error.as_deref().unwrap_or("");
         assert!(
-            err.contains("vision") && err.contains("text-only"),
-            "vision-required error message must surface clearly; got: {err}",
+            err.contains("AskAgent") && err.contains("not supported"),
+            "AskAgent error must surface clearly; got: {err}",
         );
     }
 
-    #[tokio::test]
-    async fn end_to_end_non_matching_event_produces_no_run() {
-        use crate::automation_bus::AutomationBus;
-        use std::time::Duration;
-        use tokio::sync::Notify;
+    // ---- RewritePrompt executor (Phase A) ----
 
-        let db = fresh_db();
-        let auto_store = AutomationStore::new(&db);
-        let run_store = AutomationRunStore::new(&db);
-
-        // Automation only matches RoutineFired kind.
-        let mut def = def_filter_pass("true");
-        def.trigger.kind = BusEventKind::RoutineFired;
-        let row = auto_store
-            .upsert(
-                &AutomationUpsert {
-                    id: None,
-                    name: "routine-only".into(),
-                    enabled: true,
-                    definition: def,
-                },
-                1000,
-            )
-            .unwrap();
-
-        let stop = std::sync::Arc::new(Notify::new());
-        let (bus, tasks) =
-            AutomationBus::spawn(db.clone(), build_handler(noop_ctx(&db)), stop.clone());
-
-        // Publish a WebhookReceived event â€” wrong kind, must not trigger.
-        bus.publish(BusEvent {
-            id: "e-webhook".into(),
-            kind: BusEventKind::WebhookReceived,
-            source: "ring".into(),
-            received_at: 100,
-            payload: serde_json::json!({}),
-        })
-        .await
-        .unwrap();
-
-        // Give the handler time to (correctly) do nothing.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let runs = run_store.list_for_automation(&row.id, 10).unwrap();
-        assert!(runs.is_empty(), "wrong-kind event must not produce a run");
-
-        stop.notify_waiters();
-        tasks.join().await;
-    }
-
-    // ----------------------- Notify (M6) ------------------------------
-
-    /// Build trigger â†’ notify â†’ terminal.
-    fn def_notify(notify_cfg: serde_json::Value) -> AutomationDef {
-        AutomationDef {
-            trigger: TriggerDef {
-                kind: BusEventKind::WebhookReceived,
-                when: None,
-            },
-            nodes: vec![
-                NodeDef {
-                    id: "alert".into(),
-                    kind: NodeKind::Notify,
-                    config: notify_cfg,
-                    position: None,
-                },
-                NodeDef {
-                    id: "end".into(),
-                    kind: NodeKind::Terminal,
-                    config: serde_json::json!({}),
-                    position: None,
-                },
+    /// Build a one-node flow that runs only the given RewritePrompt.
+    /// trigger → rw → END.
+    fn rewrite_prompt_flow(expr: &str) -> AutomationDef {
+        serde_json::from_value(serde_json::json!({
+            "trigger": {"kind": "chat.prompt", "when": null},
+            "nodes": [
+                {"id": "rw", "kind": "RewritePrompt", "config": {"expr": expr}},
             ],
-            edges: vec![
-                EdgeDef {
-                    from: TRIGGER_SENTINEL.into(),
-                    to: "alert".into(),
-                    when: None,
-                },
-                EdgeDef {
-                    from: "alert".into(),
-                    to: "end".into(),
-                    when: None,
-                },
+            "edges": [
+                {"from": "trigger", "to": "rw", "when": null},
+                {"from": "rw", "to": "END", "when": null},
             ],
-        }
+        })).unwrap()
     }
 
-    #[test]
-    fn notify_node_inserts_alert_row_and_run_succeeds() {
-        use execlaw_core::alerts::{AlertStatus, AlertStore};
-
+    fn run_rewrite_prompt(expr: &str, payload: serde_json::Value) -> DryRunResult {
         let db = fresh_db();
-        let auto_store = AutomationStore::new(&db);
-        let run_store = AutomationRunStore::new(&db);
-        let evt = seed_bus_event(&db, "e1", serde_json::json!({"zone": "driveway"}));
-
-        let def = def_notify(serde_json::json!({
-            "title": "Motion in {{event.payload.zone}}",
-            "detail": "An automation tripped",
-            "severity": "Warning",
-        }));
-        let row = auto_store
+        let store = AutomationStore::new(&db);
+        let row = store
             .upsert(
                 &AutomationUpsert {
                     id: None,
-                    name: "notify-1".into(),
+                    name: "rw-test".into(),
                     enabled: true,
-                    definition: def,
+                    definition: rewrite_prompt_flow(expr),
                 },
                 1000,
             )
             .unwrap();
-
-        run_matching_automations(&noop_ctx(&db), &evt);
-
-        let runs = run_store.list_for_automation(&row.id, 10).unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].status, AutomationRunStatus::Success);
-
-        let store = AlertStore::new(&db);
-        let alerts = store.list(None, None).unwrap();
-        assert_eq!(alerts.len(), 1);
-        let a = &alerts[0];
-        // Template substituted on title.
-        assert_eq!(a.title, "Motion in driveway");
-        assert_eq!(a.detail.as_deref(), Some("An automation tripped"));
-        assert_eq!(a.status, AlertStatus::Firing);
-        // Default source = `automation:<node_id>`.
-        assert_eq!(a.source, "automation:alert");
+        let evt = sample_event("chat.prompt", payload);
+        dry_run(&noop_ctx(&db), &row, &evt)
     }
 
     #[test]
-    fn notify_node_with_missing_title_fails_validation() {
-        use execlaw_core::automations::{AutomationError, validate};
-
-        let def = def_notify(serde_json::json!({})); // no title
-        match validate(&def) {
-            Err(AutomationError::Validation(msg)) => {
-                assert!(
-                    msg.contains("config.title"),
-                    "expected title error, got: {msg}"
-                );
-            }
-            other => panic!("expected validation error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn notify_node_with_bad_severity_fails_validation() {
-        use execlaw_core::automations::{AutomationError, validate};
-
-        let def = def_notify(serde_json::json!({
-            "title": "x",
-            "severity": "Catastrophic",
-        }));
-        match validate(&def) {
-            Err(AutomationError::Validation(msg)) => {
-                assert!(
-                    msg.contains("severity"),
-                    "expected severity error, got: {msg}"
-                );
-            }
-            other => panic!("expected validation error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn notify_node_dedupes_re_firing_via_fingerprint() {
-        use execlaw_core::alerts::AlertStore;
-
-        let db = fresh_db();
-        let auto_store = AutomationStore::new(&db);
-        let evt1 = seed_bus_event(&db, "e1", serde_json::json!({"zone": "driveway"}));
-        let evt2 = seed_bus_event(&db, "e2", serde_json::json!({"zone": "driveway"}));
-
-        let def = def_notify(serde_json::json!({
-            "title": "Motion in {{event.payload.zone}}",
-        }));
-        auto_store
-            .upsert(
-                &AutomationUpsert {
-                    id: None,
-                    name: "notify-dup".into(),
-                    enabled: true,
-                    definition: def,
-                },
-                1000,
-            )
+    fn rewrite_prompt_concat_with_event_payload() {
+        // Rhai string concat off the trigger event's payload.text.
+        let result = run_rewrite_prompt(
+            r#""[bot-fix] " + event.payload.text"#,
+            serde_json::json!({"text": "hello world"}),
+        );
+        assert_eq!(result.outcome, ExecOutcome::Success);
+        let trace = result
+            .step_traces
+            .iter()
+            .find(|t| t.node_id == "rw")
             .unwrap();
-
-        // Same fingerprint â†’ second firing bumps occurrence_count, no
-        // new row.
-        run_matching_automations(&noop_ctx(&db), &evt1);
-        run_matching_automations(&noop_ctx(&db), &evt2);
-
-        let alerts = AlertStore::new(&db).list(None, None).unwrap();
+        // The output carries the rewritten string under `text` so the
+        // middleware harvester (Phase A.3) can read it without
+        // additional rendering.
         assert_eq!(
-            alerts.len(),
-            1,
-            "dedup must collapse same-fingerprint firings"
+            trace.output,
+            serde_json::json!({"text": "[bot-fix] hello world"})
         );
-        assert_eq!(alerts[0].occurrence_count, 2);
     }
 
-    // ----------------------- CallPlugin (M6) ---------------------------
-
-    /// Build trigger â†’ call_plugin â†’ terminal.
-    fn def_call_plugin(cfg: serde_json::Value) -> AutomationDef {
-        AutomationDef {
-            trigger: TriggerDef {
-                kind: BusEventKind::WebhookReceived,
-                when: None,
-            },
-            nodes: vec![
-                NodeDef {
-                    id: "call".into(),
-                    kind: NodeKind::CallPlugin,
-                    config: cfg,
-                    position: None,
-                },
-                NodeDef {
-                    id: "end".into(),
-                    kind: NodeKind::Terminal,
-                    config: serde_json::json!({}),
-                    position: None,
-                },
-            ],
-            edges: vec![
-                EdgeDef {
-                    from: TRIGGER_SENTINEL.into(),
-                    to: "call".into(),
-                    when: None,
-                },
-                EdgeDef {
-                    from: "call".into(),
-                    to: "end".into(),
-                    when: None,
-                },
-            ],
-        }
+    #[test]
+    fn rewrite_prompt_constant_string() {
+        let result = run_rewrite_prompt(
+            r#""always this""#,
+            serde_json::json!({"text": "anything"}),
+        );
+        assert_eq!(result.outcome, ExecOutcome::Success);
+        let trace = result
+            .step_traces
+            .iter()
+            .find(|t| t.node_id == "rw")
+            .unwrap();
+        assert_eq!(trace.output, serde_json::json!({"text": "always this"}));
     }
 
-    #[tokio::test]
-    async fn call_plugin_without_plugin_host_surfaces_clear_error() {
-        let db = fresh_db();
-        let auto_store = AutomationStore::new(&db);
-        let run_store = AutomationRunStore::new(&db);
-        let evt = seed_bus_event(&db, "e1", serde_json::json!({}));
-
-        let def = def_call_plugin(serde_json::json!({
-            "tool": "signal.send_message",
-            "args": {"to": "+15551234", "body": "hello"},
-        }));
-        let row = auto_store
-            .upsert(
-                &AutomationUpsert {
-                    id: None,
-                    name: "call-no-host".into(),
-                    enabled: true,
-                    definition: def,
-                },
-                1000,
-            )
+    #[test]
+    fn rewrite_prompt_non_string_result_errors_clearly() {
+        // Rhai returns an integer — we must reject and surface a
+        // legible error in the trace so the operator can fix their
+        // expression instead of silently sending garbage to the LLM.
+        let result = run_rewrite_prompt("42", serde_json::json!({"text": "x"}));
+        assert_eq!(result.outcome, ExecOutcome::Failed);
+        let trace = result
+            .step_traces
+            .iter()
+            .find(|t| t.node_id == "rw")
             .unwrap();
-
-        // noop_ctx wires plugin_host = None â€” the CallPlugin executor
-        // must turn that into a per-node error (not a panic).
-        let db2 = db.clone();
-        let evt2 = evt.clone();
-        tokio::task::spawn_blocking(move || run_matching_automations(&noop_ctx(&db2), &evt2))
-            .await
-            .unwrap();
-
-        let runs = run_store.list_for_automation(&row.id, 10).unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].status, AutomationRunStatus::Failed);
-        let trace = &runs[0].step_traces[0];
+        let err = trace.error.as_deref().unwrap_or("");
         assert!(
-            trace
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("no plugin host"),
-            "expected plugin-host error, got: {:?}",
-            trace.error
+            err.contains("non-string") || err.contains("must evaluate to a string"),
+            "expected non-string error, got: {err}",
         );
     }
 
     #[test]
-    fn call_plugin_with_empty_tool_fails_validation() {
-        use execlaw_core::automations::{AutomationError, validate};
-
-        let def = def_call_plugin(serde_json::json!({"tool": ""}));
-        match validate(&def) {
-            Err(AutomationError::Validation(msg)) => {
-                assert!(msg.contains("config.tool"), "got: {msg}");
-            }
-            other => panic!("expected validation error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn call_plugin_with_non_object_args_fails_validation() {
-        use execlaw_core::automations::{AutomationError, validate};
-
-        let def = def_call_plugin(serde_json::json!({"tool": "x", "args": "not-an-object"}));
-        match validate(&def) {
-            Err(AutomationError::Validation(msg)) => {
-                assert!(msg.contains("args"), "got: {msg}");
-            }
-            other => panic!("expected validation error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn render_template_in_value_substitutes_string_leaves_recursively() {
-        let mut state = HashMap::new();
-        state.insert(
-            "event".to_string(),
-            serde_json::json!({"payload": {"to": "+15551234"}}),
+    fn rewrite_prompt_bad_rhai_errors_clearly() {
+        let result = run_rewrite_prompt(
+            "this is not valid rhai", // forces a parse/eval error
+            serde_json::json!({"text": "x"}),
         );
-        let v = serde_json::json!({
-            "to": "{{event.payload.to}}",
-            "body": "hi",
-            "meta": {"src": "auto:{{event.payload.to}}"},
-            "tags": ["a", "{{event.payload.to}}"],
-            "n": 7,
-        });
-        let out = render_template_in_value(&v, &state);
+        assert_eq!(result.outcome, ExecOutcome::Failed);
+        let trace = result
+            .step_traces
+            .iter()
+            .find(|t| t.node_id == "rw")
+            .unwrap();
+        let err = trace.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("RewritePrompt expr rhai eval failed"),
+            "expected rhai eval failure marker, got: {err}",
+        );
+    }
+
+    #[test]
+    fn rewrite_prompt_respects_rhai_sandbox_op_limit() {
+        // Pathological infinite loop must hit RHAI_MAX_OPS and
+        // surface as a runtime error — never hang the chat handler.
+        let pathological = r#"
+            let i = 0;
+            while true {
+                i += 1;
+            }
+            "stuck"
+        "#;
+        let result = run_rewrite_prompt(pathological, serde_json::json!({"text": "x"}));
+        assert_eq!(result.outcome, ExecOutcome::Failed);
+        let trace = result
+            .step_traces
+            .iter()
+            .find(|t| t.node_id == "rw")
+            .unwrap();
+        let err = trace.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("rhai eval failed"),
+            "sandbox cap must surface as a clean rhai eval error; got: {err}",
+        );
+    }
+
+    // ---- Phase B mutator executor tests ----
+
+    fn one_node_flow(node_kind: NodeKind, config: serde_json::Value) -> AutomationDef {
+        serde_json::from_value(serde_json::json!({
+            "trigger": {"kind": "chat.prompt", "when": null},
+            "nodes": [
+                {"id": "m", "kind": node_kind.as_str(), "config": config},
+            ],
+            "edges": [
+                {"from": "trigger", "to": "m", "when": null},
+                {"from": "m", "to": "END", "when": null},
+            ],
+        })).unwrap()
+    }
+
+    fn run_mutator(node_kind: NodeKind, config: serde_json::Value) -> DryRunResult {
+        let db = fresh_db();
+        let store = AutomationStore::new(&db);
+        let row = store
+            .upsert(
+                &AutomationUpsert {
+                    id: None,
+                    name: "mutator-test".into(),
+                    enabled: true,
+                    definition: one_node_flow(node_kind, config),
+                },
+                1000,
+            )
+            .unwrap();
+        let evt = sample_event("chat.prompt", serde_json::json!({"text": "hi"}));
+        dry_run(&noop_ctx(&db), &row, &evt)
+    }
+
+    #[test]
+    fn set_skills_emits_typed_output() {
+        let result = run_mutator(
+            NodeKind::SetSkills,
+            serde_json::json!({"skills": ["calendar", "notes"]}),
+        );
+        assert_eq!(result.outcome, ExecOutcome::Success);
+        let t = result.step_traces.iter().find(|t| t.node_id == "m").unwrap();
         assert_eq!(
-            out,
-            serde_json::json!({
-                "to": "+15551234",
-                "body": "hi",
-                "meta": {"src": "auto:+15551234"},
-                "tags": ["a", "+15551234"],
-                "n": 7,
-            })
+            t.output,
+            serde_json::json!({"skills": ["calendar", "notes"]})
+        );
+    }
+
+    #[test]
+    fn set_tools_emits_typed_output() {
+        let result = run_mutator(
+            NodeKind::SetTools,
+            serde_json::json!({"tools": ["python.execute"]}),
+        );
+        assert_eq!(result.outcome, ExecOutcome::Success);
+        let t = result.step_traces.iter().find(|t| t.node_id == "m").unwrap();
+        assert_eq!(t.output, serde_json::json!({"tools": ["python.execute"]}));
+    }
+
+    #[test]
+    fn set_trust_normalizes_snake_to_pascal_case() {
+        let result = run_mutator(
+            NodeKind::SetTrust,
+            serde_json::json!({"trust": "known_high"}),
+        );
+        assert_eq!(result.outcome, ExecOutcome::Success);
+        let t = result.step_traces.iter().find(|t| t.node_id == "m").unwrap();
+        // Output is the canonical PascalCase form (what TrustClass::as_str emits).
+        assert_eq!(t.output, serde_json::json!({"trust": "KnownTrusted"}));
+    }
+
+    // (validator already rejects unknown trust classes at save time;
+    // see `validate_rejects_set_trust_unknown_class` in
+    // crates/core/src/automations.rs — the executor's defensive
+    // check is unreachable via the store path.)
+
+    #[test]
+    fn add_attachment_emits_typed_output() {
+        let result = run_mutator(
+            NodeKind::AddAttachment,
+            serde_json::json!({"attachment_ids": ["att-1", "att-2"]}),
+        );
+        assert_eq!(result.outcome, ExecOutcome::Success);
+        let t = result.step_traces.iter().find(|t| t.node_id == "m").unwrap();
+        assert_eq!(
+            t.output,
+            serde_json::json!({"attachment_ids": ["att-1", "att-2"]})
+        );
+    }
+
+    #[test]
+    fn add_memory_renders_template_tokens() {
+        // {{event.payload.text}} → "hi" (from sample_event).
+        let result = run_mutator(
+            NodeKind::AddMemory,
+            serde_json::json!({"text": "User said: {{event.payload.text}}"}),
+        );
+        assert_eq!(result.outcome, ExecOutcome::Success);
+        let t = result.step_traces.iter().find(|t| t.node_id == "m").unwrap();
+        assert_eq!(t.output, serde_json::json!({"text": "User said: hi"}));
+    }
+
+    #[test]
+    fn add_memory_empty_after_template_render_errors_cleanly() {
+        // Validator rejects blank text at save time, but template
+        // tokens can RESOLVE to empty strings at execute time. This
+        // path drives a template that resolves to "" via an empty
+        // payload field; the executor's runtime guard must surface a
+        // clean error instead of producing an empty memory block.
+        let db = fresh_db();
+        let store = AutomationStore::new(&db);
+        let row = store
+            .upsert(
+                &AutomationUpsert {
+                    id: None,
+                    name: "memory-empty-template".into(),
+                    enabled: true,
+                    definition: one_node_flow(
+                        NodeKind::AddMemory,
+                        serde_json::json!({"text": "{{event.payload.text}}"}),
+                    ),
+                },
+                1000,
+            )
+            .unwrap();
+        // Empty-string payload field → template renders to "".
+        let evt = sample_event("chat.prompt", serde_json::json!({"text": ""}));
+        let result = dry_run(&noop_ctx(&db), &row, &evt);
+        assert_eq!(result.outcome, ExecOutcome::Failed);
+        let t = result.step_traces.iter().find(|t| t.node_id == "m").unwrap();
+        let err = t.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("AddMemory") && err.contains("empty"),
+            "expected runtime guard error; got: {err}",
         );
     }
 }
+

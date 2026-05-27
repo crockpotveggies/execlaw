@@ -11,7 +11,7 @@
 //! A regression >10% on any of these blocks a merge.
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use execlaw_core::automation_bus::{BusEventKind, BusEventStore, Event as BusEvent};
+use execlaw_core::attachments::{AttachmentRow, AttachmentStore};
 use execlaw_core::backends::{BackendMode, BackendPurpose, BackendStore, BackendUpsert};
 use execlaw_core::conversation::{
     ConversationKind, ConversationRow, ConversationStore, Modality, Phase,
@@ -24,7 +24,7 @@ use execlaw_core::events::{
     EventKind, EventLog, EventRecord, PendingEvent, ToolResultPayload, ToolUsePayload,
 };
 use execlaw_core::ids::ResearchJobId;
-use execlaw_core::ids::{ConversationId, EventSeq, IdempotencyKey, TurnSeq};
+use execlaw_core::ids::{AttachmentId, ConversationId, EventSeq, IdempotencyKey, TurnSeq};
 use execlaw_core::migrations::MigrationRunner;
 use execlaw_core::outbox::{OutboxRow, OutboxStatus, OutboxStore};
 use execlaw_core::refresh_tokens::RefreshTokenStore;
@@ -671,6 +671,121 @@ fn bench_list_thread_summaries(c: &mut Criterion) {
             });
         });
     }
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Attached-files fast path (`has_attachments` flag, migration 0014).
+//
+// Every chat turn calls `build_attached_files_block(state, cid)` to
+// decide whether to append an "Attached files: …" section to the
+// turn-context prose. Pre-fix this ran
+// `AttachmentStore::list_for_conversation` on the hot path even when
+// the conversation had zero attachments (the common case). Post-fix
+// the per-conversation `has_attachments` flag short-circuits empty
+// conversations to a single indexed-PK lookup.
+//
+// Budgets (in-memory SQLite, debug build):
+//   * has_attachments (empty conversation)       ≤ 30 µs
+//   * list_for_conversation (empty conversation) ≤ 60 µs  (baseline we beat)
+//   * has_attachments (non-empty)                ≤ 30 µs  (slow path still pays this)
+//   * list_for_conversation (4 attachments)      ≤ 200 µs (slow path total)
+//
+// The "saves N µs per turn" claim should be derived from
+// (list_for_conversation_empty - has_attachments_empty). A turn that
+// previously paid the full scan now pays only the flag probe.
+// ---------------------------------------------------------------------------
+
+fn bench_attached_files_fast_path(c: &mut Criterion) {
+    let mut group = c.benchmark_group("attached_files_fast_path");
+
+    // The common case: a conversation with NO attachments. Fast path
+    // short-circuits on a single indexed-PK lookup, never touching
+    // state_attachments.
+    group.bench_function("has_attachments_empty", |b| {
+        let db = fresh_db();
+        let store = ConversationStore::new(&db);
+        store.upsert(&fresh_conv_row("c-empty")).unwrap();
+        let cid = ConversationId::from("c-empty");
+        b.iter(|| {
+            let flag = store.has_attachments(black_box(&cid)).unwrap();
+            black_box(flag);
+        });
+    });
+
+    // Baseline we beat: pre-fix every turn ran this query on an
+    // empty conversation. The delta vs. has_attachments_empty is the
+    // per-turn saving the fast path delivers.
+    group.bench_function("list_for_conversation_empty", |b| {
+        let db = fresh_db();
+        ConversationStore::new(&db)
+            .upsert(&fresh_conv_row("c-empty"))
+            .unwrap();
+        let store = AttachmentStore::new(&db);
+        let cid = ConversationId::from("c-empty");
+        b.iter(|| {
+            let rows = store.list_for_conversation(black_box(&cid)).unwrap();
+            black_box(rows);
+        });
+    });
+
+    // Non-empty conversation: the slow path still pays the flag
+    // probe AND the list_for_conversation scan. Measure both so we
+    // can quote the total overhead the slow path incurs vs. the
+    // empty-case saving.
+    group.bench_function("has_attachments_non_empty", |b| {
+        let db = fresh_db();
+        ConversationStore::new(&db)
+            .upsert(&fresh_conv_row("c-full"))
+            .unwrap();
+        let cid = ConversationId::from("c-full");
+        let astore = AttachmentStore::new(&db);
+        for i in 0..4 {
+            astore
+                .insert(&AttachmentRow {
+                    id: AttachmentId::new(),
+                    conversation_id: cid.clone(),
+                    mime_type: "text/csv".into(),
+                    path: format!("/blobs/{i}.csv"),
+                    sha256: format!("sha-{i}"),
+                    received_at: 100 + i,
+                    filename: Some(format!("{i}.csv")),
+                })
+                .unwrap();
+        }
+        let cstore = ConversationStore::new(&db);
+        b.iter(|| {
+            let flag = cstore.has_attachments(black_box(&cid)).unwrap();
+            black_box(flag);
+        });
+    });
+
+    group.bench_function("list_for_conversation_4_rows", |b| {
+        let db = fresh_db();
+        ConversationStore::new(&db)
+            .upsert(&fresh_conv_row("c-full"))
+            .unwrap();
+        let cid = ConversationId::from("c-full");
+        let store = AttachmentStore::new(&db);
+        for i in 0..4 {
+            store
+                .insert(&AttachmentRow {
+                    id: AttachmentId::new(),
+                    conversation_id: cid.clone(),
+                    mime_type: "text/csv".into(),
+                    path: format!("/blobs/{i}.csv"),
+                    sha256: format!("sha-{i}"),
+                    received_at: 100 + i,
+                    filename: Some(format!("{i}.csv")),
+                })
+                .unwrap();
+        }
+        b.iter(|| {
+            let rows = store.list_for_conversation(black_box(&cid)).unwrap();
+            black_box(rows);
+        });
+    });
+
     group.finish();
 }
 
@@ -1543,165 +1658,8 @@ fn bench_transport_binding_store(c: &mut Criterion) {
 // becomes a concern (today: 1 tick per 100ms × 4ms work = 4% CPU, fine).
 // ---------------------------------------------------------------------------
 
-fn bench_automation_bus(c: &mut Criterion) {
-    let db = fresh_db();
-    let store = BusEventStore::new(&db);
-
-    // Pre-seed: one row to claim (mark_dispatched bench) + many rows to
-    // page through (fetch_pending bench). Each bench function runs many
-    // iterations; we want the table state stable across iterations.
-    let claim_evt = BusEvent {
-        id: "bench-claim".into(),
-        kind: BusEventKind::WebhookReceived,
-        source: "bench".into(),
-        received_at: 0,
-        payload: serde_json::json!({"k": "v"}),
-    };
-    store.publish(&claim_evt, false).unwrap();
-
-    // Seed 1024 pending rows so `fetch_pending` measures the realistic
-    // case of "many available, return up to N".
-    for i in 0..1024 {
-        store
-            .publish(
-                &BusEvent {
-                    id: format!("seed-{i}"),
-                    kind: BusEventKind::WebhookReceived,
-                    source: "bench-seed".into(),
-                    received_at: i as i64,
-                    payload: serde_json::json!({"i": i}),
-                },
-                false,
-            )
-            .unwrap();
-    }
-
-    let mut group = c.benchmark_group("automation_bus");
-
-    // publish — the write path. Each iteration writes a fresh id so the
-    // INSERT actually fires (PK collisions don't measure the same path).
-    group.bench_function("publish_external", |b| {
-        let mut i = 0u64;
-        b.iter(|| {
-            let id = format!("bench-pub-{i}");
-            i += 1;
-            let evt = BusEvent {
-                id,
-                kind: BusEventKind::WebhookReceived,
-                source: "bench".into(),
-                received_at: black_box(i as i64),
-                payload: serde_json::json!({"i": i}),
-            };
-            BusEventStore::new(black_box(&db))
-                .publish(&evt, false)
-                .unwrap()
-        });
-    });
-
-    // mark_dispatched — the claim path. We use the WHERE clause's
-    // already-claimed semantics: after the first iteration claims the
-    // row, every subsequent call returns `false` quickly. That measures
-    // the no-op UPDATE cost, which is what the dispatcher sees most
-    // often (claim races on pending rows are rare).
-    group.bench_function("mark_dispatched_already_claimed", |b| {
-        // Make sure it's claimed first.
-        let _ = BusEventStore::new(&db).mark_dispatched("bench-claim", 1);
-        b.iter(|| {
-            BusEventStore::new(black_box(&db))
-                .mark_dispatched(black_box("bench-claim"), 1)
-                .unwrap()
-        });
-    });
-
-    // fetch_pending(256) — what the poller + recovery scan call on
-    // every wake. Throughput-friendly metric (ids returned).
-    group.throughput(Throughput::Elements(256));
-    group.bench_function("fetch_pending_256_of_1024", |b| {
-        b.iter(|| {
-            BusEventStore::new(black_box(&db))
-                .fetch_pending(false, 256)
-                .unwrap()
-        });
-    });
-
-    group.finish();
-}
-
-// ---------------------------------------------------------------------------
-// Automation suggestions (M4a) — sweep + recent-events lookup. The sweep
-// runs daily but the per-tick cost matters under busy buses. The
-// recent-events query backs the editor's sample-payload picker, hit
-// every time the test-run drawer opens.
-//
-// M5 baseline (in-memory SQLite, Windows dev box, single-threaded):
-//   * sweep_1024_events_4_sources:     ~272 µs / call
-//   * list_recent_for_kind_50_of_1024: ~26 µs / call (~520 ns / row)
-//
-// Budgets (10× the measured baseline for regression headroom):
-//   * sweep:                ≤ 3 ms p99
-//   * list_recent_for_kind: ≤ 300 µs p99
-//
-// Both indexed: the sweep groups by (kind, source) via the
-// kind+received_at index; list_recent_for_kind hits the same index
-// in reverse with LIMIT. No sort step, so cost scales linearly with
-// the limit, not total rows.
-// ---------------------------------------------------------------------------
-
-fn bench_automation_suggestions(c: &mut Criterion) {
-    use execlaw_core::automation_bus::{BusEventKind, BusEventStore, Event as BusEvent};
-    use execlaw_core::automation_suggestions::SuggestionStore;
-    let db = fresh_db();
-    // Seed 1024 events across 4 sources (256 each) so the sweep has
-    // 4 candidate patterns to evaluate.
-    let now_ms = 1_700_000_000_000_i64;
-    {
-        let bus = BusEventStore::new(&db);
-        for source_idx in 0..4 {
-            let source = format!("webhook:src-{source_idx}");
-            for i in 0..256 {
-                bus.publish(
-                    &BusEvent {
-                        id: format!("seed-{source_idx}-{i}"),
-                        kind: BusEventKind::WebhookReceived,
-                        source: source.clone(),
-                        received_at: now_ms + (source_idx * 1000 + i) as i64,
-                        payload: serde_json::json!({"i": i}),
-                    },
-                    false,
-                )
-                .unwrap();
-            }
-        }
-    }
-
-    let mut group = c.benchmark_group("automation_suggestions");
-
-    // sweep — daily worker hot path
-    group.bench_function("sweep_1024_events_4_sources", |b| {
-        b.iter(|| {
-            SuggestionStore::new(black_box(&db))
-                .sweep(black_box(now_ms / 1_000))
-                .unwrap()
-        });
-    });
-
-    // list_recent_for_kind(50) — sample-payload picker hot path
-    group.throughput(Throughput::Elements(50));
-    group.bench_function("list_recent_for_kind_50_of_1024", |b| {
-        b.iter(|| {
-            BusEventStore::new(black_box(&db))
-                .list_recent_for_kind(BusEventKind::WebhookReceived, 50)
-                .unwrap()
-        });
-    });
-
-    group.finish();
-}
-
 criterion_group!(
     benches,
-    bench_automation_bus,
-    bench_automation_suggestions,
     bench_hmac,
     bench_idempotency_key,
     bench_event_record_encode_decode,
@@ -1715,6 +1673,7 @@ criterion_group!(
     bench_ephemeral_sweeper,
     bench_conversation_metadata,
     bench_list_thread_summaries,
+    bench_attached_files_fast_path,
     bench_backend_store,
     bench_webauthn_store,
     bench_refresh_token_store,

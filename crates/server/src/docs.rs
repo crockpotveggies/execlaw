@@ -24,8 +24,8 @@ use crate::approvals::{
 };
 use crate::automation_runtime::{DryRunResult, ExecOutcome};
 use crate::automations_admin::{
-    AutomationDto, CreateAutomationRequest, MetricsDto, RecentBusEventDto, SampleEventBody,
-    SuggestionDto, TestRunRequest, UpdateAutomationRequest,
+    AutomationDto, CreateAutomationRequest, MetricsDto, SampleEventBody, SuggestionDto,
+    TestRunRequest, UpdateAutomationRequest,
 };
 use crate::backend_presets::{BackendPreset, PresetField, PresetWithFlag, PresetsResponse};
 use crate::backends::{
@@ -67,7 +67,6 @@ use crate::trust_policy::{TrustPolicyView, UpdateTrustPolicyRequest};
 use crate::users::{
     ChangePasswordRequest, InviteUserRequest, ResetPasswordRequest, UserListResponse, UserView,
 };
-use execlaw_core::automation_bus::BusEventKind;
 use execlaw_core::automation_runs::{AutomationRunRow, AutomationRunStatus, StepTrace};
 use execlaw_core::automations::{
     AskAgentConfig, AutomationDef, EdgeDef, ExitToolDef, NodeDef, NodeKind, TriggerDef,
@@ -229,7 +228,6 @@ impl Modify for SecurityAddon {
         crate::automations_admin::dismiss_suggestion,
         crate::automations_admin::action_suggestion,
         crate::automations_admin::test_run,
-        crate::automations_admin::list_recent_events,
         // inference observability (M5)
         crate::inference_admin::metrics,
     ),
@@ -318,13 +316,11 @@ impl Modify for SecurityAddon {
         CreateAutomationRequest,
         UpdateAutomationRequest,
         MetricsDto,
-        RecentBusEventDto,
         SampleEventBody,
         SuggestionDto,
         TestRunRequest,
         DryRunResult,
         ExecOutcome,
-        BusEventKind,
         AutomationRunRow,
         AutomationRunStatus,
         StepTrace,

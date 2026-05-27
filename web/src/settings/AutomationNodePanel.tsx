@@ -9,10 +9,51 @@
 // changes are visible immediately; no separate "save" inside the
 // panel (the page's top-bar Save button persists the full def).
 
-import { useState, type ChangeEvent } from "react";
+import { useEffect, useMemo, useState, type ChangeEvent } from "react";
 import Button from "react-bootstrap/Button";
 import Form from "react-bootstrap/Form";
-import type { AutomationDef, ExitToolDef, NodeDef } from "../api/automations";
+import type {
+    AutomationDef,
+    EdgeDef,
+    ExitToolDef,
+    NodeDef,
+    RegisteredEventKind,
+    TriggerDef,
+} from "../api/automations";
+import { listRegisteredEvents } from "../api/automations";
+import { listSkills, listTools } from "../api/endpoints";
+import { useAuth } from "../auth/AuthContext";
+
+/// Phase D (2026-05-22) — operator-pickable name lists for the
+/// SetSkills / SetTools mutator forms. Returns just the names so
+/// the form's chip strip stays simple; rich metadata stays out of
+/// the panel.
+///
+/// `fetchActiveSkillNames` filters out archived skills (the
+/// resolver rejects archived names with a 400 at turn time) and
+/// returns whatever survives, alphabetically sorted for stable
+/// rendering. Empty result is "no skills installed yet" — the
+/// form's hint footer shows a friendly placeholder.
+async function fetchActiveSkillNames(token: () => string | null): Promise<string[]> {
+    const resp = await listSkills(token, { includeArchived: false });
+    const names = resp.skills
+        .filter((s) => s.state !== "archived")
+        .map((s) => s.name);
+    names.sort();
+    return names;
+}
+
+/// `fetchEnabledToolNames` filters out disabled tools (calling a
+/// disabled tool fails at dispatch time) and tools removed from
+/// the registry. Alphabetical for stable rendering.
+async function fetchEnabledToolNames(token: () => string | null): Promise<string[]> {
+    const resp = await listTools(token);
+    const names = resp.tools
+        .filter((t) => t.enabled && t.removed_at === null)
+        .map((t) => t.tool_name);
+    names.sort();
+    return names;
+}
 
 interface Props {
     /** The node being edited. `null` closes the panel. */
@@ -203,12 +244,86 @@ function KindForm({
                     They have no config and no outgoing edges.
                 </div>
             );
+        case "RewritePrompt":
+            return (
+                <ExprField
+                    label="Rewrite expression (Rhai value → string)"
+                    placeholder='"[fix] " + event.payload.text'
+                    value={(cfg.expr as string | undefined) ?? ""}
+                    onChange={(v) => setConfig({ ...cfg, expr: v })}
+                    help="Must return a string. The result replaces the user-facing prompt the chat turn driver sees. Errors (non-string result, bad Rhai) surface in the run trace and the chat falls back to the un-mutated input."
+                    testId="node-panel-rewrite-prompt-expr"
+                />
+            );
+        case "SetSkills":
+            return <StringListForm
+                node={node}
+                onChange={onChange}
+                fieldKey="skills"
+                label="Skill names (one per line)"
+                placeholder="calendar&#10;notes_taker"
+                help="Appended to the chat turn's applied skills. Each name must match an entry in state_skills (the skill prepend resolver fails the turn otherwise — gate with Filter to be safe)."
+                testId="node-panel-set-skills"
+                hintFetcher={fetchActiveSkillNames}
+                hintLabel="Installed skills (click to append)"
+            />;
+        case "SetTools":
+            return <StringListForm
+                node={node}
+                onChange={onChange}
+                fieldKey="tools"
+                label="Tool names (one per line)"
+                placeholder="python.execute&#10;web.search"
+                help="Added to caller_caps for this turn. Additive only — use SetTrust to downgrade trust if you want a smaller tool surface."
+                testId="node-panel-set-tools"
+                hintFetcher={fetchEnabledToolNames}
+                hintLabel="Registered tools (click to append)"
+            />;
+        case "SetTrust":
+            return <SetTrustForm node={node} onChange={onChange} />;
+        case "AddAttachment":
+            return <StringListForm
+                node={node}
+                onChange={onChange}
+                fieldKey="attachment_ids"
+                label="Attachment IDs (one per line)"
+                placeholder="att-abc-123&#10;att-def-456"
+                help="Appended to the turn's persisted_attachments. IDs must already exist in state_attachments — missing rows skip silently at hydration."
+                testId="node-panel-add-attachment"
+            />;
+        case "AddMemory":
+            return (
+                <Form.Group className="mb-2">
+                    <Form.Label className="small text-muted mb-1">
+                        Memory text
+                    </Form.Label>
+                    <Form.Control
+                        as="textarea"
+                        rows={4}
+                        value={(cfg.text as string | undefined) ?? ""}
+                        onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
+                            setConfig({ ...cfg, text: e.target.value })
+                        }
+                        placeholder="Operator prefers concise replies. Always default to metric units."
+                        spellCheck={false}
+                        className="small"
+                        data-testid="node-panel-add-memory-text"
+                    />
+                    <div className="small text-muted mt-1">
+                        Prepended to the user message wrapped in
+                        {" "}<code>&lt;memory&gt;...&lt;/memory&gt;</code>.
+                        Supports <code>{`{{event.payload.x}}`}</code> templating.
+                    </div>
+                </Form.Group>
+            );
         case "AskAgent":
             return <AskAgentForm node={node} onChange={onChange} />;
         case "Notify":
             return <NotifyForm node={node} onChange={onChange} />;
         case "CallPlugin":
             return <CallPluginForm node={node} onChange={onChange} />;
+        case "SendReply":
+            return <SendReplyForm node={node} onChange={onChange} />;
         default:
             return (
                 <div className="small text-danger">
@@ -264,6 +379,7 @@ function AskAgentForm({
     const attachments = (cfg.attachments as string[] | undefined) ?? [];
     const exitTools = (cfg.exit_tools as ExitToolDef[] | undefined) ?? [];
     const maxTurns = (cfg.max_turns as number | undefined) ?? null;
+    const reasoningTools = (cfg.reasoning_tools as string[] | undefined) ?? [];
 
     const update = (next: Record<string, unknown>) =>
         onChange({ ...node, config: { ...cfg, ...next } });
@@ -330,6 +446,36 @@ function AskAgentForm({
                     placeholder="3"
                     data-testid="node-panel-askagent-maxturns"
                 />
+            </Form.Group>
+
+            <Form.Group className="mb-2">
+                <Form.Label className="small text-muted mb-1">
+                    Reasoning tools (one tool name per line, optional)
+                </Form.Label>
+                <Form.Control
+                    as="textarea"
+                    rows={2}
+                    size="sm"
+                    value={reasoningTools.join("\n")}
+                    onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
+                        update({
+                            reasoning_tools: e.target.value
+                                .split("\n")
+                                .map((s) => s.trim())
+                                .filter((s) => s !== ""),
+                        })
+                    }
+                    placeholder="python.execute&#10;web.search"
+                    spellCheck={false}
+                    className="font-monospace small"
+                    data-testid="node-panel-askagent-reasoning-tools"
+                />
+                <div className="small text-muted mt-1">
+                    Optional palette the agent may call while reasoning,
+                    before committing to an exit_tool. Must be a subset
+                    of the trust profile's allowed_tools — out-of-palette
+                    names are rejected at invoke time.
+                </div>
             </Form.Group>
 
             <Form.Group className="mb-2">
@@ -438,6 +584,214 @@ function ExitToolRow({
 
 const SEVERITIES = ["Critical", "Error", "Warning", "Info"] as const;
 type Severity = (typeof SEVERITIES)[number];
+
+/// Phase B mutator helper — line-delimited textarea backed by a
+/// JSON-array config field. Used by SetSkills / SetTools /
+/// AddAttachment (all three share the shape: a single string-array
+/// field with a different key name). Empty lines + whitespace-only
+/// lines are dropped on commit so a trailing newline doesn't break
+/// the validator.
+///
+/// Phase D (2026-05-22) extension: optional `hintFetcher` produces
+/// a `string[]` of operator-pickable names rendered as clickable
+/// chips below the textarea. Click a chip → append to the list
+/// (deduped against entries already present). Used by SetSkills +
+/// SetTools to surface the registered skill / tool catalog the
+/// validator will check at execute time. Loading + error states
+/// render explicitly so a slow / down admin endpoint doesn't
+/// silently strand the operator.
+function StringListForm({
+    node,
+    onChange,
+    fieldKey,
+    label,
+    placeholder,
+    help,
+    testId,
+    hintFetcher,
+    hintLabel,
+}: {
+    node: NodeDef;
+    onChange: (updated: NodeDef) => void;
+    fieldKey: string;
+    label: string;
+    placeholder: string;
+    help: string;
+    testId: string;
+    /** Optional. When set, renders a "Available:" hint chip strip
+     *  below the textarea. Called once on mount with the current
+     *  auth token. */
+    hintFetcher?: (token: () => string | null) => Promise<string[]>;
+    /** Plain-English label preceding the hint chips, e.g.
+     *  "Installed skills" / "Registered tools". Required when
+     *  `hintFetcher` is set. */
+    hintLabel?: string;
+}) {
+    const cfg = (node.config ?? {}) as Record<string, unknown>;
+    const items = (cfg[fieldKey] as string[] | undefined) ?? [];
+
+    // Hint chip state — only used when hintFetcher is set.
+    const auth = useAuth();
+    const [hints, setHints] = useState<string[] | null>(null);
+    const [hintErr, setHintErr] = useState<string | null>(null);
+    useEffect(() => {
+        if (!hintFetcher) return;
+        let cancelled = false;
+        hintFetcher(auth.getAccessToken)
+            .then((names) => {
+                if (!cancelled) setHints(names);
+            })
+            .catch((e: Error) => {
+                if (!cancelled) setHintErr(e.message);
+            });
+        return () => {
+            cancelled = true;
+        };
+        // Effect runs once on mount; auth + hintFetcher are stable
+        // for the lifetime of the panel. eslint-disable-next-line
+        // react-hooks/exhaustive-deps
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    const appendName = (name: string) => {
+        if (items.includes(name)) return;
+        onChange({
+            ...node,
+            config: { ...cfg, [fieldKey]: [...items, name] },
+        });
+    };
+
+    return (
+        <Form.Group className="mb-2">
+            <Form.Label className="small text-muted mb-1">{label}</Form.Label>
+            <Form.Control
+                as="textarea"
+                rows={3}
+                value={items.join("\n")}
+                onChange={(e: ChangeEvent<HTMLTextAreaElement>) => {
+                    const next = e.target.value
+                        .split("\n")
+                        .map((s) => s.trim())
+                        .filter((s) => s !== "");
+                    onChange({
+                        ...node,
+                        config: { ...cfg, [fieldKey]: next },
+                    });
+                }}
+                placeholder={placeholder}
+                spellCheck={false}
+                className="font-monospace small"
+                data-testid={`${testId}-textarea`}
+            />
+            <div className="small text-muted mt-1">{help}</div>
+            {hintFetcher && (
+                <div
+                    className="mt-2"
+                    data-testid={`${testId}-hints`}
+                >
+                    <div className="small text-muted mb-1">
+                        <i className="bi bi-lightbulb me-1" aria-hidden />
+                        {hintLabel ?? "Available"}
+                    </div>
+                    {hints === null && !hintErr && (
+                        <div className="small text-muted">Loading…</div>
+                    )}
+                    {hintErr && (
+                        <div
+                            className="small text-warning"
+                            data-testid={`${testId}-hints-error`}
+                        >
+                            Couldn't load list ({hintErr}). You can still type
+                            names manually above.
+                        </div>
+                    )}
+                    {hints !== null && hints.length === 0 && !hintErr && (
+                        <div className="small text-muted">
+                            (none registered yet)
+                        </div>
+                    )}
+                    {hints !== null && hints.length > 0 && (
+                        <div className="d-flex flex-wrap gap-1">
+                            {hints.map((name) => {
+                                const already = items.includes(name);
+                                return (
+                                    <Button
+                                        key={name}
+                                        variant={
+                                            already
+                                                ? "outline-secondary"
+                                                : "outline-info"
+                                        }
+                                        size="sm"
+                                        className="font-monospace"
+                                        style={{ fontSize: 11 }}
+                                        onClick={() => appendName(name)}
+                                        disabled={already}
+                                        title={
+                                            already
+                                                ? "Already in list"
+                                                : "Click to append"
+                                        }
+                                        data-testid={`${testId}-hint-${name}`}
+                                    >
+                                        {name}
+                                    </Button>
+                                );
+                            })}
+                        </div>
+                    )}
+                </div>
+            )}
+        </Form.Group>
+    );
+}
+
+/// Phase B SetTrust mutator form — dropdown over the canonical
+/// trust classes the policy engine matches on. Saves the
+/// snake_case alias because that's what the SPA's TypeScript
+/// TrustClass union uses (the validator accepts both forms).
+const TRUST_CLASSES: Array<{ value: string; label: string }> = [
+    { value: "controller", label: "controller (full caps, no spotlighting)" },
+    { value: "known_high", label: "known_high (KnownTrusted — full topic access)" },
+    { value: "known_limited", label: "known_limited (engages spotlight + planner/executor)" },
+    { value: "cold_contact", label: "cold_contact (parks for admission)" },
+    { value: "blocked", label: "blocked (drops the turn at the policy gate)" },
+];
+
+function SetTrustForm({
+    node,
+    onChange,
+}: {
+    node: NodeDef;
+    onChange: (updated: NodeDef) => void;
+}) {
+    const cfg = (node.config ?? {}) as Record<string, unknown>;
+    const current = (cfg.trust as string | undefined) ?? "known_limited";
+    return (
+        <Form.Group className="mb-2">
+            <Form.Label className="small text-muted mb-1">Trust class</Form.Label>
+            <Form.Select
+                size="sm"
+                value={current}
+                onChange={(e: ChangeEvent<HTMLSelectElement>) =>
+                    onChange({ ...node, config: { ...cfg, trust: e.target.value } })
+                }
+                data-testid="node-panel-set-trust"
+            >
+                {TRUST_CLASSES.map((t) => (
+                    <option key={t.value} value={t.value}>
+                        {t.label}
+                    </option>
+                ))}
+            </Form.Select>
+            <div className="small text-muted mt-1">
+                Overrides the policy engine's resolved sender_trust for
+                this turn. Last-writer-wins across matching flows
+                (alphabetical by flow name).
+            </div>
+        </Form.Group>
+    );
+}
 
 function NotifyForm({
     node,
@@ -628,5 +982,716 @@ function CallPluginForm({
                 </div>
             </Form.Group>
         </>
+    );
+}
+
+const SEND_REPLY_SOURCES = [
+    "from_agent",
+    "from_node_output",
+    "template",
+] as const;
+type SendReplySource = (typeof SEND_REPLY_SOURCES)[number];
+
+function SendReplyForm({
+    node,
+    onChange,
+}: {
+    node: NodeDef;
+    onChange: (updated: NodeDef) => void;
+}) {
+    const cfg = (node.config ?? {}) as Record<string, unknown>;
+    const source = ((cfg.source as string | undefined) ?? "from_agent") as SendReplySource;
+    const fromNode = (cfg.from_node as string | undefined) ?? "";
+    const text = (cfg.text as string | undefined) ?? "";
+    const targetOverride = cfg.target_override as unknown;
+    const hints = (cfg.hints as Record<string, unknown> | undefined) ?? {};
+    const splitPerPart = (hints.split_per_part as boolean | undefined) ?? false;
+    const onFailureRaw = hints.on_failure as Record<string, unknown> | undefined;
+    const onFailureKind = (onFailureRaw?.kind as string | undefined) ?? "chat_append_home";
+    const minChartForm = (hints.min_chart_form as string | undefined) ?? "";
+
+    // target_override is rendered as JSON in a textarea so authors can
+    // edit a free-shape OriginRef (the validator on save rejects bad
+    // shapes). Empty textarea = field absent = use envelope.origin.
+    const [targetDraft, setTargetDraft] = useState(
+        targetOverride && targetOverride !== null
+            ? JSON.stringify(targetOverride, null, 2)
+            : "",
+    );
+    const [targetErr, setTargetErr] = useState<string | null>(null);
+
+    const update = (next: Record<string, unknown>) =>
+        onChange({ ...node, config: { ...cfg, ...next } });
+
+    const updateHints = (next: Record<string, unknown>) =>
+        update({ hints: { ...hints, ...next } });
+
+    const commitTarget = () => {
+        const trimmed = targetDraft.trim();
+        if (trimmed === "") {
+            // Clear the field entirely so the server falls back to
+            // envelope.origin.
+            setTargetErr(null);
+            const { target_override: _omit, ...rest } = cfg;
+            void _omit;
+            onChange({ ...node, config: rest });
+            return;
+        }
+        try {
+            const parsed = JSON.parse(trimmed);
+            if (
+                parsed === null ||
+                typeof parsed !== "object" ||
+                Array.isArray(parsed) ||
+                typeof (parsed as { kind?: unknown }).kind !== "string"
+            ) {
+                setTargetErr("target_override must be an OriginRef object with a 'kind' field");
+                return;
+            }
+            setTargetErr(null);
+            update({ target_override: parsed });
+        } catch (e) {
+            setTargetErr((e as Error).message);
+        }
+    };
+
+    return (
+        <>
+            <Form.Group className="mb-2">
+                <Form.Label className="small text-muted mb-1">
+                    Reply source
+                </Form.Label>
+                <Form.Select
+                    size="sm"
+                    value={source}
+                    onChange={(e: ChangeEvent<HTMLSelectElement>) =>
+                        update({ source: e.target.value })
+                    }
+                    data-testid="node-panel-sendreply-source"
+                >
+                    <option value="from_agent">
+                        from_agent — use upstream AskAgent's exit-tool args
+                    </option>
+                    <option value="from_node_output">
+                        from_node_output — copy a node's output verbatim
+                    </option>
+                    <option value="template">
+                        template — author-supplied templated text
+                    </option>
+                </Form.Select>
+                <div className="small text-muted mt-1">
+                    Defaults to <code>from_agent</code> — the common single-
+                    AskAgent flow case.
+                </div>
+            </Form.Group>
+
+            {(source === "from_agent" || source === "from_node_output") && (
+                <Form.Group className="mb-2">
+                    <Form.Label className="small text-muted mb-1">
+                        Upstream node id
+                    </Form.Label>
+                    <Form.Control
+                        type="text"
+                        size="sm"
+                        value={fromNode}
+                        onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                            update({ from_node: e.target.value })
+                        }
+                        placeholder="(auto-detect last AskAgent)"
+                        spellCheck={false}
+                        className="font-monospace small"
+                        data-testid="node-panel-sendreply-from-node"
+                    />
+                    <div className="small text-muted mt-1">
+                        Leave blank to auto-detect the most recent AskAgent
+                        output in state.
+                    </div>
+                </Form.Group>
+            )}
+
+            {source === "template" && (
+                <Form.Group className="mb-2">
+                    <Form.Label className="small text-muted mb-1">
+                        Reply text template
+                    </Form.Label>
+                    <Form.Control
+                        as="textarea"
+                        rows={3}
+                        size="sm"
+                        value={text}
+                        onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
+                            update({ text: e.target.value })
+                        }
+                        placeholder="Acknowledged: {{event.payload.subject}}"
+                        spellCheck={false}
+                        className="small"
+                        data-testid="node-panel-sendreply-text"
+                    />
+                    <div className="small text-muted mt-1">
+                        Supports <code>{`{{event.payload.x}}`}</code> and
+                        upstream node refs like{" "}
+                        <code>{`{{node_id.field}}`}</code>.
+                    </div>
+                </Form.Group>
+            )}
+
+            <div className="small text-muted mt-2">
+                Routes through the ReplyRouter using the trigger event's{" "}
+                <code>envelope.origin</code> — web chat replies land via{" "}
+                <code>chat_append</code>, channel-plugin replies via the
+                plugin's <code>send_reply</code> tool, fire-and-forget
+                triggers drop silently.
+            </div>
+
+            <hr className="my-3" />
+            <div className="small text-muted mb-1">
+                <i className="bi bi-sliders me-1" aria-hidden />
+                Advanced
+            </div>
+
+            <Form.Group className="mb-2">
+                <Form.Label className="small text-muted mb-1">
+                    Target override (OriginRef JSON, optional)
+                </Form.Label>
+                <Form.Control
+                    as="textarea"
+                    rows={3}
+                    size="sm"
+                    value={targetDraft}
+                    onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
+                        setTargetDraft(e.target.value)
+                    }
+                    onBlur={commitTarget}
+                    placeholder='{"kind":"chat_append","thread_id":"…"}'
+                    spellCheck={false}
+                    className="font-monospace small"
+                    data-testid="node-panel-sendreply-target"
+                />
+                {targetErr && (
+                    <div
+                        className="small text-danger mt-1"
+                        data-testid="node-panel-sendreply-target-error"
+                    >
+                        {targetErr}
+                    </div>
+                )}
+                <div className="small text-muted mt-1">
+                    Defaults to the trigger's <code>envelope.origin</code>.
+                    Override to route the reply to a different transport
+                    (e.g., always post into the operator Inbox even when
+                    triggered by WhatsApp). Empty = use envelope.
+                </div>
+            </Form.Group>
+
+            <Form.Group className="mb-2">
+                <Form.Check
+                    type="checkbox"
+                    id={`${node.id}-split-per-part`}
+                    label="Split per part (one transport message per ReplyPart)"
+                    checked={splitPerPart}
+                    onChange={(e) =>
+                        updateHints({ split_per_part: e.target.checked })
+                    }
+                    data-testid="node-panel-sendreply-split-per-part"
+                />
+                <div className="small text-muted mt-1">
+                    WhatsApp/Signal often want one message per attachment
+                    for readability; web chat usually wants bundled.
+                </div>
+            </Form.Group>
+
+            <Form.Group className="mb-2">
+                <Form.Label className="small text-muted mb-1">
+                    On delivery failure
+                </Form.Label>
+                <Form.Select
+                    size="sm"
+                    value={onFailureKind}
+                    onChange={(e: ChangeEvent<HTMLSelectElement>) =>
+                        updateHints({
+                            on_failure: { kind: e.target.value },
+                        })
+                    }
+                    data-testid="node-panel-sendreply-on-failure"
+                >
+                    <option value="chat_append_home">
+                        chat_append_home — append into operator Inbox + alert
+                    </option>
+                    <option value="alert_only">
+                        alert_only — fire alert, drop payload
+                    </option>
+                    <option value="drop">
+                        drop — silently discard
+                    </option>
+                </Form.Select>
+            </Form.Group>
+
+            <Form.Group className="mb-2">
+                <Form.Label className="small text-muted mb-1">
+                    Minimum chart fidelity (optional)
+                </Form.Label>
+                <Form.Select
+                    size="sm"
+                    value={minChartForm}
+                    onChange={(e: ChangeEvent<HTMLSelectElement>) => {
+                        const v = e.target.value;
+                        if (v === "") {
+                            // Clear field entirely.
+                            const { min_chart_form: _omit, ...rest } = hints;
+                            void _omit;
+                            update({ hints: rest });
+                        } else {
+                            updateHints({ min_chart_form: v });
+                        }
+                    }}
+                    data-testid="node-panel-sendreply-min-chart-form"
+                >
+                    <option value="">— No floor —</option>
+                    <option value="inline">inline (web only)</option>
+                    <option value="image">image (PNG/JPEG)</option>
+                    <option value="url">url</option>
+                    <option value="text_ok">text_ok (any)</option>
+                </Form.Select>
+                <div className="small text-muted mt-1">
+                    If the transport can't satisfy this floor, the router
+                    refuses to degrade and fires a{" "}
+                    <code>ReplyDegradationRefused</code> alert.
+                </div>
+            </Form.Group>
+        </>
+    );
+}
+
+/**
+ * Side panel that opens when the operator clicks the trigger sentinel
+ * on the canvas. Audit fix #4+#5: the trigger block was previously
+ * only editable from the JSON view. This surfaces both fields
+ * (`kind`, `when`) on the canvas and uses the live event registry to
+ * populate the kind dropdown so plugin-declared kinds are reachable.
+ *
+ * The kind dropdown is sourced from
+ * `/api/admin/automations/registered-events`. While the request is in
+ * flight the dropdown still shows the current value so the form is
+ * never empty. Free-text fallback (operator typing a kind that isn't
+ * registered yet) is supported via the trailing "Other…" option.
+ */
+export function TriggerPanel({
+    trigger,
+    onChange,
+    onClose,
+}: {
+    trigger: TriggerDef;
+    onChange: (updated: TriggerDef) => void;
+    onClose: () => void;
+}) {
+    const auth = useAuth();
+    const [registry, setRegistry] = useState<RegisteredEventKind[] | null>(null);
+    const [registryErr, setRegistryErr] = useState<string | null>(null);
+    const [customKind, setCustomKind] = useState<string>("");
+    const [usingCustom, setUsingCustom] = useState(false);
+
+    useEffect(() => {
+        let cancelled = false;
+        listRegisteredEvents(auth.getAccessToken)
+            .then((kinds) => {
+                if (cancelled) return;
+                setRegistry(kinds);
+                // If the current trigger.kind isn't in the registry,
+                // flip to free-text mode so the operator sees their
+                // current value and can keep editing it.
+                if (!kinds.some((k) => k.kind === trigger.kind)) {
+                    setUsingCustom(true);
+                    setCustomKind(trigger.kind);
+                }
+            })
+            .catch((e: Error) => {
+                if (cancelled) return;
+                setRegistryErr(e.message);
+            });
+        return () => {
+            cancelled = true;
+        };
+        // Intentionally only run on mount — trigger.kind changes are
+        // driven by the operator interacting with this panel, so we
+        // don't want the effect re-flipping `usingCustom` mid-edit.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    const selectedFromRegistry = registry?.find((k) => k.kind === trigger.kind);
+
+    return (
+        <div
+            className="execlaw-automation-trigger-panel border rounded shadow-sm"
+            style={{
+                position: "absolute",
+                top: 12,
+                right: 12,
+                width: 380,
+                maxHeight: "calc(100% - 24px)",
+                overflowY: "auto",
+                zIndex: 10,
+                padding: 12,
+                background: "#161b22",
+                borderColor: "#30363d",
+                color: "#e6edf3",
+                boxShadow: "0 4px 12px rgba(0, 0, 0, 0.45)",
+            }}
+            data-testid="trigger-panel"
+            onKeyDown={(e) => e.stopPropagation()}
+        >
+            <div className="d-flex justify-content-between align-items-start mb-2">
+                <div>
+                    <div className="text-muted small">Trigger</div>
+                    <div className="h6 mb-0">
+                        <i className="bi bi-lightning-fill me-1" aria-hidden />
+                        Event entrypoint
+                    </div>
+                </div>
+                <Button
+                    variant="link"
+                    size="sm"
+                    onClick={onClose}
+                    aria-label="Close panel"
+                    data-testid="trigger-panel-close"
+                >
+                    <i className="bi bi-x-lg" aria-hidden />
+                </Button>
+            </div>
+
+            <Form.Group className="mb-2">
+                <Form.Label className="small text-muted mb-1">Event kind</Form.Label>
+                {registry === null && !registryErr && (
+                    <div className="small text-muted mb-1">
+                        Loading registered events…
+                    </div>
+                )}
+                {registryErr && (
+                    <div
+                        className="small text-warning mb-1"
+                        data-testid="trigger-panel-registry-error"
+                    >
+                        Failed to load registry ({registryErr}). Falling
+                        back to free-text entry.
+                    </div>
+                )}
+                {!usingCustom && registry !== null && (
+                    <Form.Select
+                        size="sm"
+                        value={trigger.kind}
+                        onChange={(e: ChangeEvent<HTMLSelectElement>) => {
+                            const next = e.target.value;
+                            if (next === "__custom__") {
+                                setUsingCustom(true);
+                                setCustomKind(trigger.kind);
+                                return;
+                            }
+                            onChange({ ...trigger, kind: next });
+                        }}
+                        data-testid="trigger-panel-kind"
+                    >
+                        {/* If the current kind isn't registered (shouldn't
+                            happen with the useEffect above, but defensive)
+                            show it at top so the form isn't blank. */}
+                        {!registry.some((k) => k.kind === trigger.kind) && (
+                            <option value={trigger.kind}>
+                                {trigger.kind} (not registered)
+                            </option>
+                        )}
+                        {registry.map((k) => (
+                            <option key={k.kind} value={k.kind}>
+                                {k.kind} — {k.source}
+                            </option>
+                        ))}
+                        <option value="__custom__">
+                            Other (type a custom kind)…
+                        </option>
+                    </Form.Select>
+                )}
+                {(usingCustom || registryErr) && (
+                    <div className="d-flex gap-2 align-items-start">
+                        <Form.Control
+                            type="text"
+                            size="sm"
+                            value={customKind}
+                            onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                                setCustomKind(e.target.value)
+                            }
+                            onBlur={() => {
+                                const trimmed = customKind.trim();
+                                if (trimmed && trimmed !== trigger.kind) {
+                                    onChange({ ...trigger, kind: trimmed });
+                                }
+                            }}
+                            placeholder="e.g. my_plugin.thing.happened"
+                            spellCheck={false}
+                            className="font-monospace small"
+                            data-testid="trigger-panel-kind-custom"
+                        />
+                        {registry !== null && !registryErr && (
+                            <Button
+                                variant="outline-secondary"
+                                size="sm"
+                                onClick={() => setUsingCustom(false)}
+                                title="Back to registered kinds"
+                            >
+                                <i className="bi bi-arrow-left" aria-hidden />
+                            </Button>
+                        )}
+                    </div>
+                )}
+                {selectedFromRegistry && (
+                    <div
+                        className="small text-muted mt-1"
+                        data-testid="trigger-panel-kind-description"
+                    >
+                        {selectedFromRegistry.description || "(no description)"}
+                        {" "}
+                        <span style={{ color: "#7d8590" }}>
+                            · expects_reply ={" "}
+                            <code>{String(selectedFromRegistry.expects_reply)}</code>
+                        </span>
+                    </div>
+                )}
+            </Form.Group>
+
+            <Form.Group className="mb-2">
+                <Form.Label className="small text-muted mb-1">
+                    Trigger filter (Rhai bool, optional)
+                </Form.Label>
+                <Form.Control
+                    as="textarea"
+                    rows={3}
+                    value={trigger.when ?? ""}
+                    onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
+                        onChange({
+                            ...trigger,
+                            when: e.target.value === "" ? null : e.target.value,
+                        })
+                    }
+                    placeholder='event.envelope.identity.trust == "controller"'
+                    spellCheck={false}
+                    className="font-monospace small"
+                    data-testid="trigger-panel-when"
+                />
+                <div className="small text-muted mt-1">
+                    Evaluated for every event of this kind. Falsy → the
+                    flow doesn't run. The scope exposes{" "}
+                    <code>event.kind</code>, <code>event.source</code>,{" "}
+                    <code>event.payload</code>, <code>event.envelope</code>,{" "}
+                    <code>event.internal</code>.
+                </div>
+            </Form.Group>
+
+            <div className="small text-muted mt-2">
+                The trigger and the End sentinel are structural — every
+                flow has exactly one of each. Drag operator nodes from
+                the palette and wire them between trigger and End.
+            </div>
+        </div>
+    );
+}
+
+/**
+ * Side panel for editing an edge's `when` clause (audit fix #3).
+ * Edges previously had no canvas-side editor — operators had to drop
+ * into the JSON view to gate a branch on the upstream AskAgent's
+ * exit-tool name. This surfaces that field directly.
+ *
+ * The `when` clause is a Rhai bool expression evaluated against the
+ * same scope as trigger filters (`event.*`) plus the per-node state
+ * keys (e.g. `agent1.outcome` when `agent1` is an upstream AskAgent
+ * node). Empty/whitespace text persists as `null` — the runtime
+ * treats null as "always taken".
+ */
+export function EdgePanel({
+    edgeId,
+    edge,
+    definition,
+    onWhenChange,
+    onClose,
+}: {
+    edgeId: string;
+    edge: EdgeDef;
+    /** Whole def — needed so we can look up the upstream node's
+     *  exit_tools and suggest click-to-paste `when` snippets. */
+    definition: AutomationDef;
+    /** Replace the edge's `when` clause. Pass `null` to clear it. */
+    onWhenChange: (edgeId: string, whenExpr: string | null) => void;
+    onClose: () => void;
+}) {
+    // Draft state — local mutation flushes back to the canonical def
+    // on blur so each keystroke doesn't churn the AutomationDef object
+    // (which would re-render the whole canvas + re-seed ReactFlow).
+    const [draft, setDraft] = useState<string>(edge.when ?? "");
+    const commit = () => {
+        const trimmed = draft.trim();
+        const next = trimmed === "" ? null : draft;
+        if (next !== edge.when) {
+            onWhenChange(edgeId, next);
+        }
+    };
+
+    /** Suggestions for the `when` clause based on the upstream node's
+     *  kind. AskAgent exits via a tool call whose name is recorded as
+     *  `{node_id}.tool` in state — so the canonical predicate is
+     *  `<node_id>.tool == "<exit_tool>"`. Audit fix #10. */
+    const suggestions = useMemo<string[]>(() => {
+        if (edge.from === "trigger") {
+            return [
+                'event.envelope.identity.trust == "controller"',
+                'event.envelope.origin.kind == "web_socket_session"',
+                "event.internal == false",
+            ];
+        }
+        const upstream = definition.nodes.find((n) => n.id === edge.from);
+        if (!upstream) return [];
+        if (upstream.kind === "AskAgent") {
+            const cfg = (upstream.config ?? {}) as Record<string, unknown>;
+            const exitTools = (cfg.exit_tools as ExitToolDef[] | undefined) ?? [];
+            return exitTools.map(
+                (t) => `${edge.from}.tool == "${t.name}"`,
+            );
+        }
+        if (upstream.kind === "Filter" || upstream.kind === "Transform") {
+            // For Transform, the node output is whatever the Rhai
+            // expression returned. We don't know the shape — suggest
+            // a generic pattern.
+            return [`${edge.from}.field == "value"`];
+        }
+        if (upstream.kind === "CallPlugin") {
+            return [
+                `${edge.from}.ok == true`,
+                `${edge.from}.status == 200`,
+            ];
+        }
+        return [];
+    }, [definition, edge.from]);
+    return (
+        <div
+            className="execlaw-automation-edge-panel border rounded shadow-sm"
+            style={{
+                position: "absolute",
+                top: 12,
+                right: 12,
+                width: 380,
+                maxHeight: "calc(100% - 24px)",
+                overflowY: "auto",
+                zIndex: 10,
+                padding: 12,
+                background: "#161b22",
+                borderColor: "#30363d",
+                color: "#e6edf3",
+                boxShadow: "0 4px 12px rgba(0, 0, 0, 0.45)",
+            }}
+            data-testid="edge-panel"
+            onKeyDown={(e) => e.stopPropagation()}
+        >
+            <div className="d-flex justify-content-between align-items-start mb-2">
+                <div>
+                    <div className="text-muted small">Edge</div>
+                    <div
+                        className="h6 mb-0 font-monospace"
+                        data-testid="edge-panel-route"
+                    >
+                        {edge.from} → {edge.to}
+                    </div>
+                </div>
+                <Button
+                    variant="link"
+                    size="sm"
+                    onClick={onClose}
+                    aria-label="Close panel"
+                    data-testid="edge-panel-close"
+                >
+                    <i className="bi bi-x-lg" aria-hidden />
+                </Button>
+            </div>
+
+            <Form.Group className="mb-2">
+                <Form.Label className="small text-muted mb-1">
+                    When (Rhai bool, optional)
+                </Form.Label>
+                <Form.Control
+                    as="textarea"
+                    rows={3}
+                    value={draft}
+                    onChange={(e: ChangeEvent<HTMLTextAreaElement>) =>
+                        setDraft(e.target.value)
+                    }
+                    onBlur={commit}
+                    onKeyDown={(e) => {
+                        // Ctrl/Cmd+Enter commits without leaving the
+                        // panel — useful for quick iteration on a
+                        // branch condition.
+                        if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+                            e.preventDefault();
+                            commit();
+                        }
+                    }}
+                    placeholder={
+                        edge.from === "trigger"
+                            ? 'event.payload.zone == "driveway"'
+                            : `${edge.from}.outcome == "notify"`
+                    }
+                    spellCheck={false}
+                    className="font-monospace small"
+                    data-testid="edge-panel-when"
+                />
+                <div className="small text-muted mt-1">
+                    Falsy or expression error → this edge isn't taken.
+                    Leave blank for an unconditional edge. Scope
+                    exposes <code>event.*</code> plus each upstream
+                    node's output as <code>{`{node_id}.field`}</code>.
+                </div>
+            </Form.Group>
+
+            {suggestions.length > 0 && (
+                <div className="mb-2" data-testid="edge-panel-suggestions">
+                    <div className="small text-muted mb-1">
+                        <i className="bi bi-lightbulb me-1" aria-hidden />
+                        Suggestions {edge.from !== "trigger" && `from ${edge.from}`}
+                    </div>
+                    <div className="d-flex flex-wrap gap-1">
+                        {suggestions.map((s, i) => (
+                            <Button
+                                key={i}
+                                variant="outline-secondary"
+                                size="sm"
+                                className="font-monospace"
+                                style={{ fontSize: 11 }}
+                                onClick={() => {
+                                    setDraft(s);
+                                    onWhenChange(edgeId, s);
+                                }}
+                                data-testid={`edge-panel-suggestion-${i}`}
+                            >
+                                {s}
+                            </Button>
+                        ))}
+                    </div>
+                </div>
+            )}
+
+            <Button
+                variant="outline-secondary"
+                size="sm"
+                onClick={() => {
+                    setDraft("");
+                    onWhenChange(edgeId, null);
+                }}
+                disabled={!edge.when && draft === ""}
+                data-testid="edge-panel-clear"
+            >
+                <i className="bi bi-eraser me-1" aria-hidden />
+                Clear condition
+            </Button>
+
+            <div className="small text-muted mt-3">
+                Multiple outgoing edges from a Branch node each get
+                their own <code>when</code>; the first matching edge
+                wins. From a non-Branch node, an unconditional edge is
+                taken always.
+            </div>
+        </div>
     );
 }

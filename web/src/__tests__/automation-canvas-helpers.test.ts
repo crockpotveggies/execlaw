@@ -170,3 +170,50 @@ describe("withUpdatedNode", () => {
         );
     });
 });
+
+describe("END sentinel protection + normalization", () => {
+    it("refuses to remove the synthetic END sentinel", () => {
+        const def = fixtureDef();
+        // Both the synthetic visual id and the canonical "END"
+        // string should be rejected.
+        const next1 = withRemovedNode(def, "__end__");
+        expect(next1).toEqual(def);
+        const next2 = withRemovedNode(def, "END");
+        expect(next2).toEqual(def);
+    });
+
+    it("normalizes edges-to-END-sentinel-node-id to the canonical 'END' string", () => {
+        const def = fixtureDef();
+        // Operator drags from t1's source handle to the END sentinel
+        // (visual id `__end__`); the persisted edge must use the
+        // canonical END_SENTINEL string the runtime expects.
+        const next = withAddedEdge(def, "t1", "__end__");
+        expect(next.edges).toContainEqual({
+            from: "t1",
+            to: "END",
+            when: null,
+        });
+    });
+
+    it("rejects self-loop into the END sentinel from END", () => {
+        const def = fixtureDef();
+        // Even via the synthetic id, dragging END onto itself
+        // (impossible UX-wise, but defensive) is a no-op.
+        const next = withAddedEdge(def, "__end__", "END");
+        expect(next).toEqual(def);
+    });
+
+    it("does NOT protect operator-created Terminal nodes named 'end'", () => {
+        // Backward-compat: the protection is on the SENTINEL ids
+        // (`__end__` / `"END"`), not on every node whose id happens
+        // to be "end". Operators who drop a Terminal node and name
+        // it "end" can still delete it like any other node.
+        const def = fixtureDef(); // has node id "end" (Terminal kind)
+        const next = withRemovedNode(def, "end");
+        expect(next.nodes.map((n) => n.id)).toEqual(["f1", "t1"]);
+        expect(next.edges).toEqual([
+            { from: "trigger", to: "f1", when: null },
+            { from: "f1", to: "t1", when: null },
+        ]);
+    });
+});
