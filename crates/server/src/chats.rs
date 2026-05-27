@@ -516,7 +516,7 @@ pub async fn send_message(
 
     let (user_msg_seq, assistant_text, assistant_seq) =
         match (inference_for_turn, runner_routed.as_deref()) {
-            (Some(_inference), Some(group_id)) => {
+            (Some(inference), Some(group_id)) => {
                 // The supervisor is fetched from `state` inside
                 // `run_runner_turn` now (the prior signature passed it
                 // redundantly). We still gate the branch on
@@ -540,6 +540,7 @@ pub async fn send_message(
                     group_context: group_context_for_turn.clone(),
                     attachment_ids: persisted_attachments.clone(),
                     applied_skill_names: applied_skill_names.clone(),
+                    resolved_inference: inference,
                 })
                 .await
                 {
@@ -1360,6 +1361,14 @@ pub(crate) struct RunnerTurnCtx<'a> {
     /// by the send-handler upstream; the runner doesn't need to
     /// re-resolve them.
     pub applied_skill_names: Vec<String>,
+    /// 2026-05-26 — already-resolved inference target for this turn.
+    /// Every caller of `run_runner_turn` already calls
+    /// `state.inference.resolve(...)` upstream to gate the runner
+    /// branch (`runner_eligible = ... && inference_for_turn.is_some()`).
+    /// Threading the value through avoids a second indexed
+    /// `BackendStore::get()` read inside the runner path — small win
+    /// per turn (~50-100 us) but the right shape.
+    pub resolved_inference: crate::inference_resolver::ResolvedInference,
 }
 
 /// Build the `tool_catalog` the runner advertises to the model for one
@@ -1755,6 +1764,7 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
         group_context,
         attachment_ids,
         applied_skill_names,
+        resolved_inference,
     } = ctx;
     let supervisor = state
         .runner_supervisor
@@ -1880,15 +1890,17 @@ pub(crate) async fn run_runner_turn(ctx: RunnerTurnCtx<'_>) -> Result<(i64, Stri
 
     // Step 3 — build TurnRequest.
     let turn_id = supervisor.mint_turn_id();
-    // Resolve client + model id from the SAME backend-row read so
-    // they can't drift (cf. the 2026-05-13 regression where the chat
-    // path sent `model=Qwen3.5` to a vLLM container loaded with
-    // `model=Qwen3.6`, because the URL came from the DB and the
-    // model id came from a stale `state.config.model_id` constant).
-    let resolved = state
-        .inference
-        .resolve(&state.db, BackendPurpose::Standard)
-        .ok_or_else(|| "no inference backend configured".to_owned())?;
+    // Inference target was resolved ONCE by the caller (every
+    // `run_runner_turn` callsite already gates the runner branch on
+    // `inference_for_turn.is_some()`) and threaded in via the ctx;
+    // re-resolving here would burn a second `BackendStore::get()`
+    // SQLite read per turn for no benefit. Client + model id still
+    // travel together from the SAME backend-row read so they can't
+    // drift (cf. the 2026-05-13 regression where the chat path sent
+    // `model=Qwen3.5` to a vLLM container loaded with `model=Qwen3.6`
+    // because the URL came from the DB and the model id came from a
+    // stale `state.config.model_id` constant).
+    let resolved = resolved_inference;
     let inference_client_for_subagents = resolved.client.clone();
     let resolved_model_id = resolved.model_id.clone();
     let inference_url = resolved.endpoint.clone();
@@ -2979,7 +2991,7 @@ pub async fn dispatch_routine_turn(
         };
 
     let result = match (inference_for_turn, runner_routed_group.as_deref()) {
-        (Some(_inference), Some(group_id)) => {
+        (Some(inference), Some(group_id)) => {
             let cancel_guard = crate::turn_cancel::TurnCancelGuard::new(
                 state.turn_cancel.clone(),
                 cid.as_str().to_owned(),
@@ -3005,6 +3017,7 @@ pub async fn dispatch_routine_turn(
                 attachment_ids: Vec::new(),
                 // Routines don't surface a skill picker.
                 applied_skill_names: Vec::new(),
+                resolved_inference: inference,
             })
             .await;
             drop(cancel_guard);
@@ -3480,7 +3493,7 @@ pub async fn dispatch_external_turn(
         };
 
     let result = match (inference_for_turn, runner_routed_group.as_deref()) {
-        (Some(_inference), Some(group_id)) => {
+        (Some(inference), Some(group_id)) => {
             let cancel_guard = crate::turn_cancel::TurnCancelGuard::new(
                 state.turn_cancel.clone(),
                 cid_str.clone(),
@@ -3503,6 +3516,7 @@ pub async fn dispatch_external_turn(
                 attachment_ids: attachment_ids.clone(),
                 // Transports don't surface a skill picker.
                 applied_skill_names: Vec::new(),
+                resolved_inference: inference,
             })
             .await;
             drop(cancel_guard);
@@ -4017,7 +4031,7 @@ pub async fn dispatch_clarification_turn(
             None
         };
     let result = match (inference_for_turn, runner_routed_group.as_deref()) {
-        (Some(_inference), Some(group_id)) => {
+        (Some(inference), Some(group_id)) => {
             let cancel_guard = crate::turn_cancel::TurnCancelGuard::new(
                 state.turn_cancel.clone(),
                 cid.as_str().to_owned(),
@@ -4042,6 +4056,7 @@ pub async fn dispatch_clarification_turn(
                 group_context: synth_group_ctx.clone(),
                 attachment_ids: Vec::new(),
                 applied_skill_names: Vec::new(),
+                resolved_inference: inference,
             })
             .await;
             drop(cancel_guard);
