@@ -91,6 +91,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "drop_shadow_default_flow",
         sql: include_str!("../migrations/0013_drop_shadow_default_flow.sql"),
     },
+    Migration {
+        id: 14,
+        name: "state_conversations_has_attachments",
+        sql: include_str!("../migrations/0014_state_conversations_has_attachments.sql"),
+    },
 ];
 
 #[derive(Debug, Error)]
@@ -283,7 +288,7 @@ mod tests {
         // discovery surface on the /automations landing page).
         // Update this list whenever a new migration is added to
         // MIGRATIONS.
-        assert_eq!(applied, vec![1, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+        assert_eq!(applied, vec![1, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
 
         // Spot-check: every documented table exists.
         let tables = vec![
@@ -362,7 +367,7 @@ mod tests {
         let runner = MigrationRunner::new(&db);
         let first = runner.apply_all().unwrap();
         let second = runner.apply_all().unwrap();
-        assert_eq!(first, vec![1, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+        assert_eq!(first, vec![1, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
         assert!(
             second.is_empty(),
             "rerun must not re-apply already-applied migrations"

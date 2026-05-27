@@ -746,7 +746,28 @@ pub(crate) fn encode_attachments_as_data_urls(
 /// needs to keep being reminded it exists.
 pub(crate) fn build_attached_files_block(state: &AppState, cid: &ConversationId) -> Option<String> {
     use execlaw_core::attachments::AttachmentStore;
+    use execlaw_core::conversation::ConversationStore;
 
+    // Fast path (migration 0014). The vast majority of turns belong
+    // to conversations that have never had a non-image attachment;
+    // the per-conversation `has_attachments` flag short-circuits
+    // those without going through the full
+    // `list_for_conversation` scan + row decode. A DB error here is
+    // a soft failure — fall through to the slow path so a transient
+    // SQLite error doesn't silently drop a real attachment from the
+    // agent's view.
+    match ConversationStore::new(&state.db).has_attachments(cid) {
+        Ok(false) => return None,
+        Ok(true) => {}
+        Err(e) => {
+            tracing::warn!(
+                target: "chats::attached_files_block",
+                conversation_id = %cid.as_str(),
+                error = %e,
+                "has_attachments probe failed; falling through to full list_for_conversation",
+            );
+        }
+    }
     let rows = match AttachmentStore::new(&state.db).list_for_conversation(cid) {
         Ok(r) => r,
         Err(e) => {

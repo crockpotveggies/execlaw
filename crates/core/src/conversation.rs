@@ -383,6 +383,32 @@ impl<'db> ConversationStore<'db> {
         })
     }
 
+    /// Fast-path probe: does this conversation have any non-image
+    /// attachment? Read by the chats per-turn `build_attached_files_block`
+    /// to short-circuit the empty-conversation case (the common one)
+    /// before going through `AttachmentStore::list_for_conversation`.
+    ///
+    /// Backed by `state_conversations.has_attachments` (migration
+    /// 0014), maintained by [`crate::attachments::AttachmentStore::insert`]
+    /// in the same transaction as the row insert.
+    ///
+    /// Missing conversation row → `Ok(false)`. Cheap enough to call
+    /// per turn; a single indexed-PK lookup on a singleton column.
+    pub fn has_attachments(&self, conversation_id: &ConversationId) -> Result<bool, DbError> {
+        let cid = conversation_id.as_str().to_owned();
+        self.db.with_conn(|c| {
+            let flag: i64 = c
+                .query_row(
+                    "SELECT has_attachments FROM state_conversations \
+                     WHERE conversation_id = ?1",
+                    params![cid],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            Ok(flag != 0)
+        })
+    }
+
     /// Bump the wall-clock recency timestamp the sidebar orders by.
     /// Called after every turn commit (regardless of which path —
     /// streaming, runner, tool-capable, stub fallback). Idempotent.
@@ -798,6 +824,67 @@ mod tests {
         assert!(got.is_pinned);
         assert!(got.is_ephemeral);
         assert_eq!(got.ephemeral_expires_at, Some(9_999));
+    }
+
+    /// Fresh conversation defaults `has_attachments` to false. The
+    /// flag is only flipped by `AttachmentStore::insert` and only for
+    /// non-image MIMEs — the upsert path leaves it at the column
+    /// default (`0`).
+    #[test]
+    fn has_attachments_defaults_false_for_fresh_conversation() {
+        let db = fresh_db();
+        let store = ConversationStore::new(&db);
+        let row = fresh_row("c-fresh");
+        store.upsert(&row).unwrap();
+        assert!(!store.has_attachments(&row.conversation_id).unwrap());
+    }
+
+    /// Missing conversation row → `Ok(false)`. The fast-path probe
+    /// must never error on a not-yet-created conversation; the chats
+    /// caller falls back to `None` (no attachment block) in that case
+    /// anyway.
+    #[test]
+    fn has_attachments_returns_false_for_unknown_conversation() {
+        let db = fresh_db();
+        let store = ConversationStore::new(&db);
+        assert!(!store
+            .has_attachments(&ConversationId::from("never-existed"))
+            .unwrap());
+    }
+
+    /// An FSM upsert (the per-turn hot path) MUST NOT reset
+    /// `has_attachments` back to 0 — the flag is set out-of-band by
+    /// the attachment-commit pipeline and the upsert's `ON CONFLICT
+    /// DO UPDATE SET …` deliberately omits the column.
+    #[test]
+    fn upsert_does_not_clobber_has_attachments() {
+        let db = fresh_db();
+        let store = ConversationStore::new(&db);
+        let row = fresh_row("c-keep-flag");
+        store.upsert(&row).unwrap();
+        // Manually flip the flag the way AttachmentStore::insert
+        // would, so this test isn't coupled to the attachment crate.
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE state_conversations SET has_attachments = 1 \
+                 WHERE conversation_id = ?1",
+                params![row.conversation_id.as_str()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(store.has_attachments(&row.conversation_id).unwrap());
+
+        // Subsequent FSM upsert (post-turn) carries the default
+        // (false) value on the struct — must not clobber the flag.
+        let mut next = fresh_row("c-keep-flag");
+        next.last_seq = EventSeq(5);
+        next.phase = Phase::Thinking;
+        store.upsert(&next).unwrap();
+        assert!(
+            store.has_attachments(&row.conversation_id).unwrap(),
+            "FSM upsert must preserve out-of-band-set has_attachments flag"
+        );
     }
 
     #[test]

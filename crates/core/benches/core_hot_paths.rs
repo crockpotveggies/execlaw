@@ -11,6 +11,7 @@
 //! A regression >10% on any of these blocks a merge.
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use execlaw_core::attachments::{AttachmentRow, AttachmentStore};
 use execlaw_core::backends::{BackendMode, BackendPurpose, BackendStore, BackendUpsert};
 use execlaw_core::conversation::{
     ConversationKind, ConversationRow, ConversationStore, Modality, Phase,
@@ -23,7 +24,7 @@ use execlaw_core::events::{
     EventKind, EventLog, EventRecord, PendingEvent, ToolResultPayload, ToolUsePayload,
 };
 use execlaw_core::ids::ResearchJobId;
-use execlaw_core::ids::{ConversationId, EventSeq, IdempotencyKey, TurnSeq};
+use execlaw_core::ids::{AttachmentId, ConversationId, EventSeq, IdempotencyKey, TurnSeq};
 use execlaw_core::migrations::MigrationRunner;
 use execlaw_core::outbox::{OutboxRow, OutboxStatus, OutboxStore};
 use execlaw_core::refresh_tokens::RefreshTokenStore;
@@ -670,6 +671,121 @@ fn bench_list_thread_summaries(c: &mut Criterion) {
             });
         });
     }
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// Attached-files fast path (`has_attachments` flag, migration 0014).
+//
+// Every chat turn calls `build_attached_files_block(state, cid)` to
+// decide whether to append an "Attached files: …" section to the
+// turn-context prose. Pre-fix this ran
+// `AttachmentStore::list_for_conversation` on the hot path even when
+// the conversation had zero attachments (the common case). Post-fix
+// the per-conversation `has_attachments` flag short-circuits empty
+// conversations to a single indexed-PK lookup.
+//
+// Budgets (in-memory SQLite, debug build):
+//   * has_attachments (empty conversation)       ≤ 30 µs
+//   * list_for_conversation (empty conversation) ≤ 60 µs  (baseline we beat)
+//   * has_attachments (non-empty)                ≤ 30 µs  (slow path still pays this)
+//   * list_for_conversation (4 attachments)      ≤ 200 µs (slow path total)
+//
+// The "saves N µs per turn" claim should be derived from
+// (list_for_conversation_empty - has_attachments_empty). A turn that
+// previously paid the full scan now pays only the flag probe.
+// ---------------------------------------------------------------------------
+
+fn bench_attached_files_fast_path(c: &mut Criterion) {
+    let mut group = c.benchmark_group("attached_files_fast_path");
+
+    // The common case: a conversation with NO attachments. Fast path
+    // short-circuits on a single indexed-PK lookup, never touching
+    // state_attachments.
+    group.bench_function("has_attachments_empty", |b| {
+        let db = fresh_db();
+        let store = ConversationStore::new(&db);
+        store.upsert(&fresh_conv_row("c-empty")).unwrap();
+        let cid = ConversationId::from("c-empty");
+        b.iter(|| {
+            let flag = store.has_attachments(black_box(&cid)).unwrap();
+            black_box(flag);
+        });
+    });
+
+    // Baseline we beat: pre-fix every turn ran this query on an
+    // empty conversation. The delta vs. has_attachments_empty is the
+    // per-turn saving the fast path delivers.
+    group.bench_function("list_for_conversation_empty", |b| {
+        let db = fresh_db();
+        ConversationStore::new(&db)
+            .upsert(&fresh_conv_row("c-empty"))
+            .unwrap();
+        let store = AttachmentStore::new(&db);
+        let cid = ConversationId::from("c-empty");
+        b.iter(|| {
+            let rows = store.list_for_conversation(black_box(&cid)).unwrap();
+            black_box(rows);
+        });
+    });
+
+    // Non-empty conversation: the slow path still pays the flag
+    // probe AND the list_for_conversation scan. Measure both so we
+    // can quote the total overhead the slow path incurs vs. the
+    // empty-case saving.
+    group.bench_function("has_attachments_non_empty", |b| {
+        let db = fresh_db();
+        ConversationStore::new(&db)
+            .upsert(&fresh_conv_row("c-full"))
+            .unwrap();
+        let cid = ConversationId::from("c-full");
+        let astore = AttachmentStore::new(&db);
+        for i in 0..4 {
+            astore
+                .insert(&AttachmentRow {
+                    id: AttachmentId::new(),
+                    conversation_id: cid.clone(),
+                    mime_type: "text/csv".into(),
+                    path: format!("/blobs/{i}.csv"),
+                    sha256: format!("sha-{i}"),
+                    received_at: 100 + i,
+                    filename: Some(format!("{i}.csv")),
+                })
+                .unwrap();
+        }
+        let cstore = ConversationStore::new(&db);
+        b.iter(|| {
+            let flag = cstore.has_attachments(black_box(&cid)).unwrap();
+            black_box(flag);
+        });
+    });
+
+    group.bench_function("list_for_conversation_4_rows", |b| {
+        let db = fresh_db();
+        ConversationStore::new(&db)
+            .upsert(&fresh_conv_row("c-full"))
+            .unwrap();
+        let cid = ConversationId::from("c-full");
+        let store = AttachmentStore::new(&db);
+        for i in 0..4 {
+            store
+                .insert(&AttachmentRow {
+                    id: AttachmentId::new(),
+                    conversation_id: cid.clone(),
+                    mime_type: "text/csv".into(),
+                    path: format!("/blobs/{i}.csv"),
+                    sha256: format!("sha-{i}"),
+                    received_at: 100 + i,
+                    filename: Some(format!("{i}.csv")),
+                })
+                .unwrap();
+        }
+        b.iter(|| {
+            let rows = store.list_for_conversation(black_box(&cid)).unwrap();
+            black_box(rows);
+        });
+    });
+
     group.finish();
 }
 
@@ -1557,6 +1673,7 @@ criterion_group!(
     bench_ephemeral_sweeper,
     bench_conversation_metadata,
     bench_list_thread_summaries,
+    bench_attached_files_fast_path,
     bench_backend_store,
     bench_webauthn_store,
     bench_refresh_token_store,
