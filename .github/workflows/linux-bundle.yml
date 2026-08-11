@@ -119,7 +119,7 @@ jobs:
           echo "deb=$DEB" >> "$GITHUB_OUTPUT"
 
       - name: Upload .deb
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: execlaw-deb-amd64
           path: ${{ steps.outputs.outputs.deb }}
@@ -127,7 +127,7 @@ jobs:
           retention-days: 90
 
       - name: Upload plugin ZIPs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: execlaw-plugins-linux
           path: |

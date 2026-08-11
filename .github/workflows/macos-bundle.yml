@@ -113,7 +113,7 @@ jobs:
           echo "dmg=$DMG" >> "$GITHUB_OUTPUT"
 
       - name: Upload .app
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: execlaw-app-aarch64
           # Zip the .app for upload — actions/upload-artifact unpacks
@@ -126,7 +126,7 @@ jobs:
 
       - name: Upload .dmg
         if: steps.outputs.outputs.dmg != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: execlaw-dmg-aarch64
           path: ${{ steps.outputs.outputs.dmg }}
@@ -137,7 +137,7 @@ jobs:
         # Bundle all plugin ZIPs into a single workflow artifact
         # (so a `gh run download` grabs them in one shot) AND
         # attach them individually to the GitHub Release below.
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: execlaw-plugins
           path: |
