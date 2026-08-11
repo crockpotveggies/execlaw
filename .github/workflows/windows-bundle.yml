@@ -197,7 +197,7 @@ jobs:
         # — the macOS-bundle workflow creates the release entry as a
         # draft, then this workflow adds the Windows artefacts to
         # the same release. Tag-name dedup happens server-side.
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           draft: true
           prerelease: false
